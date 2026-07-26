@@ -168,7 +168,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     extensions: { ... }
 ```
 
@@ -242,7 +241,7 @@ proxy:
 | `tls_cert_file` | string | | Path to PEM-encoded TLS certificate. Ignored when `acme` is configured. |
 | `tls_key_file` | string | | Path to PEM-encoded TLS private key. |
 | `acme` | object | | ACME (auto-TLS) block. Overrides manual cert/key when set. See [ACME / auto TLS](#acme--auto-tls). |
-| `http3` | object | | HTTP/3 (QUIC) listener config. Currently inert; see [HTTP/3 fields](#http3-fields). |
+| `http3` | object | | Reserved HTTP/3 (QUIC) listener config. Enabling it is rejected; see [HTTP/3 fields](#http3-fields). |
 | `metrics` | object | | Metrics tuning, including label cardinality limits. |
 | `alerting` | object | | Alert notification channels. |
 | `admin` | object | | Embedded read-only admin / stats API server. |
@@ -285,13 +284,13 @@ proxy:
 
 ### HTTP/3 fields
 
-HTTP/3 is temporarily disabled until native QUIC support lands in Pingora. The `http3` block still parses, but no QUIC listener starts and setting `enabled: true` only logs a warning. The fields below are documented for forward compatibility; they have no runtime effect today.
+HTTP/3 is not served by this build. The `http3` shape is retained for forward compatibility: omitting the block or setting `enabled: false` compiles, while `enabled: true` fails config compilation with an actionable error referencing WOR-1969. The remaining fields are reserved and have no runtime effect while the block is disabled.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | false | Enable the HTTP/3 (QUIC) listener. Currently inert; no listener starts. |
-| `max_streams` | int | 100 | Maximum concurrent QUIC streams per connection. Currently inert. |
-| `idle_timeout_secs` | int | 30 | Idle timeout for QUIC connections. Currently inert. |
+| `enabled` | bool | false | Reserved activation flag. Must remain false in this build. |
+| `max_streams` | int | 100 | Reserved maximum concurrent QUIC streams per connection. |
+| `idle_timeout_secs` | int | 30 | Reserved idle timeout for QUIC connections. |
 
 ### Admin fields
 
@@ -801,13 +800,13 @@ origins:
 | `mirror` | object | | Shadow traffic configuration. See [Request mirror](#request-mirror). |
 | `bot_detection` | object | | Bot detection config. |
 | `threat_protection` | object | | IP reputation / blocklist config. |
-| `rate_limit_headers` | object | | `X-RateLimit-*` and `Retry-After` header configuration. |
+| `rate_limit_headers` | object | | Compatibility-only; ignored by the OSS runtime. Configure headers on the live rate-limit policy. |
 | `error_pages` | list | | Custom error pages keyed by status code or class. |
 | `problem_details` | object | | RFC 9457 `application/problem+json` default renderer. Composes with `error_pages`. |
-| `traffic_capture` | object | | Traffic capture / mirroring. |
+| `traffic_capture` | object | | Compatibility-only; no OSS consumer. Use `mirror` for live request mirroring. |
 | `message_signatures` | object | | RFC 9421 HTTP message signatures. |
 | `idempotency` | object | | RFC 8594 idempotency middleware. See [Idempotency](#idempotency). |
-| `connection_pool` | object | | Per-origin connection pool tuning. |
+| `connection_pool` | object | | Compatibility-only; Pingora's built-in upstream pool settings apply. |
 | `extensions` | object | | Opaque map for enterprise / third-party origin-level blocks. |
 
 ### Origin architecture
@@ -833,7 +832,6 @@ origins:
     cors: { ... }                # Optional
     compression: { ... }         # Optional
     hsts: { ... }                # Optional
-    connection_pool: { ... }     # Optional
 ```
 
 ### Request-envelope capture
@@ -872,7 +870,7 @@ origins:
 | `properties.rollup_keys` | list | `[]` | Explicit property keys promoted into durable usage-rollup dimensions. At most five. |
 | `sessions.capture` | bool | `true` | Capture caller-supplied session and parent-session ULIDs. |
 | `sessions.auto_generate` | enum | `anonymous` | `never`, `anonymous`, or `always`. |
-| `sessions.ttl_seconds` | int | `86400` | Session-index retention hint used by downstream projections. The recent admin Sessions page is governed by the request-ring size instead. |
+| `sessions.ttl_seconds` | int | `86400` | Reserved compatibility hint. No OSS consumer expires the request ring from this value. |
 | `sessions.budget` | object | unset | Optional per-workspace cap for automatically generated session IDs. Caller-supplied IDs are not gated. |
 | `user.capture` | bool | `true` | Capture the resolved user identifier. |
 | `user.max_length` | int | `256` | Maximum captured user-ID length. |
@@ -1426,7 +1424,7 @@ origins:
 | `provider` | string | | Provider this key routes to. Matches an entry in the action's `providers:` list. |
 | `key` | string | | Client-facing key material. Accepts `${ENV}` and secret reference URIs. |
 | `models.allow` / `models.deny` | list | | Per-key model gate, enforced with a 403 before any upstream call. Stacks on the origin-level allow-list; most restrictive wins. |
-| `attrs` | object | | Attribution metadata (`project`, `tags`, `budget`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. The `budget` here is attribution, not an enforced ceiling; enforced spend caps live in the action-level `budget:` block. |
+| `attrs` | object | | Attribution metadata (`project`, `tags`, ...) surfaced as attribution labels (including `api_key_id`) on the `sbproxy_ai_*_attributed_total` metrics. `attrs.team` is compatibility-only and is not copied into the principal; use `tags` or `metadata` instead. `attrs.budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is also compatibility-only and does not install a reset schedule. Explicit compatibility-only keys emit a warning. |
 | `policies` | list | | Sub-policies that fire when this credential matches. `{type: rate_limit, rpm: <n>}` lowers to an enforced per-key requests-per-minute cap; there is no per-key tokens-per-minute knob. `{type: require_pii_redaction, rules: [...]}` gates dispatch on active PII redaction. |
 | `route_to_model` | string | | Pin the upstream `model` field; the client-supplied value is ignored. |
 | `compression_profile` | string | | Select `on`, `off`, or a named profile declared by this AI route. |
@@ -1527,15 +1525,20 @@ The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class ret
 
 #### Shadow (`shadow`)
 
-Mirrors each request to a second provider concurrently. The primary's response is what the client sees; the shadow body is drained and metrics are logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish_reason). Useful for prompt regression checks before swapping a primary model.
+Mirrors a sampled set of non-streaming chat evaluation requests to a second provider after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
+
+The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Each configured usage sink receives a distinct shadow row tagged `shadow`; its request ID is freshly generated by the server and ends in `:shadow`. Shadow cost is estimated in that row but does not debit primary budgets. Set `enabled: false` on a shadow-only provider to keep it out of primary routing; the explicit shadow selection still uses it. Credential provider allow/block rules apply to the shadow target independently. A request carrying `x-sbproxy-disallow-prompt-training: true` is copied only when the shadow provider declares `no_prompt_training: true`. A hosting process that attaches a purpose-scoped egress authorizer to `AiClient` suppresses v1 shadow dispatch because the direct shadow transport cannot yet consume authorized DNS pins and redirect checks.
 
 ```yaml
 shadow:
   provider: anthropic         # must also appear in `providers`
-  model: claude-haiku-4-5   # optional override; defaults to client's model
+  model: claude-haiku-4-5     # optional override; defaults to client's model
   sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
-  timeout_ms: 30000
+  timeout_ms: 30000           # upstream HTTP timeout
+  task_timeout_ms: 30000      # hard wall-clock supervisor timeout
 ```
+
+`sbproxy_ai_shadow_dropped_total{reason=...}` uses the closed reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Sampling out is expected behavior and does not increment the counter.
 
 #### Race strategy (`routing.strategy: race`)
 
@@ -1569,9 +1572,27 @@ origins:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | required | Backend GraphQL endpoint URL (`http://` or `https://`). |
-| `max_depth` | int | 0 | Maximum query nesting depth. `0` means unlimited. |
-| `allow_introspection` | bool | true | When false, introspection queries are rejected. |
-| `validate_queries` | bool | false | When true, validate incoming GraphQL queries. |
+| `max_depth` | int | 0 | Maximum field nesting depth, including named-fragment expansion. The exact limit is accepted; `0` means unlimited. |
+| `allow_introspection` | bool | true | When false, operations selecting `__schema` or `__type` are rejected, including aliased or nested selections. |
+| `validate_queries` | bool | false | When true, parse GraphQL document syntax before proxying. This does not perform schema-aware validation. |
+
+With all three fields at their defaults, the action remains a transparent
+proxy and does not parse the request. Setting `validate_queries: true`,
+setting `max_depth` above zero, or setting `allow_introspection: false`
+enables fail-closed parsing. Validated requests support a percent-encoded
+`query` parameter on `GET`, plus an `application/json` object or batched
+array on `POST`. Every entry in a batch must contain a string `query`
+field and the complete batch is rejected when any entry fails. Validated
+`GET` requests are query-parameter-only: a non-empty inbound body, or a
+body added by a request modifier, is rejected with `400`.
+
+Validation failures return `400` before an HTTP request is sent upstream.
+Inbound bodies on validated requests are limited to 64 KiB so an accepted
+POST body can be replayed unchanged after the pre-upstream check; larger
+bodies return `413`. Multipart uploads and persisted-query-only envelopes
+are not validated transports and therefore return `400` when any validation
+control is enabled. They continue to pass through unchanged under the default
+transparent configuration.
 
 ### storage
 
@@ -2131,7 +2152,7 @@ Cap in-flight requests per key. Distinct from `rate_limiting`, which throttles R
 policies:
   - type: concurrent_limit
     max: 50
-    key: api_key      # or 'ip', or 'origin' (default)
+    key_by: api_key   # or ip, route, header:<name>, or global (default)
     status: 503
     error_body: '{"error":"too many concurrent requests"}'
 ```
@@ -2139,11 +2160,12 @@ policies:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `max` | int | required | Maximum concurrent requests per key. Must be `> 0`. |
-| `key` | string | `origin` | Bucket strategy: `origin` (one global counter for the route), `ip` (per client IP), or `api_key` (per `X-Api-Key` or `Bearer` token). |
+| `key_by` | string | `global` | Bucket strategy: `global`, `ip`, `api_key`, `route`, or `header:<name>`. Route keys use the request path without its query. |
+| `key` | string | unset | Legacy schema-v1 spelling retained for compatibility. Supports `origin`, `ip`, and `api_key`; use `key_by` in new configuration. |
 | `status` | int | 503 | HTTP status when the limit is exceeded. |
 | `error_body` | string | unset | Optional response body for rejections. |
 
-Each accepted request takes a permit; the permit is released when the request finishes (success, error, or client disconnect). Counters use a sharded `DashMap` so contention across keys is bounded.
+Each accepted request takes a permit; the permit is released when the request finishes (success, error, panic, or client disconnect). Idle keys are removed from the sharded map, so one-off client keys do not accumulate after their requests drain.
 
 See [example 82](../examples/concurrent-limit/sb.yml).
 
@@ -2826,7 +2848,7 @@ origins:
 | `headers.add` | map | Append headers |
 | `headers.remove` | list | Remove headers (alias: `delete`) |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational only; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | object | Replace the response body with this JSON value |
 
@@ -3173,24 +3195,10 @@ origins:
 
 ### Secret references
 
-Secrets are resolved through the top-level `proxy.secrets` block (see [Secrets](#secrets)). Once resolved, secrets are available in templates as `{{ secrets.name }}`.
-
-```yaml
-proxy:
-  secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-    map:
-      database_url: secret/data/prod/db_url
-      stripe_key: secret/data/prod/stripe_key
-
-origins:
-  "api.example.com":
-    action:
-      type: proxy
-      url: "{{ secrets.database_url }}"
-```
+Declare named backends under `proxy.secrets.backends` and place a provider URI
+directly in a secret-bearing field. The legacy `backend`, `hashicorp`, `map`,
+`rotation`, and `fallback` fields remain parseable but are config-only. See
+[Secrets](#secrets) and [the secrets guide](secrets.md).
 
 ### Template scopes
 
@@ -3282,22 +3290,10 @@ origins:
 
 ## Connection pool
 
-Per-origin connection pool tuning. When unset, falls back to proxy-wide defaults.
-
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 128
-      idle_timeout_secs: 90
-      max_lifetime_secs: 300
-```
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `max_connections` | int | 128 | Maximum concurrent connections to the upstream |
-| `idle_timeout_secs` | int | 90 | Maximum idle time before a connection is closed |
-| `max_lifetime_secs` | int | 300 | Maximum total lifetime of a connection |
+`origins.*.connection_pool` is retained for config compatibility but is not
+applied by the OSS runtime. Pingora's built-in upstream connection-pool
+behavior remains in effect regardless of the three parsed values. Do not use
+this block to enforce a connection cap, idle timeout, or maximum lifetime.
 
 ---
 
@@ -4027,35 +4023,36 @@ Alert webhook channels (`proxy.alerting.channels[]`) do not accept a `secret` fi
 
 ## Secrets
 
-The top-level `proxy.secrets` block configures how `secret:` references are resolved at config-load time and how rotation is handled.
+The live surface is the named-backend list under
+`proxy.secrets.backends`. Provider URI references select a backend by name and
+fail startup if they cannot be resolved:
 
 ```yaml
 proxy:
   secrets:
-    backend: hashicorp
-    hashicorp:
-      addr: https://vault.example.com:8200
-      token: ${VAULT_TOKEN}
-      mount: secret
-    map:
-      openai_key: secret/data/prod/openai_key
-      db_password: secret/data/prod/db_password
-    rotation:
-      grace_period_secs: 300
-      re_resolve_interval_secs: 60
-    fallback: cache
+    backends:
+      - type: hashicorp
+        name: primary
+        addr: https://vault.example.com
+        mount: secret
+        auth:
+          type: token
+          token: ${VAULT_TOKEN}
+
+origins:
+  "ai.example.com":
+    action:
+      type: ai_proxy
+      providers:
+        - name: openai
+          api_key: vault://primary/apps/openai?key=api_key
 ```
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `backend` | string | `env` | Backend used to resolve secrets. Supported: `env`, `local`, `hashicorp`. |
-| `hashicorp.addr` | string | | Vault server address (required when `backend = hashicorp`) |
-| `hashicorp.token` | string | from `VAULT_TOKEN` env var | Vault token |
-| `hashicorp.mount` | string | `secret` | KV secrets engine mount path |
-| `map` | map | | Logical-name to vault-path mapping |
-| `rotation.grace_period_secs` | int | 300 | Seconds the previous secret value remains valid after rotation |
-| `rotation.re_resolve_interval_secs` | int | 60 | How often to re-fetch secrets from the backend |
-| `fallback` | string | `cache` | Strategy when the backend is unavailable. Supported: `cache`, `reject`, `env`. |
+The legacy `proxy.secrets.backend`, `hashicorp`, `map`, `rotation`, and
+`fallback` keys are config-only compatibility fields. They do not select a
+backend, schedule re-resolution, provide a dual-value grace window, or change
+failure behavior. Use [the named-backend guide](secrets.md) for every supported
+backend and URI shape.
 
 The `extensions` map at both the proxy and the origin level holds opaque blocks consumed by enterprise / third-party crates. OSS does not parse them.
 
@@ -4641,7 +4638,6 @@ origins:
     cors: { ... }
     compression: { ... }
     hsts: { ... }
-    connection_pool: { ... }
     mirror: { ... }                # shadow traffic; sibling of action
     on_request: [ ... ]            # webhook callbacks
     on_response: [ ... ]

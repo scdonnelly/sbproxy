@@ -198,6 +198,8 @@ CEL includes the standard operators (`+`, `-`, `*`, `/`, `%`, `in`, `==`, `!=`, 
 | `flag_enabled(name, key)` | bool | Resolve a feature flag against the live flag store; unknown flags evaluate false |
 | `tls_fingerprint_matches(ja4, agent_class_id)` | bool | True when `ja4` is a known fingerprint for the catalogued agent class, or when the catalogue has no entry for the class (conservative) |
 
+`flag_enabled` reads the process-wide set declared by the top-level `flags:` block. Its second argument is the stable bucketing key; use a user, tenant, or subject identifier rather than a random request ID. Successful hot reloads replace the full flag set atomically, and an absent `flags:` block clears it. Unknown flags evaluate to `false`. See [Edge feature flags](feature-flags.md) for the rule grammar.
+
 ### 3.3 CEL policy examples
 
 The scripted request gate is the `expression` policy. It takes one CEL expression; `false` (or an evaluation error) denies the request with `deny_status` (default 403) and `deny_message`.
@@ -636,19 +638,15 @@ transforms:
 
 The `ctx` argument carries `ctx.request.aipref.train`, `ctx.request.aipref.search`, and `ctx.request.aipref.ai_input`, each defaulting to `true` when the request has no valid `aipref` header.
 
-Sandbox limits live under `proxy.scripting.javascript.sandbox`:
+QuickJS always runs with a sandbox: a 100 ms CPU budget, 16 MiB heap cap, and
+1 MiB native-stack cap. A script that exceeds the CPU budget is aborted by a
+watchdog with an uncatchable exception; the modifier or transform is skipped
+and the error is logged.
 
-```yaml
-proxy:
-  scripting:
-    javascript:
-      sandbox:
-        budget_ms: 100    # CPU time budget per invocation
-        memory_mb: 16     # QuickJS heap cap
-        stack_kb: 1024    # native stack cap
-```
-
-A script that exceeds `budget_ms` is aborted by a watchdog with an uncatchable exception; the modifier or transform is skipped and the error is logged.
+The `proxy.scripting.javascript.sandbox` YAML subtree remains parseable for
+compatibility but is not installed into `JsEngine::new` today, so changing
+those YAML values does not tune the live engine. Rust integrations that
+construct `JsEngine::with_sandbox` directly can supply different limits.
 
 ---
 
@@ -733,7 +731,7 @@ request_modifiers:
 |---|---|---|
 | `headers.set` / `headers.add` / `headers.remove` | map / map / list | Same semantics as the request side |
 | `status.code` | int | Override the response status code |
-| `status.text` | string | Optional reason phrase (informational; not sent in HTTP/2) |
+| `status.text` | string | Compatibility-only reason phrase; accepted with a warning and ignored |
 | `body.replace` | string | Replace the response body with this string |
 | `body.replace_json` | any | Replace the response body with this JSON value |
 | `lua_script` | string | Lua `modify_response(resp, ctx)`; returned `set_headers` applied |

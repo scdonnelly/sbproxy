@@ -222,6 +222,10 @@ pub struct RequestContext {
     /// guards release their slots when dropped, which happens when the
     /// context is dropped at the end of the request lifecycle.
     pub concurrent_limit_guards: Vec<ConcurrentLimitGuard>,
+    /// Configured concurrent-limit rejection body. The enforcer stores
+    /// this separately from the decision message so the response phase
+    /// can emit it verbatim.
+    pub concurrent_limit_denial_body: Option<String>,
     /// Permits issued by `AgentBudgetPolicy`. Same lifecycle
     /// as `concurrent_limit_guards`: each guard tracks an in-flight
     /// agent-keyed slot and releases it when the request finishes.
@@ -319,6 +323,10 @@ pub struct RequestContext {
     /// so operators can spot pool pressure or oversize bodies. None
     /// when the middleware engaged normally (hit / miss / conflict).
     pub idempotency_skip_reason: Option<&'static str>,
+    /// Cached response selected only after a validated GraphQL request has
+    /// produced its final authoritative body. `fail_to_proxy` replays it with
+    /// the normal idempotency headers after the upstream request phase aborts.
+    pub idempotency_deferred_hit: Option<sbproxy_middleware::idempotency::CachedResponse>,
 
     // --- Request body size limit (streaming) ---
     /// Streaming-time max body size cap from `RequestLimitPolicy`.
@@ -465,6 +473,18 @@ pub struct RequestContext {
     /// If a request modifier specifies a body replacement, it is stored here
     /// so that the body filter phase can swap it in before sending upstream.
     pub replacement_request_body: Option<bytes::Bytes>,
+
+    // --- GraphQL validation state ---
+    /// Whether the resolved GraphQL action requires validation of the final
+    /// outbound request after request modifiers have run.
+    pub graphql_validation_pending: bool,
+    /// Original request bytes captured into Pingora's replay buffer. The final
+    /// validator uses these unless a body modifier supplies replacement bytes.
+    pub graphql_request_body: Option<bytes::Bytes>,
+    /// Exact POST body that passed GraphQL validation after all request
+    /// modifiers ran. Every request-body filter path must emit these bytes,
+    /// rather than whichever inbound chunk it inspected or hashed.
+    pub graphql_validated_request_body: Option<bytes::Bytes>,
 
     // --- Response modifier state ---
     /// If a response modifier specifies a status code override, it is stored here
@@ -1142,6 +1162,7 @@ impl RequestContext {
             admin_load_balancer_strategy: None,
             admin_load_balancer_target: None,
             concurrent_limit_guards: Vec::new(),
+            concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
             request_body_buf: None,
@@ -1164,6 +1185,7 @@ impl RequestContext {
             idempotency_response_headers: None,
             idempotency_permit: None,
             idempotency_skip_reason: None,
+            idempotency_deferred_hit: None,
             body_size_limit: None,
             body_bytes_seen: 0,
             request_body_bytes: 0,
@@ -1196,6 +1218,9 @@ impl RequestContext {
             fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
+            graphql_validation_pending: false,
+            graphql_request_body: None,
+            graphql_validated_request_body: None,
             response_status_override: None,
             response_body_replacement: None,
             trust_headers: None,

@@ -716,8 +716,8 @@ plane, enterprise hooks) log and degrade instead of blocking.
     `SB_WORKER_THREADS` or auto-detection), binds the plain HTTP
     listener on `http_bind_port`, and adds the HTTPS listener (manual
     certs or the ACME dynamic-certificate resolver, with optional
-    mTLS). No QUIC port is bound even when `proxy.http3` is
-    configured; an enabled `http3` block only logs a warning.
+    mTLS). No QUIC port is bound. Config compilation rejects
+    `proxy.http3.enabled: true` because HTTP/3 is not served.
 11. **Admin server**: when `proxy.admin.enabled: true`, spawns the
     embedded admin listener (default `127.0.0.1:9090`) and registers
     the component health probes that `/readyz` and `/health` report.
@@ -1190,62 +1190,41 @@ testing:
 
 ## 8. Connection tuning
 
-Upstream connection behavior is tuned per origin with a single
-`connection_pool` block, placed at the origin level alongside the
-`action` block.
-
-![ten concurrent requests completing over a bounded upstream pool, per-request timing shown](assets/connection-pool.gif)
-
-A 32-connection pool with idle and lifetime caps absorbs the burst ([config](../examples/connection-pool/)).
-
-### Per-origin connection pool
+Pingora owns the OSS runtime's upstream connection pool. The legacy
+per-origin `connection_pool` shape remains parseable for config compatibility,
+but none of its values are installed into Pingora today.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_connections` | `128` | Maximum concurrent connections to the upstream. Additional requests queue until a connection frees up |
-| `idle_timeout_secs` | `90` | Idle keep-alive connections unused for longer than this are dropped from the pool |
-| `max_lifetime_secs` | `300` | Hard ceiling on any single connection's lifetime; older connections are replaced even when healthy |
+| `max_connections` | `128` | Config-only compatibility value; does not cap live connections |
+| `idle_timeout_secs` | `90` | Config-only compatibility value; does not change live idle reaping |
+| `max_lifetime_secs` | `300` | Config-only compatibility value; does not change live connection lifetime |
 
-```yaml
-origins:
-  "api.example.com":
-    connection_pool:
-      max_connections: 32
-      idle_timeout_secs: 60
-      max_lifetime_secs: 300
-    action:
-      type: proxy
-      url: https://backend.internal
-```
-
-Tune these when an upstream is sensitive to concurrent connection
-count, or when a load balancer aggressively terminates long-lived TCP
-sessions. Origins without a `connection_pool` block get the defaults
-above. There are no other per-origin transport knobs; buffer sizes and
-handshake timeouts follow Pingora's defaults.
+Do not use this block to satisfy an upstream concurrency or lifetime
+requirement. Buffer sizes, pooling, and handshake timeouts currently follow
+Pingora's runtime defaults.
 
 ### HTTP/3 (QUIC)
 
-HTTP/3 is temporarily disabled until native QUIC support lands in
-Pingora. The `proxy.http3` block still parses, but it is ignored: no
-QUIC listener is started, no `Alt-Svc` header is advertised, and
-setting `enabled: true` only logs a warning at startup. HTTP/2 is the
-highest version served. The fields are documented for when HTTP/3
-returns:
+HTTP/3 is not served by this build. No QUIC listener is started and no
+`Alt-Svc` header is advertised. The `proxy.http3` shape is retained for
+forward compatibility, but config compilation rejects `enabled: true`
+with a reference to WOR-1969. HTTP/2 is the highest version served. The
+reserved shape is:
 
 ```yaml
 proxy:
   http3:
-    enabled: true          # currently ignored; logs a warning
+    enabled: false         # true is rejected during config compilation
     idle_timeout_secs: 30
     max_streams: 100
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `false` | Whether to start the HTTP/3 (QUIC) listener. Currently inert |
-| `idle_timeout_secs` | `30` | Idle timeout for QUIC connections |
-| `max_streams` | `100` | Maximum concurrent QUIC streams per connection |
+| `enabled` | `false` | Reserved activation flag. Must remain false in this build |
+| `idle_timeout_secs` | `30` | Reserved idle timeout for QUIC connections |
+| `max_streams` | `100` | Reserved maximum concurrent QUIC streams per connection |
 
 ---
 

@@ -1,5 +1,5 @@
 # Upgrade Guide
-*Last modified: 2026-07-09*
+*Last modified: 2026-07-22*
 
 ## Upgrading between versions
 
@@ -15,12 +15,13 @@
 
 - JavaScript engine (QuickJS) for transforms and WAF rules via `js_script` fields in request/response modifiers.
 - ACME auto-cert (Let's Encrypt) via `proxy.acme` config block.
-- HTTP/3 (QUIC) support via `proxy.http3` config block (temporarily disabled pending native Pingora HTTP/3 support).
+- Reserved HTTP/3 (QUIC) config shape via `proxy.http3`. `enabled: true` is rejected until native HTTP/3 support lands.
 - Per-origin metrics with 21 metric families and configurable cardinality limiting.
 - W3C and B3 distributed tracing header propagation.
 - Webhook alerting with configurable channels via `proxy.alerting`.
 - Admin stats SPA via `proxy.admin`.
-- Per-origin connection pool tuning via `connection_pool`.
+- The legacy per-origin `connection_pool` shape remains parseable but is
+  config-only; Pingora's built-in pool settings apply.
 
 #### Config additions
 
@@ -29,7 +30,7 @@ The following top-level `proxy:` sub-keys are new in v1.0:
 | Key | Description |
 |-----|-------------|
 | `proxy.acme` | ACME auto-cert configuration (Let's Encrypt). |
-| `proxy.http3` | HTTP/3 QUIC configuration (temporarily disabled pending native Pingora HTTP/3 support). |
+| `proxy.http3` | Reserved HTTP/3 QUIC configuration. `enabled: true` fails config compilation. |
 | `proxy.metrics` | Metrics cardinality limits. |
 | `proxy.alerting` | Alert notification channels (webhook, log). |
 | `proxy.admin` | Embedded stats/logs SPA. |
@@ -38,13 +39,13 @@ The following per-origin keys are new in v1.0:
 
 | Key | Description |
 |-----|-------------|
-| `connection_pool` | Per-origin connection pool tuning. |
+| `connection_pool` | Config-only compatibility shape; does not tune Pingora. |
 | `on_request` | Event hook plugins (alpha). |
 | `on_response` | Event hook plugins (alpha). |
 | `bot_detection` | Bot traffic detection (alpha). |
 | `threat_protection` | Dynamic blocklist integration (alpha). |
-| `rate_limit_headers` | Rate limit response header control. |
-| `traffic_capture` | Request mirroring (alpha). |
+| `rate_limit_headers` | Config-only compatibility shape; configure response headers on the live rate-limit policy. |
+| `traffic_capture` | Config-only compatibility shape; use `mirror` for live request mirroring. |
 | `message_signatures` | HTTP message signature verification (alpha). |
 
 #### Migration steps

@@ -30,6 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use syn::parse::Parser;
+
 use crate::{MetricCapability, RegistryError, SupportLevel, Writer};
 
 /// Labels Prometheus itself attaches, which no metric declares.
@@ -66,12 +68,481 @@ const QUERY_DIRS: &[&str] = &[
     "deploy/alerts",
 ];
 
-/// A Rust source file with test-gated code removed.
+/// A Rust source file with both its original and production-only views.
 pub struct SourceFile {
     /// Path, relative to the repo root.
     pub path: PathBuf,
+    /// Original file text, used for syntax-aware analysis.
+    pub raw_text: String,
     /// File text with `#[cfg(test)]` items and `#[test]` functions stripped.
     pub text: String,
+}
+
+/// Whether an item's attributes make it unreachable in every production build.
+pub(crate) fn attributes_exclude_production(attributes: &[syn::Attribute]) -> bool {
+    if attributes
+        .iter()
+        .any(|attribute| path_is_test_attribute(attribute.path()))
+    {
+        return true;
+    }
+
+    let predicates = production_cfg_predicates(attributes);
+    predicates.is_some_and(|predicates| {
+        !predicates.is_empty() && !cfg_predicates_can_be_production(&predicates)
+    })
+}
+
+fn path_is_test_attribute(path: &syn::Path) -> bool {
+    if path.is_ident("test") {
+        return true;
+    }
+    let mut segments = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string());
+    matches!(
+        (
+            segments.next().as_deref(),
+            segments.next().as_deref(),
+            segments.next()
+        ),
+        (Some("tokio" | "async_std"), Some("test"), None)
+    )
+}
+
+fn production_cfg_predicates(attributes: &[syn::Attribute]) -> Option<Vec<syn::Meta>> {
+    let mut predicates = Vec::new();
+    for attribute in attributes {
+        let syn::Meta::List(list) = &attribute.meta else {
+            if attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr") {
+                return None;
+            }
+            continue;
+        };
+        if list.path.is_ident("cfg") {
+            predicates.push(list.parse_args::<syn::Meta>().ok()?);
+        } else if list.path.is_ident("cfg_attr") {
+            let items = parse_meta_items(list)?;
+            let (condition, attributes) = items.split_first()?;
+            collect_cfg_attr_predicates(condition, attributes, &mut predicates)?;
+        }
+    }
+    Some(predicates)
+}
+
+fn collect_cfg_attr_predicates(
+    condition: &syn::Meta,
+    attributes: &[syn::Meta],
+    predicates: &mut Vec<syn::Meta>,
+) -> Option<()> {
+    for attribute in attributes {
+        if path_is_test_attribute(attribute.path()) {
+            let condition = condition.clone();
+            predicates.push(syn::parse_quote!(not(#condition)));
+            continue;
+        }
+        let syn::Meta::List(list) = attribute else {
+            continue;
+        };
+        if list.path.is_ident("cfg") {
+            let predicate = list.parse_args::<syn::Meta>().ok()?;
+            let condition = condition.clone();
+            predicates.push(syn::parse_quote!(any(not(#condition), #predicate)));
+        } else if list.path.is_ident("cfg_attr") {
+            let items = parse_meta_items(list)?;
+            let (nested_condition, attributes) = items.split_first()?;
+            let condition = condition.clone();
+            let nested_condition = nested_condition.clone();
+            let combined: syn::Meta = syn::parse_quote!(all(#condition, #nested_condition));
+            collect_cfg_attr_predicates(&combined, attributes, predicates)?;
+        }
+    }
+    Some(())
+}
+
+#[derive(Clone, Copy)]
+struct CfgPossibility {
+    can_be_true: bool,
+    can_be_false: bool,
+}
+
+impl CfgPossibility {
+    const UNKNOWN: Self = Self {
+        can_be_true: true,
+        can_be_false: true,
+    };
+}
+
+fn cfg_predicates_can_be_production(predicates: &[syn::Meta]) -> bool {
+    if cfg_conjunction_has_direct_contradiction(predicates) {
+        return false;
+    }
+    let mut atoms = BTreeSet::new();
+    for predicate in predicates {
+        collect_cfg_atoms(predicate, &mut atoms);
+    }
+    atoms.remove("test");
+    let mut polarities = BTreeMap::<String, CfgAtomPolarity>::new();
+    for predicate in predicates {
+        collect_cfg_atom_polarities(predicate, true, &mut polarities);
+    }
+    let mut atoms: Vec<_> = atoms.into_iter().collect();
+    atoms.sort_by(|left, right| {
+        cfg_atom_search_priority(left, &polarities)
+            .cmp(&cfg_atom_search_priority(right, &polarities))
+            .then_with(|| left.cmp(right))
+    });
+    cfg_assignment_can_satisfy(predicates, &atoms, 0, &mut BTreeMap::<&str, bool>::new())
+}
+
+pub(crate) fn production_cfg_condition_possibility(predicate: &syn::Meta) -> (bool, bool) {
+    let can_be_true = cfg_predicates_can_be_production(std::slice::from_ref(predicate));
+    let predicate = predicate.clone();
+    let negated: syn::Meta = syn::parse_quote!(not(#predicate));
+    let can_be_false = cfg_predicates_can_be_production(std::slice::from_ref(&negated));
+    (can_be_true, can_be_false)
+}
+
+fn cfg_atom_search_priority(atom: &str, polarities: &BTreeMap<String, CfgAtomPolarity>) -> u8 {
+    if atom == "unix"
+        || atom == "windows"
+        || atom
+            .split_once('=')
+            .is_some_and(|(key, _)| cfg_key_has_single_value(key))
+    {
+        return 0;
+    }
+    if polarities
+        .get(atom)
+        .is_some_and(|polarity| polarity.positive && polarity.negative)
+    {
+        return 1;
+    }
+    2
+}
+
+fn cfg_assignment_can_satisfy<'a>(
+    predicates: &[syn::Meta],
+    atoms: &'a [String],
+    index: usize,
+    values: &mut BTreeMap<&'a str, bool>,
+) -> bool {
+    if predicates
+        .iter()
+        .any(|predicate| !evaluate_cfg_predicate(predicate, values).can_be_true)
+    {
+        return false;
+    }
+    let Some(atom) = atoms.get(index).map(String::as_str) else {
+        return true;
+    };
+    for value in [false, true] {
+        if value && !cfg_true_assignment_is_compatible(atom, values) {
+            continue;
+        }
+        values.insert(atom, value);
+        if cfg_assignment_can_satisfy(predicates, atoms, index + 1, values) {
+            values.remove(atom);
+            return true;
+        }
+        values.remove(atom);
+    }
+    false
+}
+
+#[derive(Default)]
+struct CfgAtomPolarity {
+    positive: bool,
+    negative: bool,
+}
+
+fn collect_cfg_atom_polarities(
+    predicate: &syn::Meta,
+    positive: bool,
+    polarities: &mut BTreeMap<String, CfgAtomPolarity>,
+) {
+    match predicate {
+        syn::Meta::Path(path) => {
+            record_cfg_atom_polarity(meta_path_key(path), positive, polarities);
+        }
+        syn::Meta::NameValue(name_value) => {
+            if let Some(atom) = cfg_name_value_key(name_value) {
+                record_cfg_atom_polarity(atom, positive, polarities);
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return;
+            };
+            let [item] = items.as_slice() else {
+                return;
+            };
+            collect_cfg_atom_polarities(item, !positive, polarities);
+        }
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_cfg_atom_polarities(item, positive, polarities);
+                }
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn record_cfg_atom_polarity(
+    atom: String,
+    positive: bool,
+    polarities: &mut BTreeMap<String, CfgAtomPolarity>,
+) {
+    let polarity = polarities.entry(atom).or_default();
+    if positive {
+        polarity.positive = true;
+    } else {
+        polarity.negative = true;
+    }
+}
+
+fn cfg_true_assignment_is_compatible(atom: &str, values: &BTreeMap<&str, bool>) -> bool {
+    if atom == "unix" && values.get("windows") == Some(&true)
+        || atom == "windows" && values.get("unix") == Some(&true)
+    {
+        return false;
+    }
+    let Some((key, _)) = atom.split_once('=') else {
+        return true;
+    };
+    !cfg_key_has_single_value(key)
+        || values.iter().all(|(assigned, value)| {
+            !*value
+                || assigned
+                    .split_once('=')
+                    .is_none_or(|(assigned_key, _)| assigned_key != key || *assigned == atom)
+        })
+}
+
+#[derive(Default)]
+struct RequiredCfgValues {
+    positive: BTreeSet<String>,
+    negative: BTreeSet<String>,
+    single_values: BTreeMap<String, String>,
+    impossible: bool,
+}
+
+fn cfg_conjunction_has_direct_contradiction(predicates: &[syn::Meta]) -> bool {
+    let mut required = RequiredCfgValues::default();
+    for predicate in predicates {
+        collect_required_cfg_values(predicate, true, &mut required);
+    }
+    required.impossible
+        || required.positive.contains("unix") && required.positive.contains("windows")
+}
+
+fn collect_required_cfg_values(
+    predicate: &syn::Meta,
+    positive: bool,
+    required: &mut RequiredCfgValues,
+) {
+    if required.impossible {
+        return;
+    }
+    match predicate {
+        syn::Meta::List(list) if positive && list.path.is_ident("all") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_required_cfg_values(item, true, required);
+                }
+            }
+        }
+        syn::Meta::List(list) if !positive && list.path.is_ident("any") => {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_required_cfg_values(item, false, required);
+                }
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return;
+            };
+            let [item] = items.as_slice() else {
+                return;
+            };
+            collect_required_cfg_values(item, !positive, required);
+        }
+        syn::Meta::Path(path) => {
+            record_required_cfg_atom(meta_path_key(path), positive, required);
+        }
+        syn::Meta::NameValue(name_value) => {
+            let Some((key, value)) = cfg_name_value_parts(name_value) else {
+                return;
+            };
+            let atom = format!("{key}={value}");
+            record_required_cfg_atom(atom, positive, required);
+            if positive
+                && cfg_key_has_single_value(&key)
+                && required
+                    .single_values
+                    .insert(key, value.clone())
+                    .is_some_and(|existing| existing != value)
+            {
+                required.impossible = true;
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn record_required_cfg_atom(atom: String, positive: bool, required: &mut RequiredCfgValues) {
+    let (same, opposite) = if positive {
+        (&mut required.positive, &required.negative)
+    } else {
+        (&mut required.negative, &required.positive)
+    };
+    if opposite.contains(&atom) {
+        required.impossible = true;
+    }
+    same.insert(atom);
+}
+
+fn cfg_key_has_single_value(key: &str) -> bool {
+    matches!(
+        key,
+        "panic"
+            | "target_arch"
+            | "target_abi"
+            | "target_endian"
+            | "target_env"
+            | "target_os"
+            | "target_pointer_width"
+            | "target_vendor"
+    )
+}
+
+fn collect_cfg_atoms(predicate: &syn::Meta, atoms: &mut BTreeSet<String>) {
+    match predicate {
+        syn::Meta::Path(path) => {
+            atoms.insert(meta_path_key(path));
+        }
+        syn::Meta::NameValue(name_value) => {
+            if let Some(key) = cfg_name_value_key(name_value) {
+                atoms.insert(key);
+            }
+        }
+        syn::Meta::List(list)
+            if list.path.is_ident("all")
+                || list.path.is_ident("any")
+                || list.path.is_ident("not") =>
+        {
+            if let Some(items) = parse_meta_items(list) {
+                for item in &items {
+                    collect_cfg_atoms(item, atoms);
+                }
+            }
+        }
+        syn::Meta::List(_) => {}
+    }
+}
+
+fn evaluate_cfg_predicate(predicate: &syn::Meta, values: &BTreeMap<&str, bool>) -> CfgPossibility {
+    match predicate {
+        syn::Meta::Path(path) if path.is_ident("test") => CfgPossibility {
+            can_be_true: false,
+            can_be_false: true,
+        },
+        syn::Meta::Path(path) => assigned_cfg_atom(&meta_path_key(path), values),
+        syn::Meta::NameValue(name_value) => cfg_name_value_key(name_value)
+            .map(|key| assigned_cfg_atom(&key, values))
+            .unwrap_or(CfgPossibility::UNKNOWN),
+        syn::Meta::List(list) if list.path.is_ident("all") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            CfgPossibility {
+                can_be_true: items
+                    .iter()
+                    .all(|item| evaluate_cfg_predicate(item, values).can_be_true),
+                can_be_false: items
+                    .iter()
+                    .any(|item| evaluate_cfg_predicate(item, values).can_be_false),
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("any") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            CfgPossibility {
+                can_be_true: items
+                    .iter()
+                    .any(|item| evaluate_cfg_predicate(item, values).can_be_true),
+                can_be_false: items
+                    .iter()
+                    .all(|item| evaluate_cfg_predicate(item, values).can_be_false),
+            }
+        }
+        syn::Meta::List(list) if list.path.is_ident("not") => {
+            let Some(items) = parse_meta_items(list) else {
+                return CfgPossibility::UNKNOWN;
+            };
+            let [item] = items.as_slice() else {
+                return CfgPossibility::UNKNOWN;
+            };
+            let possibility = evaluate_cfg_predicate(item, values);
+            CfgPossibility {
+                can_be_true: possibility.can_be_false,
+                can_be_false: possibility.can_be_true,
+            }
+        }
+        syn::Meta::List(_) => CfgPossibility::UNKNOWN,
+    }
+}
+
+fn assigned_cfg_atom(key: &str, values: &BTreeMap<&str, bool>) -> CfgPossibility {
+    values
+        .get(key)
+        .map_or(CfgPossibility::UNKNOWN, |value| CfgPossibility {
+            can_be_true: *value,
+            can_be_false: !value,
+        })
+}
+
+fn meta_path_key(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn cfg_name_value_key(name_value: &syn::MetaNameValue) -> Option<String> {
+    let (key, value) = cfg_name_value_parts(name_value)?;
+    Some(format!("{key}={value}"))
+}
+
+fn cfg_name_value_parts(name_value: &syn::MetaNameValue) -> Option<(String, String)> {
+    let value = match &name_value.value {
+        syn::Expr::Lit(expression) => match &expression.lit {
+            syn::Lit::Bool(value) => value.value.to_string(),
+            syn::Lit::Byte(value) => value.value().to_string(),
+            syn::Lit::ByteStr(value) => format!("{:?}", value.value()),
+            syn::Lit::Char(value) => value.value().escape_default().to_string(),
+            syn::Lit::Float(value) => value.base10_digits().to_string(),
+            syn::Lit::Int(value) => value.base10_digits().to_string(),
+            syn::Lit::Str(value) => format!("{:?}", value.value()),
+            syn::Lit::CStr(_) | syn::Lit::Verbatim(_) => return None,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some((meta_path_key(&name_value.path), value))
+}
+
+fn parse_meta_items(list: &syn::MetaList) -> Option<Vec<syn::Meta>> {
+    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .ok()
+        .map(|items| items.into_iter().collect())
 }
 
 /// One metric reference found in a dashboard or rule file.
@@ -100,39 +571,142 @@ pub struct ReferenceExemption {
     pub reason: &'static str,
 }
 
-/// Read every `.rs` file under `crates/`, with test-gated code stripped.
+/// Read production `.rs` files under `crates/`, with test-gated code stripped.
 ///
-/// `e2e/` sits outside `crates/` and is therefore excluded, which is what we
-/// want: an end-to-end test driving a metric does not make it live in
-/// production.
+/// Integration tests, benches, examples, conventional `tests.rs` modules, and
+/// `e2e/` are excluded. A test driving a metric or reading a configuration
+/// field does not make that behavior live in production.
 pub fn rust_sources(root: &Path) -> Vec<SourceFile> {
     let mut out = Vec::new();
-    walk(&root.join("crates"), &mut out);
+    let mut visited = BTreeSet::new();
+    let crates = root.join("crates");
+    let Ok(crate_entries) = fs::read_dir(&crates) else {
+        return out;
+    };
+    for crate_entry in crate_entries.flatten() {
+        let crate_dir = crate_entry.path();
+        let src_dir = crate_dir.join("src");
+        if !src_dir.is_dir() {
+            continue;
+        }
+        for root_name in ["lib.rs", "main.rs"] {
+            let crate_root = src_dir.join(root_name);
+            if crate_root.is_file() {
+                collect_reachable_source(root, &crate_root, &mut visited, &mut out);
+            }
+        }
+        let bin_dir = src_dir.join("bin");
+        let Ok(bin_entries) = fs::read_dir(bin_dir) else {
+            continue;
+        };
+        for bin_entry in bin_entries.flatten() {
+            let path = bin_entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                collect_reachable_source(root, &path, &mut visited, &mut out);
+            } else {
+                let main = path.join("main.rs");
+                if main.is_file() {
+                    collect_reachable_source(root, &main, &mut visited, &mut out);
+                }
+            }
+        }
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn walk(dir: &Path, out: &mut Vec<SourceFile>) {
-    let Ok(entries) = fs::read_dir(dir) else {
+fn collect_reachable_source(
+    repo_root: &Path,
+    path: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<SourceFile>,
+) {
+    let normalized = path.to_path_buf();
+    if !visited.insert(normalized) {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == "target" || name.starts_with('.') {
-                continue;
-            }
-            walk(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if let Ok(text) = fs::read_to_string(&path) {
-                out.push(SourceFile {
-                    text: strip_test_regions(&text),
-                    path,
-                });
-            }
+    out.push(SourceFile {
+        text: strip_test_regions(&text),
+        raw_text: text.clone(),
+        path: path.strip_prefix(repo_root).unwrap_or(path).to_path_buf(),
+    });
+
+    let Ok(file) = syn::parse_file(&text) else {
+        return;
+    };
+    let module_dir = child_module_directory(path);
+    collect_external_modules(repo_root, &file.items, &module_dir, visited, out);
+}
+
+fn collect_external_modules(
+    repo_root: &Path,
+    items: &[syn::Item],
+    module_dir: &Path,
+    visited: &mut BTreeSet<PathBuf>,
+    out: &mut Vec<SourceFile>,
+) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if attributes_exclude_production(&module.attrs) {
+            continue;
+        }
+        if let Some((_, inline_items)) = &module.content {
+            collect_external_modules(
+                repo_root,
+                inline_items,
+                &module_dir.join(module.ident.to_string()),
+                visited,
+                out,
+            );
+            continue;
+        }
+
+        if let Some(target) = module_path_override(module)
+            .map(|relative| module_dir.join(relative))
+            .or_else(|| {
+                let name = module.ident.to_string();
+                [
+                    module_dir.join(format!("{name}.rs")),
+                    module_dir.join(name).join("mod.rs"),
+                ]
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+            })
+        {
+            collect_reachable_source(repo_root, &target, visited, out);
         }
     }
+}
+
+fn child_module_directory(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some("lib" | "main" | "mod") | None => parent.to_path_buf(),
+        Some(stem) => parent.join(stem),
+    }
+}
+
+fn module_path_override(module: &syn::ItemMod) -> Option<PathBuf> {
+    module.attrs.iter().find_map(|attribute| {
+        if !attribute.path().is_ident("path") {
+            return None;
+        }
+        let syn::Meta::NameValue(name_value) = &attribute.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(expression) = &name_value.value else {
+            return None;
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return None;
+        };
+        Some(PathBuf::from(path.value()))
+    })
 }
 
 /// Remove `#[cfg(test)]` items and `#[test]` functions from Rust source.
@@ -141,8 +715,6 @@ fn walk(dir: &Path, out: &mut Vec<SourceFile>) {
 /// item it guards, skipping string literals and comments so a `{` inside
 /// either does not throw off the count. What remains is code that ships.
 pub fn strip_test_regions(src: &str) -> String {
-    const MARKERS: &[&str] = &["#[cfg(test)]", "#[test]", "#[tokio::test]"];
-
     // Byte-wise, not char-wise: source files contain multi-byte characters
     // (an em dash in a doc comment is enough), and slicing `src[i..i + 1]` on
     // one of them panics. Every offset this walk produces lands on an ASCII
@@ -151,12 +723,15 @@ pub fn strip_test_regions(src: &str) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
 
-    'outer: while i < bytes.len() {
-        for marker in MARKERS {
-            if bytes[i..].starts_with(marker.as_bytes()) {
-                i = end_of_item(src, i + marker.len());
-                continue 'outer;
-            }
+    while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            out.extend_from_slice(&bytes[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some(attribute_end) = test_attribute_end(src, i) {
+            i = end_of_item(src, attribute_end);
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -174,6 +749,10 @@ fn end_of_item(src: &str, from: usize) -> usize {
     // Skip to whichever comes first: the item's opening brace, or the
     // semicolon that ends a brace-less item such as a gated `use`.
     while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b';' {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
         i += 1;
     }
     if i >= bytes.len() {
@@ -185,20 +764,11 @@ fn end_of_item(src: &str, from: usize) -> usize {
 
     let mut depth = 0usize;
     while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
         match bytes[i] {
-            b'"' => i = skip_string(src, i),
-            b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-            }
             b'{' => {
                 depth += 1;
                 i += 1;
@@ -214,6 +784,126 @@ fn end_of_item(src: &str, from: usize) -> usize {
         }
     }
     bytes.len()
+}
+
+fn test_attribute_end(src: &str, start: usize) -> Option<usize> {
+    const EXACT: &[&str] = &["#[cfg(test)]", "#[test]"];
+    for marker in EXACT {
+        if src.as_bytes()[start..].starts_with(marker.as_bytes()) {
+            return Some(start + marker.len());
+        }
+    }
+
+    for prefix in ["#[tokio::test", "#[async_std::test"] {
+        if src.as_bytes()[start..].starts_with(prefix.as_bytes()) {
+            let after = start + prefix.len();
+            if !matches!(src.as_bytes().get(after), Some(b']' | b'(')) {
+                continue;
+            }
+            return attribute_end(src, start);
+        }
+    }
+    None
+}
+
+fn attribute_end(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start + 2;
+    let mut parens = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = lexical_region_end(src, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b']' if parens == 0 => return Some(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn lexical_region_end(src: &str, start: usize) -> Option<usize> {
+    if let Some(end) = skip_raw_string(src, start) {
+        return Some(end);
+    }
+
+    let bytes = src.as_bytes();
+    match bytes.get(start).copied()? {
+        b'"' => Some(skip_string(src, start)),
+        b'\'' => skip_char_literal(src, start),
+        b'/' if bytes.get(start + 1) == Some(&b'/') => {
+            let mut i = start + 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            Some(i)
+        }
+        b'/' if bytes.get(start + 1) == Some(&b'*') => {
+            let mut i = start + 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes.get(i..i + 2) == Some(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes.get(i..i + 2) == Some(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Some(i)
+        }
+        _ => None,
+    }
+}
+
+fn skip_raw_string(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    if bytes.get(i) == Some(&b'b') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'r') {
+        return None;
+    }
+    i += 1;
+    let hashes_start = i;
+    while bytes.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let hashes = i - hashes_start;
+    i += 1;
+    while i < bytes.len() {
+        if bytes[i] == b'"'
+            && bytes
+                .get(i + 1..i + 1 + hashes)
+                .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
+        {
+            return Some(i + 1 + hashes);
+        }
+        i += 1;
+    }
+    Some(bytes.len())
+}
+
+fn skip_char_literal(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = start + 1;
+    if bytes.get(i) == Some(&b'\\') {
+        i += 2;
+    } else {
+        let ch = src.get(i..)?.chars().next()?;
+        i += ch.len_utf8();
+    }
+    (bytes.get(i) == Some(&b'\'')).then_some(i + 1)
 }
 
 /// Skip a double-quoted Rust string literal, honoring backslash escapes.
@@ -945,6 +1635,124 @@ pub fn live() { record_thing("a"); }
         let stripped = strip_test_regions(src);
         assert!(stripped.contains("pub fn live"));
         assert!(!stripped.contains("mod tests"));
+    }
+
+    #[test]
+    fn test_markers_inside_strings_and_comments_are_not_attributes() {
+        let src = r##"
+const FIXTURE: &str = r#"#[cfg(test)] fn fixture() { record_thing("fixture"); }"#;
+// #[test] fn comment_only() { record_thing("comment"); }
+pub fn live() { record_thing("live"); }
+"##;
+
+        let stripped = strip_test_regions(src);
+
+        assert!(
+            syn::parse_file(&stripped).is_ok(),
+            "stripping must preserve valid Rust: {stripped}"
+        );
+        assert!(stripped.contains("const FIXTURE"));
+        assert!(stripped.contains("record_thing(\"fixture\")"));
+        assert!(stripped.contains("record_thing(\"live\")"));
+    }
+
+    #[test]
+    fn attributed_tokio_test_with_arguments_is_stripped() {
+        let src = r#"
+#[tokio::test(flavor = "multi_thread")]
+async fn only_test() { record_thing("test"); }
+
+pub fn live() { record_thing("live"); }
+"#;
+
+        let stripped = strip_test_regions(src);
+
+        assert_eq!(count_tokens(&stripped, "record_thing("), 1);
+        assert!(!stripped.contains("only_test"));
+    }
+
+    #[test]
+    fn impossible_cfg_predicates_are_not_production_attributes() {
+        for predicate in [
+            "all(unix, windows)",
+            "all(feature = \"x\", not(feature = \"x\"))",
+        ] {
+            let item: syn::ItemFn =
+                syn::parse_str(&format!("#[cfg({predicate})] fn impossible() {{}}"))
+                    .expect("probe must be valid Rust syntax");
+
+            assert!(
+                attributes_exclude_production(&item.attrs),
+                "cfg({predicate}) cannot exist in any production build"
+            );
+        }
+    }
+
+    #[test]
+    fn single_valued_builtin_cfg_keys_cannot_take_competing_values() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(target_os = \"linux\", target_os = \"windows\"))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "target_os cannot equal linux and windows in one build"
+        );
+    }
+
+    #[test]
+    fn contradictions_remain_impossible_above_the_search_threshold() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(feature = \"x\", not(feature = \"x\"), \
+             feature = \"a\", feature = \"b\", feature = \"c\", feature = \"d\", \
+             feature = \"e\", feature = \"f\", feature = \"g\", feature = \"h\", \
+             feature = \"i\", feature = \"j\", feature = \"k\", feature = \"l\", \
+             feature = \"m\"))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "an atom-count guard cannot hide a direct contradiction"
+        );
+    }
+
+    #[test]
+    fn nested_exclusivity_remains_impossible_with_many_atoms() {
+        let item: syn::ItemFn = syn::parse_str(
+            "#[cfg(all(target_os = \"windows\", not(feature = \"x\"), \
+             any(target_os = \"linux\", feature = \"x\"), \
+             any(feature = \"a\", feature = \"b\", feature = \"c\", feature = \"d\", \
+             feature = \"e\", feature = \"f\", feature = \"g\", feature = \"h\", \
+             feature = \"i\", feature = \"j\", feature = \"k\", feature = \"l\", \
+             feature = \"m\")))] fn impossible() {}",
+        )
+        .expect("probe must be valid Rust syntax");
+
+        assert!(
+            attributes_exclude_production(&item.attrs),
+            "nested target exclusivity cannot fail open above an atom-count threshold"
+        );
+    }
+
+    #[test]
+    fn possible_cfg_predicates_remain_production_attributes() {
+        for predicate in [
+            "any(unix, windows)",
+            "any(test, feature = \"fixtures\")",
+            "all(feature = \"x\", unix)",
+            "all(custom_cfg(foo), not(custom_cfg(bar)))",
+        ] {
+            let item: syn::ItemFn =
+                syn::parse_str(&format!("#[cfg({predicate})] fn possible() {{}}"))
+                    .expect("probe must be valid Rust syntax");
+
+            assert!(
+                !attributes_exclude_production(&item.attrs),
+                "cfg({predicate}) has at least one production assignment"
+            );
+        }
     }
 
     #[test]

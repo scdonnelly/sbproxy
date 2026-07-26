@@ -17,11 +17,46 @@ pub(super) async fn handle_action(
     ctx: &mut RequestContext,
 ) -> Result<bool> {
     match action {
-        Action::Proxy(_)
-        | Action::LoadBalancer(_)
-        | Action::WebSocket(_)
-        | Action::GraphQL(_)
-        | Action::A2a(_) => Ok(false),
+        Action::Proxy(_) | Action::LoadBalancer(_) | Action::WebSocket(_) | Action::A2a(_) => {
+            Ok(false)
+        }
+
+        Action::GraphQL(graphql) => {
+            if !graphql.validation_enabled() {
+                return Ok(false);
+            }
+
+            // The request's final method, URI, headers, and replacement body
+            // do not exist until `upstream_request_filter` applies request
+            // modifiers. Mark it for validation there. Any inbound body still
+            // needs to be drained and captured now so both validation and
+            // forwarding see the same bytes, including when a modifier
+            // changes the request method.
+            ctx.graphql_validation_pending = true;
+            if !session.as_mut().is_body_empty() {
+                // Pingora copies bodies consumed from request_filter into its
+                // replay buffer. The fixed 64 KiB buffer is therefore also
+                // the maximum body that can be validated and then forwarded
+                // byte-for-byte.
+                session.as_mut().enable_retry_buffering();
+                while session.read_request_body().await?.is_some() {}
+                if session.as_ref().retry_buffer_truncated() {
+                    let detail = "validated GraphQL request body exceeds the 64 KiB replay limit"
+                        .to_string();
+                    debug!(detail = %detail, "GraphQL request validation failed");
+                    send_error(session, 413, &detail).await?;
+                    return Ok(true);
+                }
+                let Some(body) = session.as_ref().get_retry_buffer() else {
+                    let detail = "validated GraphQL request body could not be captured for replay";
+                    debug!(detail, "GraphQL request validation failed");
+                    send_error(session, 400, detail).await?;
+                    return Ok(true);
+                };
+                ctx.graphql_request_body = Some(body);
+            }
+            Ok(false)
+        }
 
         Action::Grpc(g) => {
             // WOR-819: a REST request (not native `application/grpc`) sent

@@ -1,5 +1,5 @@
 # Troubleshooting
-*Last modified: 2026-07-18*
+*Last modified: 2026-07-22*
 
 When something breaks, this is the first place to look. Each section is one failure: the symptom, the likely cause, and the fix. For *why* these things happen, see [architecture.md](architecture.md); for what the proxy does on its own while a dependency is down, see [degradation.md](degradation.md); for the dashboard-to-action triage flow, see [operator-runbook.md](operator-runbook.md).
 
@@ -120,7 +120,7 @@ SBproxy adds well under 1 ms of overhead under normal load. If you see more, the
 1. Check `upstream_ttfb_ms` in the structured log. If it's high, the upstream is slow, not SBproxy.
 2. If `upstream_ttfb_ms` is low but total latency is high, suspect DNS. Resolved addresses are cached and refreshed in the background by a refreshing resolver, so a request that lands right after a hostname goes stale pays the resolver round trip.
 3. Turn on OpenTelemetry tracing (`telemetry` block) to get a per-span breakdown across the phase pipeline.
-4. If you have Lua or JavaScript configured, cap runaway scripts with the per-engine sandbox budgets: `proxy.scripting.lua.sandbox.max_execution_ms` and `proxy.scripting.javascript.sandbox.budget_ms`.
+4. If you have Lua configured, cap runaway scripts with `proxy.scripting.lua.sandbox.max_execution_ms`. JavaScript uses its built-in 100 ms budget; the parsed `proxy.scripting.javascript` tuning block is not installed yet.
 5. The `sbproxy_phase_duration_seconds{phase}` histogram (and the matching `auth_ms` / `upstream_ttfb_ms` / `response_filter_ms` access-log fields) splits end-to-end latency into auth, upstream wait, and response transforms, so you can see which phase grew without tracing.
 
 ## No access-log lines appear
@@ -287,10 +287,10 @@ Check:
 
 ## HTTP/3 requests fall back to HTTP/2
 
-Cause: HTTP/3 is currently disabled until native QUIC support lands in Pingora. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
+Cause: HTTP/3 is not served by this build. The proxy does not start a QUIC listener and does not advertise `Alt-Svc`, so HTTP/2 is the highest version served. Clients that try HTTP/3 fall back to HTTP/2, which is expected.
 
 Check:
-- The `proxy.http3` block still parses, but it is inert. Setting `enabled: true` only logs a warning and starts no listener, so the absence of an `Alt-Svc: h3` header on responses is expected.
+- Config compilation rejects `proxy.http3.enabled: true` and references WOR-1969. Remove the block or set `enabled: false`.
 - If you need a UDP/QUIC path today, terminate HTTP/3 at an upstream edge or CDN and forward HTTP/2 to SBproxy.
 
 ## A local model will not serve

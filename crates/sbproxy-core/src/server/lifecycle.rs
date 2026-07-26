@@ -321,13 +321,11 @@ fn install_detection_singletons(compiled: &sbproxy_config::CompiledConfig) {
     // Build the process-wide `AgentClassResolver` from the parsed
     // top-level `agent_classes:` block (or from defaults when the block
     // is absent), then install it in the global slot the request
-    // pipeline reads in `request_filter`. The catalog source toggles
-    // between the embedded `builtin` defaults, an external `hosted-feed`
-    // (placeholder until G2.2 lands the registry fetcher), or the two
-    // `merged` (currently equivalent to defaults; the registry overlay
-    // arrives in G2.2). All paths are infallible: a malformed
-    // `hosted_feed` block degrades gracefully to defaults so a
-    // misconfiguration does not block serving.
+    // pipeline reads in `request_filter`. `builtin` and `inline` are
+    // live. The compatibility values `hosted-feed` and `merged` warn
+    // and use the embedded defaults; the OSS runtime does not fetch or
+    // validate the reserved `hosted_feed` block. All paths are
+    // infallible so an unsupported selection does not block serving.
     #[cfg(feature = "agent-class")]
     {
         install_agent_class_resolver(compiled.agent_classes.as_ref());
@@ -687,7 +685,6 @@ fn reload_from_config_yaml_locked(config_path: &str, yaml: &str) -> anyhow::Resu
         .unwrap_or_else(|| std::path::Path::new("."));
     super::model_host::reconcile_model_runtime_blocking(&new_pipeline, config_dir)
         .map_err(|error| anyhow::anyhow!("model runtime reconciliation failed: {error}"))?;
-
     // --- Phase 3: commit ---
     //
     // Every fallible step is behind us. From here the reload returns
@@ -1103,7 +1100,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // forever.
     let initial_content_hash = crate::identity::config_revision(yaml.as_bytes());
     let compiled = sbproxy_config::compile_config(&yaml)?;
-
     // Fold a cached config-authority bundle into the boot document before
     // anything downstream reads the compiled config: listener ports, TLS
     // hostnames, and the request pipeline all have to describe the
@@ -1944,25 +1940,10 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Register ACME challenge store and Alt-Svc header globally.
+    // Register the ACME challenge store globally.
     if let Some(ref tls) = tls_state {
         reload::set_challenge_store(std::sync::Arc::clone(&tls.challenge_store));
     }
-    // HTTP/3 (QUIC) is temporarily disabled, so we do not advertise it via
-    // Alt-Svc. The listener below is a standalone quinn/h3 stack that is not
-    // integrated with the Pingora request pipeline; advertising HTTP/3 would
-    // steer clients onto a transport that does not honor the full proxy
-    // feature set. Restore this block once Pingora ships native HTTP/3.
-    //
-    // if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-    //     if let Some(https_port) = server_config.https_bind_port {
-    //         reload::set_alt_svc(sbproxy_tls::alt_svc::h3_alt_svc_value(https_port));
-    //         tracing::info!(
-    //             "Alt-Svc header will advertise HTTP/3 on port {}",
-    //             https_port
-    //         );
-    //     }
-    // }
 
     // Start ACME renewal task if enabled.
     if let Some(ref tls) = tls_state {
@@ -1974,41 +1955,6 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
         // bytes on the cert.
         tls.start_ocsp_refresh_task();
     }
-
-    // HTTP/3 (QUIC) support is temporarily disabled until native HTTP/3 lands
-    // in Pingora. The listener is a standalone quinn/h3 stack wired outside
-    // the Pingora pipeline, so enabling it would expose a transport path that
-    // does not run the full request chain. The `http3` config field stays
-    // parseable but is ignored; operators who set it get a warning so the
-    // behavior is visible. The original wiring is preserved below for the
-    // eventual cutover.
-    if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-        tracing::warn!(
-            "HTTP/3 (QUIC) is configured but not available in this build; the \
-             setting is ignored. HTTP/3 will return once native support lands \
-             in the proxy engine."
-        );
-    }
-    // if let Some(ref tls) = tls_state {
-    //     if server_config.http3.as_ref().is_some_and(|h| h.enabled) {
-    //         // Wire the real pipeline dispatch into the H3 listener.
-    //         let dispatch_fn: sbproxy_tls::h3_listener::DispatchFn =
-    //             std::sync::Arc::new(|method, uri, headers, body, client_ip| {
-    //                 Box::pin(crate::dispatch::dispatch_h3_request(
-    //                     method, uri, headers, body, client_ip,
-    //                 ))
-    //             });
-    //         match tls.start_h3_listener(&server_config, dispatch_fn) {
-    //             Ok(Some(_handle)) => {
-    //                 tracing::info!("HTTP/3 listener started");
-    //             }
-    //             Ok(None) => {}
-    //             Err(e) => {
-    //                 tracing::warn!(error = %e, "failed to start HTTP/3 listener, continuing without it");
-    //             }
-    //         }
-    //     }
-    // }
 
     server.bootstrap();
 
@@ -3093,6 +3039,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn real_reload_seeds_replaces_clears_and_preserves_flags_on_rejection() {
+        let _guard = crate::reload::FEATURE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = sbproxy_extension::flags::global_store();
+        let engine = sbproxy_extension::cel::CelEngine::new();
+        let context = sbproxy_extension::cel::CelContext::new();
+
+        reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: new-auth-path
+    default: false
+    rules:
+      allow_list: [alice]
+"#,
+        )
+        .expect("initial flag config should reload");
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("CEL should evaluate"));
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "mallory")"#, &context)
+            .expect("CEL should evaluate"));
+
+        reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: replacement
+    default: true
+"#,
+        )
+        .expect("replacement flag config should reload");
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("new-auth-path", "alice")"#, &context)
+            .expect("old flag should be absent after replacement"));
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("replacement flag should evaluate"));
+
+        let rejected = reload_from_config_yaml(
+            "sb.yml",
+            r#"
+flags:
+  - name: must-not-publish
+    default: true
+origins:
+  "invalid.example":
+    action:
+      type: action-that-does-not-exist
+"#,
+        );
+        assert!(
+            rejected.is_err(),
+            "pipeline construction must reject the invalid action"
+        );
+        assert!(engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("prior flag should survive a rejected reload"));
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("must-not-publish", "any-key")"#, &context)
+            .expect("rejected candidate must not publish flags"));
+
+        reload_from_config_yaml("sb.yml", "proxy: {}\n")
+            .expect("config without flags should reload");
+        assert!(!engine
+            .eval_bool_source(r#"flag_enabled("replacement", "any-key")"#, &context)
+            .expect("an absent block should clear flags"));
+
+        sbproxy_extension::flags::set_global_store(previous);
+    }
+
+    #[test]
     fn proxy_service_startup_error_preserves_native_cert_hint() {
         let payload = "called `Result::unwrap()` on an `Err` value: Failed to load native certificates: No keychain is available";
         let err = proxy_service_startup_error(&payload);
@@ -3260,6 +3281,7 @@ mod tests {
             rate_limits: None,
             audit: None,
             session_ledger: None,
+            flags: Vec::new(),
         };
 
         install_op_redact_state(&compiled);

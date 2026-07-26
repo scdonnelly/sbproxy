@@ -7,6 +7,109 @@
 
 use super::*;
 
+struct ConcurrentLimitDenialResponse {
+    status: u16,
+    content_type: &'static str,
+    body: String,
+}
+
+fn take_concurrent_limit_denial_response(
+    ctx: &mut RequestContext,
+    status: u16,
+    message: &str,
+    policy_type: &str,
+) -> Option<ConcurrentLimitDenialResponse> {
+    if policy_type != "concurrent_limit" {
+        return None;
+    }
+    let body = ctx
+        .concurrent_limit_denial_body
+        .take()
+        .unwrap_or_else(|| error_json_body(message));
+    Some(ConcurrentLimitDenialResponse {
+        status,
+        content_type: "application/json",
+        body,
+    })
+}
+
+#[cfg(test)]
+mod concurrent_limit_denial_response_tests {
+    use super::*;
+
+    #[test]
+    fn configured_body_is_emitted_byte_for_byte() {
+        let configured = "{\"error\":\"busy\"}";
+        let mut ctx = RequestContext::new();
+        ctx.concurrent_limit_denial_body = Some(configured.to_string());
+
+        let response =
+            take_concurrent_limit_denial_response(&mut ctx, 529, configured, "concurrent_limit")
+                .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 529);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(response.body.as_bytes(), configured.as_bytes());
+        assert!(ctx.concurrent_limit_denial_body.is_none());
+    }
+
+    #[test]
+    fn default_message_keeps_the_generic_json_envelope() {
+        let mut ctx = RequestContext::new();
+
+        let response = take_concurrent_limit_denial_response(
+            &mut ctx,
+            503,
+            "too many concurrent requests",
+            "concurrent_limit",
+        )
+        .expect("concurrent-limit response");
+
+        assert_eq!(response.status, 503);
+        assert_eq!(response.content_type, "application/json");
+        assert_eq!(
+            response.body,
+            "{\"error\":\"too many concurrent requests\"}"
+        );
+    }
+}
+
+/// Resolve whether the request's eventual base/forward-rule action is a
+/// GraphQL action with parsing enabled.
+///
+/// Forward-rule matching later in this phase reads the same immutable request
+/// path, query, and headers. Resolving it here lets us enable Pingora's bounded
+/// replay buffer before threat protection or another origin middleware reads
+/// the body.
+fn request_requires_graphql_replay(
+    session: &Session,
+    pipeline: &CompiledPipeline,
+    origin_idx: usize,
+) -> bool {
+    let request = session.req_header();
+    let path = request.uri.path();
+    let query = request.uri.query();
+    let forwarded_action = pipeline
+        .forward_rules
+        .get(origin_idx)
+        .and_then(|rules| {
+            rules.iter().find(|rule| {
+                rule.matchers.iter().any(|matcher| {
+                    matcher
+                        .match_request(path, query, &request.headers)
+                        .is_some()
+                })
+            })
+        })
+        .map(|rule| &rule.action);
+    let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
+
+    matches!(
+        effective_action,
+        Some(Action::GraphQL(graphql)) if graphql.validation_enabled()
+    )
+}
+
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
 pub(super) async fn request_filter(
@@ -953,6 +1056,19 @@ pub(super) async fn request_filter(
         }
     };
     ctx.origin_idx = Some(origin_idx);
+
+    // Validated GraphQL requests may pass through body-consuming middleware
+    // (notably threat protection) before action dispatch. Enable replay at
+    // the origin boundary so every consumed chunk is still available for
+    // GraphQL validation and byte-for-byte upstream forwarding.
+    if request_requires_graphql_replay(session, &pipeline, origin_idx) {
+        session.as_mut().enable_retry_buffering();
+        // Mark this before the idempotency pre-check. A cached response from
+        // an older, more permissive configuration must not return before the
+        // current GraphQL action validates the final modified request.
+        ctx.graphql_validation_pending = true;
+    }
+
     // WOR-1053: stamp the matched origin's tenant on the request
     // context so downstream auth / policy / vault resolution can
     // partition by tenant. The compiler defaults the field to
@@ -2333,6 +2449,7 @@ pub(super) async fn request_filter(
         .idempotencies
         .get(origin_idx)
         .and_then(|o| o.as_ref())
+        .filter(|_| !ctx.graphql_validation_pending)
     {
         let method_matches = idem.methods.contains(&session.req_header().method);
         let header_present = session
@@ -2467,38 +2584,12 @@ pub(super) async fn request_filter(
 
                             let body_hash = sbproxy_middleware::idempotency::hash_body(&buf);
                             if body_hash == cached_resp.request_body_hash {
-                                // Cache hit: replay the cached
-                                // response. Strip framing headers
-                                // so Pingora rederives them on
-                                // the client connection.
-                                let filtered_headers: Vec<(String, String)> = cached_resp
-                                    .headers
-                                    .into_iter()
-                                    .filter(|(name, _)| {
-                                        let lower = name.to_ascii_lowercase();
-                                        lower != "content-length"
-                                            && lower != "transfer-encoding"
-                                            && lower != "connection"
-                                    })
-                                    .collect();
-                                let mut header = pingora_http::ResponseHeader::build(
-                                    cached_resp.status,
-                                    Some(filtered_headers.len() + 1),
-                                )?;
-                                for (name, value) in filtered_headers {
-                                    let _ = header.insert_header(name, value);
-                                }
-                                let _ = header.insert_header("x-sbproxy-idempotency", "HIT");
-                                session
-                                    .write_response_header(Box::new(header), false)
-                                    .await?;
-                                session
-                                    .write_response_body(
-                                        Some(bytes::Bytes::from(cached_resp.body)),
-                                        true,
-                                    )
-                                    .await?;
-                                ctx.response_status = Some(cached_resp.status);
+                                // Cache hit: replay the cached response. The
+                                // shared helper also serves GraphQL hits that
+                                // must wait until final-request validation.
+                                let status =
+                                    send_idempotency_cache_hit(session, cached_resp).await?;
+                                ctx.response_status = Some(status);
                                 return Ok(true);
                             } else {
                                 // Body conflict: same key,
@@ -2592,7 +2683,17 @@ pub(super) async fn request_filter(
             )
             .with_tenant_id(ctx.tenant_id.to_string())
             .emit();
-            if status == 429
+            if let Some(response) =
+                take_concurrent_limit_denial_response(ctx, status, &msg, policy_type)
+            {
+                send_response(
+                    session,
+                    response.status,
+                    response.content_type,
+                    response.body.as_bytes(),
+                )
+                .await?;
+            } else if status == 429
                 && (policy_type == "rate_limit"
                     || policy_type == "ddos"
                     || policy_type == "rate_limit_budget")
@@ -2631,9 +2732,13 @@ pub(super) async fn request_filter(
                                 .insert_header("RateLimit-Remaining", info.remaining.to_string());
                             let _ = header
                                 .insert_header("RateLimit-Reset", info.reset_secs.to_string());
-                            // Window is the per-second budget window.
-                            let _ = header
-                                .insert_header("RateLimit-Policy", format!("{};w=1", info.limit));
+                            if info.include_ratelimit_policy {
+                                // Window is the per-second budget window.
+                                let _ = header.insert_header(
+                                    "RateLimit-Policy",
+                                    format!("{};w=1", info.limit),
+                                );
+                            }
                         }
                     } else if info.headers_enabled {
                         let _ = header.insert_header("X-RateLimit-Limit", info.limit.to_string());

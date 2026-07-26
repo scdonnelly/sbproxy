@@ -36,9 +36,10 @@ pub struct ConfigFile {
     /// Top-level agent-class catalog selection and resolver tuning.
     /// When unset, the binary constructs a resolver from the embedded
     /// default catalog (so per-agent metric labels keep firing);
-    /// operators only set this block when they want to point at a
-    /// hosted feed, merge a custom catalog, or change the rDNS /
-    /// bot-auth / cache settings.
+    /// operators set this block to provide an inline catalog or change
+    /// the rDNS / bot-auth / cache settings. Hosted-feed fields remain
+    /// parseable for compatibility but are not fetched by the OSS
+    /// runtime.
     #[serde(default)]
     pub agent_classes: Option<AgentClassesConfig>,
     /// WOR-1130: top-level workspace rate-limit budget + auto-suspend
@@ -47,9 +48,9 @@ pub struct ConfigFile {
     /// with a soft / throttle / auto-suspend state machine.
     #[serde(default)]
     pub rate_limits: Option<RateLimitsConfig>,
-    /// WOR-1130: audit sink selection for admin-action audit rows
-    /// (e.g. the auto-suspend transition). `memory` keeps the last N
-    /// rows queryable via `/api/audit/recent` (used by tests + ops).
+    /// WOR-1130: compatibility-only audit sink shape. The OSS runtime
+    /// always retains admin-action rows in memory and mirrors them to
+    /// tracing; selecting a sink here has no effect.
     #[serde(default)]
     pub audit: Option<AuditConfig>,
     /// WOR-1186: emit the canonical session ledger (per-tool-call run
@@ -57,11 +58,66 @@ pub struct ConfigFile {
     /// block is present and `enabled: true`.
     #[serde(default)]
     pub session_ledger: Option<SessionLedgerConfig>,
+    /// Process-wide feature flags available to CEL through
+    /// `flag_enabled(name, key)`. An absent or empty list installs an
+    /// empty runtime store, including on hot reload.
+    #[serde(default)]
+    pub flags: Vec<FeatureFlagConfig>,
     /// WOR-1804: how `sbproxy update` behaves for the binary and the
     /// managed inference engines. Optional; an absent block is the same
     /// as the defaults (stable channel, no background check).
     #[serde(default)]
     pub update: UpdateConfig,
+}
+
+/// One process-wide feature flag exposed to CEL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureFlagConfig {
+    /// Unique name passed as the first argument to `flag_enabled`.
+    pub name: String,
+    /// Value returned when none of the configured rules match.
+    #[serde(default)]
+    pub default: bool,
+    /// Allow/block lists and sticky rollout rules.
+    #[serde(default)]
+    pub rules: FeatureFlagRuleConfig,
+}
+
+/// Rules for a process-wide feature flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureFlagRuleConfig {
+    /// Bucketing keys that always evaluate to true.
+    #[serde(default)]
+    pub allow_list: Vec<String>,
+    /// Bucketing keys that always evaluate to false.
+    #[serde(default)]
+    pub block_list: Vec<String>,
+    /// Sticky rollout cutoff in the inclusive range 0..=100.
+    #[serde(default)]
+    #[schemars(range(max = 100))]
+    pub rollout_percent: u32,
+}
+
+#[cfg(test)]
+mod feature_flag_config_tests {
+    use super::*;
+
+    #[test]
+    fn schema_rejects_unknown_flag_fields_and_caps_rollout() {
+        let flag_schema =
+            serde_json::to_value(schemars::schema_for!(FeatureFlagConfig)).expect("flag schema");
+        assert_eq!(flag_schema["additionalProperties"], false);
+
+        let rule_schema = serde_json::to_value(schemars::schema_for!(FeatureFlagRuleConfig))
+            .expect("rule schema");
+        assert_eq!(rule_schema["additionalProperties"], false);
+        assert_eq!(
+            rule_schema["properties"]["rollout_percent"]["maximum"].as_f64(),
+            Some(100.0)
+        );
+    }
 }
 
 /// Which release stream `sbproxy update` follows for the binary and the
@@ -266,15 +322,16 @@ pub enum RateLimitClockMode {
     Manual,
 }
 
-/// WOR-1130: audit sink selection.
+/// WOR-1130: compatibility-only audit sink selection.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct AuditConfig {
-    /// Where admin-action audit rows are kept.
+    /// Accepted for config compatibility but not consumed by the OSS
+    /// runtime. Rows always use both the in-memory ring and tracing.
     #[serde(default)]
     pub sink: AuditSinkKind,
 }
 
-/// WOR-1130: audit sink kinds.
+/// WOR-1130: accepted audit sink names.
 #[derive(
     Debug,
     Clone,
@@ -288,10 +345,12 @@ pub struct AuditConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AuditSinkKind {
-    /// Keep the last N rows in memory, queryable via `/api/audit/recent`.
+    /// Compatibility value; rows remain queryable via `/api/audit/recent`
+    /// and are also mirrored to tracing.
     #[default]
     Memory,
-    /// Emit to the structured `security_audit` tracing target only.
+    /// Compatibility value; rows are still retained in memory as well
+    /// as emitted to the structured `security_audit` tracing target.
     Tracing,
 }
 
@@ -395,11 +454,10 @@ pub enum ConfigSource {
 /// resolver tuning. Most operators leave it untouched.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct AgentClassesConfig {
-    /// Catalog source. `builtin` (default) loads the embedded YAML
-    /// catalog. `inline` loads the entries in `entries`. `hosted-feed`
-    /// fetches from `hosted_feed.url`. `merged` loads the hosted feed
-    /// and overlays it on top of the embedded defaults so an operator's
-    /// feed only needs to ship deltas.
+    /// Catalog source. `builtin` (default) loads the embedded YAML and
+    /// `inline` loads `entries`. The compatibility values `hosted-feed`
+    /// and `merged` currently warn and fall back to the embedded
+    /// defaults; the OSS runtime does not fetch `hosted_feed.url`.
     #[serde(default = "default_agent_classes_catalog")]
     pub catalog: String,
     /// Inline catalog entries. Used when `catalog: inline`; each entry
@@ -407,8 +465,8 @@ pub struct AgentClassesConfig {
     /// embedded catalog.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<serde_json::Value>,
-    /// Hosted-feed configuration. Required when `catalog: hosted-feed`
-    /// or `catalog: merged`.
+    /// Compatibility-only hosted-feed configuration. It remains
+    /// parseable but the OSS runtime does not fetch or merge it.
     #[serde(default)]
     pub hosted_feed: Option<HostedFeedConfig>,
     /// Resolver tuning (rDNS toggle, bot-auth toggle, cache size).
@@ -434,19 +492,17 @@ fn default_agent_classes_catalog() -> String {
 
 /// Hosted-feed source for the agent-class catalog.
 ///
-/// Pulled at startup and refreshed on a schedule the registry owns.
-/// The fetch loop is not implemented in this crate; the field is
-/// reserved here so YAML written against the merged or hosted-feed
-/// shapes parses cleanly.
+/// Reserved so YAML written against the `hosted-feed` or `merged`
+/// shapes parses cleanly. The OSS runtime does not fetch, refresh, or
+/// verify this feed; selecting either catalog value warns and falls
+/// back to the embedded defaults.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HostedFeedConfig {
-    /// Feed URL. Plain `http://` is allowed only against `127.0.0.1`
-    /// and `localhost` for local development; the registry crate
-    /// enforces HTTPS at fetch time for any other host.
+    /// Reserved feed URL. It is accepted but not fetched or validated
+    /// by the OSS runtime.
     pub url: String,
-    /// Bootstrap public keys (base64-encoded ed25519 keys) used to
-    /// verify the feed's detached signature on the first fetch.
-    /// Empty in dev configs; required for production.
+    /// Reserved bootstrap public keys. They are accepted but no
+    /// signature verification is installed in the OSS runtime.
     #[serde(default)]
     pub bootstrap_keys: Vec<String>,
 }
@@ -536,25 +592,20 @@ pub struct ProxyServerConfig {
     /// overrides the manual `tls_cert_file` / `tls_key_file` pair.
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
-    /// Optional HTTP/3 (QUIC) listener configuration.
+    /// Reserved HTTP/3 (QUIC) listener configuration.
     ///
-    /// Temporarily inert: HTTP/3 is disabled until native QUIC support lands
-    /// in the underlying proxy engine. The field still parses so existing
-    /// configs keep loading, but enabling it only logs a warning and does not
-    /// start a listener.
+    /// The block remains in the schema for forward compatibility. Omission or
+    /// `enabled: false` compiles, but `enabled: true` is rejected because this
+    /// build does not serve HTTP/3. Native support is tracked in WOR-1969.
     #[serde(default)]
     pub http3: Option<Http3Config>,
     /// Metrics collection settings, including cardinality limiting.
     #[serde(default)]
     pub metrics: Option<MetricsConfig>,
-    /// Top-level observability block: groups `log` (tracing-subscriber
-    /// filter / format / sampling) and `telemetry` (OTLP exporter)
-    /// under one block so an operator configures the whole surface
-    /// from YAML instead of CLI flags + env vars.
-    ///
-    /// When absent, CLI / env precedence still applies; the YAML
-    /// fields are a third source of truth that wins over the existing
-    /// `RUST_LOG` default but loses to `--log-level` / `SB_LOG_LEVEL`.
+    /// Top-level observability block: live log sinks, redaction and custom
+    /// fields plus the OTLP exporter and durable usage rollups. The parent log
+    /// level, format, and sampling fields are compatibility-only; process
+    /// tracing uses CLI/environment selection and built-in sampling defaults.
     #[serde(default)]
     pub observability: Option<ObservabilityConfig>,
     /// Alert notification channel configuration.
@@ -1557,7 +1608,8 @@ pub struct KeyGovernanceConfig {
     /// be pre-gated must not be silently treated as unlimited.
     #[serde(default)]
     pub missing_rate: GovernanceMissingRatePolicy,
-    /// Expose the authenticated caller-only `GET /api/v1/key` endpoint.
+    /// Reserved caller-introspection switch. The OSS runtime does not install
+    /// `GET /api/v1/key`; retained for config compatibility.
     pub key_introspection: bool,
     /// Require AI requests to resolve to a governed key instead of accepting
     /// origin credentials or anonymous access.
@@ -1780,8 +1832,8 @@ pub struct KeyStoreConfig {
     /// Redis connection URL (backend `redis`).
     #[serde(default)]
     pub url: Option<String>,
-    /// Treat Redis as the source of truth rather than a coherence tier
-    /// (backend `redis`).
+    /// Legacy compatibility switch. Selecting `backend: redis` already makes
+    /// Redis the key store; this value does not change runtime behavior.
     #[serde(default)]
     pub redis_source_of_truth: bool,
     /// Secret-reference namespace prefix (backend `secrets_manager`).
@@ -2167,10 +2219,9 @@ pub struct SeedCredentialConfig {
 /// Per-engine scripting sandbox limits, exposed under the
 /// `proxy.scripting:` block of sb.yml.
 ///
-/// Today this block carries sub-blocks for the Lua engine
-/// and the JavaScript engine. The CEL and WebAssembly
-/// engines manage their own budgets separately. Operators who omit
-/// the block get the documented defaults from each sub-block.
+/// The Lua sub-block is installed into the live engine. The JavaScript
+/// sub-block remains parseable for compatibility but `JsEngine::new` uses its
+/// built-in defaults; CEL and WebAssembly manage their own budgets separately.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ScriptingConfig {
     /// Lua sandbox limits. Always populated, even when the operator
@@ -2178,19 +2229,16 @@ pub struct ScriptingConfig {
     /// `None`.
     #[serde(default)]
     pub lua: LuaScriptingConfig,
-    /// JavaScript engine sandbox knobs. Covers the QuickJS-backed
-    /// `JsEngine` used by transforms, request matchers, and WAF
-    /// custom rules.
+    /// Reserved JavaScript sandbox shape. It is not installed into the
+    /// QuickJS-backed `JsEngine` by the OSS boot path.
     #[serde(default)]
     pub javascript: JsScriptingConfig,
 }
 
 /// JavaScript engine config block (`proxy.scripting.javascript:`).
 ///
-/// Wraps the sandbox limits the engine enforces every time it runs a
-/// script. Adding fresh knobs here (module loader settings, host
-/// bindings, ...) should keep `sandbox:` as its own sub-block so
-/// existing configs keep parsing.
+/// Retained so existing configs keep parsing. Programmatic callers may pass
+/// this sandbox to `JsEngine::with_sandbox`, but the YAML boot path does not.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct JsScriptingConfig {
     /// Sandbox limits: CPU time budget, heap memory cap, and native
@@ -3748,15 +3796,13 @@ pub struct AlertingConfig {
     pub channels: Vec<AlertChannelConfig>,
 }
 
-/// Top-level observability block: groups the `log` and `telemetry`
-/// sub-blocks so an operator can configure both from YAML rather than
-/// CLI flags + env vars. Re-uses the existing `LoggingConfig` and
-/// `TelemetryConfig` shapes from `sbproxy-observe`.
+/// Top-level observability block grouping live log extensions, telemetry, and
+/// durable usage rollups. The legacy process-logger fields under `log` remain
+/// parseable but are not installed into the tracing subscriber.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityConfig {
-    /// `tracing-subscriber` configuration: level, format, per-level
-    /// sampling. CLI / env still wins where applicable; this block is
-    /// the YAML source-of-truth for everything else.
+    /// Log sinks, redaction, and custom fields, plus compatibility-only parent
+    /// level, format, and per-level sampling values.
     #[serde(default)]
     pub log: Option<ObservabilityLogConfig>,
     /// OTLP exporter configuration. When `enabled = true`, the
@@ -3821,13 +3867,16 @@ fn default_rollup_daily_days() -> u32 {
 /// observe crate.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ObservabilityLogConfig {
-    /// Log level filter. `debug | info | warn | error`. Default `info`.
+    /// Compatibility-only process log level. Use CLI/environment controls;
+    /// this YAML value is not installed into the tracing subscriber.
     #[serde(default)]
     pub level: Option<String>,
-    /// Output format. `compact | pretty | json`. Default `compact`.
+    /// Compatibility-only process output format. Sink-local `format` remains
+    /// live, while the process subscriber uses CLI/environment controls.
     #[serde(default)]
     pub format: Option<String>,
-    /// Per-level emission sampling rates. Default 1.0 / 0.1 / 0.01.
+    /// Compatibility-only per-level sampling rates. The process logger uses
+    /// its built-in sampling defaults.
     #[serde(default)]
     pub sampling: Option<ObservabilitySamplingConfig>,
     /// Operator-extensible redaction block. `fields` extends the
@@ -4156,15 +4205,15 @@ pub struct AlertChannelConfig {
 
 /// HTTP/3 (QUIC) configuration.
 ///
-/// Temporarily inert: HTTP/3 is disabled until native QUIC support lands in
-/// the underlying proxy engine. These fields still parse, but the listener is
-/// not started; enabling it logs a warning instead.
+/// The shape is reserved for forward compatibility. The config compiler
+/// accepts an omitted or disabled block, but rejects `enabled: true` because
+/// this build does not serve HTTP/3. Native support is tracked in WOR-1969.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Http3Config {
     /// Whether to enable the HTTP/3 (QUIC) listener.
     ///
-    /// Currently ignored: HTTP/3 is temporarily disabled (see the struct
-    /// docs). Setting this to `true` logs a warning and starts no listener.
+    /// Must remain `false` in this build. Setting it to `true` fails config
+    /// compilation because HTTP/3 is not served.
     #[serde(default)]
     pub enabled: bool,
     /// Maximum number of concurrent QUIC streams per connection.
@@ -4187,31 +4236,27 @@ fn default_idle_timeout() -> u32 {
 
 // --- ConnectionPoolConfig ---
 
-/// Per-origin connection pool tuning parameters.
+/// Legacy per-origin connection-pool shape.
 ///
-/// Controls how many concurrent connections are maintained to an upstream,
-/// how long idle connections are kept alive, and the maximum lifetime of
-/// any individual connection.
+/// The OSS runtime does not install these values into Pingora. They remain in
+/// the schema so existing configuration files continue to parse.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ConnectionPoolConfig {
     /// Maximum number of concurrent connections to the upstream.
     ///
-    /// Additional requests will queue until a connection is available.
-    /// Default: 128.
+    /// Config-only compatibility value. Default: 128.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
     /// Maximum idle time before a connection is closed, in seconds.
     ///
-    /// Connections that have been unused for longer than this will be
-    /// dropped from the pool.  Default: 90 s.
+    /// Config-only compatibility value. Default: 90 s.
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
 
     /// Maximum total lifetime of a connection, in seconds.
     ///
-    /// Connections older than this will be closed and replaced even if they
-    /// are still healthy.  Default: 300 s.
+    /// Config-only compatibility value. Default: 300 s.
     #[serde(default = "default_max_lifetime_secs")]
     pub max_lifetime_secs: u32,
 }
@@ -4386,7 +4431,7 @@ pub struct TenantObservabilityRedactConfig {
 /// * Where the secret material lives (`key`, a provider-specific
 ///   secret reference such as `vault://`, `awssm://`, `gcpsm://`,
 ///   `k8ssecret://`, `secretfile://`, or `secret://`, or a legacy
-///   `${ENV}` / `file:` / `secret:` reference).
+///   `${ENV}` / `file:` reference).
 /// * Which inbound principals can use it (`principals` selectors).
 /// * Per-credential attribution metadata (`attrs`).
 /// * Allow / deny model lists that stack on top of the origin-level
@@ -4409,9 +4454,10 @@ pub struct CredentialBlock {
     pub provider: Option<String>,
     /// Secret material reference. Provider-specific schemes include
     /// `vault://`, `awssm://`, `gcpsm://`, `k8ssecret://`,
-    /// `secretfile://`, and `secret://`; legacy `${ENV}`, `file:`,
-    /// and `secret:` forms also remain valid. The resolver dispatches
-    /// at runtime; the config parser carries it as a string.
+    /// `secretfile://`, and `secret://`; legacy `${ENV}` and `file:`
+    /// forms also remain valid. The removed `secret:<name>` form is
+    /// rejected. The resolver dispatches at runtime; the config parser
+    /// carries the value as a string.
     #[serde(default)]
     pub key: Option<String>,
     /// Principal selectors that match this credential to inbound
@@ -4420,7 +4466,8 @@ pub struct CredentialBlock {
     /// match the request.
     #[serde(default)]
     pub principals: Vec<PrincipalSelector>,
-    /// Attribution attributes copied onto matched principals.
+    /// Attribution attributes lowered onto matched principals. Individual
+    /// compatibility-only fields are documented on their definitions.
     #[serde(default)]
     pub attrs: CredentialAttrs,
     /// Model allow / deny lists. Stacks on top of the origin-level
@@ -4495,8 +4542,10 @@ pub struct CredentialAttrs {
     /// inbound request authenticates as).
     #[serde(default)]
     pub user: Option<String>,
-    /// Team grouping. Drives the team partition on the
-    /// per-credential attribution metric.
+    /// Compatibility-only team grouping. The field remains parseable, but
+    /// credential lowering does not currently copy it onto the matched
+    /// principal. Use `tags` or `metadata` for live attribution until
+    /// WOR-1976 wires this value.
     #[serde(default)]
     pub team: Option<String>,
     /// Cost center. Lifted onto `Principal.attrs.metadata` under
@@ -4519,17 +4568,19 @@ pub struct CredentialAttrs {
     pub budget: Option<CredentialBudget>,
 }
 
-/// Per-credential budget. Reset windows use the LiteLLM-style
-/// `30s|30m|30h|30d` syntax.
+/// Per-credential budget. The token and cost caps are lowered into
+/// the live credential registry. `reset` remains a reserved,
+/// compatibility-only field and does not install a reset schedule.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CredentialBudget {
-    /// Maximum tokens (input + output combined) per reset window.
+    /// Maximum input + output tokens enforced for this credential.
     #[serde(default)]
     pub max_tokens: Option<u64>,
-    /// Maximum USD spend per reset window.
+    /// Maximum USD spend enforced for this credential.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
-    /// Reset window. Parsed at config-load.
+    /// Reserved reset-window hint. It is accepted but not parsed or
+    /// enforced by the OSS runtime.
     #[serde(default)]
     pub reset: Option<String>,
 }
@@ -4659,7 +4710,8 @@ pub struct RawOriginConfig {
     /// Threat protection (IP reputation, blocklist) configuration.
     #[serde(default)]
     pub threat_protection: Option<serde_json::Value>,
-    /// Configuration for rate-limit response headers (`X-RateLimit-*`, `Retry-After`).
+    /// Compatibility-only origin-level rate-limit header shape. Configure the
+    /// live rate-limit policy's `headers` block instead.
     #[serde(default)]
     pub rate_limit_headers: Option<serde_json::Value>,
     /// Per-status custom error response bodies. Each entry covers one
@@ -4684,7 +4736,8 @@ pub struct RawOriginConfig {
     /// wide branding (e.g. `acme-edge`).
     #[serde(default)]
     pub proxy_status: Option<ProxyStatusConfig>,
-    /// Traffic capture / mirroring configuration.
+    /// Compatibility-only traffic-capture shape. The OSS runtime has no
+    /// consumer; use [`MirrorConfig`] for live request mirroring.
     #[serde(default)]
     pub traffic_capture: Option<serde_json::Value>,
     /// Shadow traffic mirror, fire-and-forget copy of each request to
@@ -4716,8 +4769,8 @@ pub struct RawOriginConfig {
     /// header. See [`IdempotencyConfig`].
     #[serde(default)]
     pub idempotency: Option<IdempotencyConfig>,
-    /// Per-origin connection pool tuning.  Falls back to proxy-wide defaults
-    /// when not specified.
+    /// Compatibility-only per-origin connection-pool shape. Pingora's built-in
+    /// pool settings apply regardless of these values.
     #[serde(default)]
     pub connection_pool: Option<ConnectionPoolConfig>,
     /// Opaque per-origin extensions for out-of-tree config blocks.
@@ -5250,19 +5303,21 @@ pub struct PathMatcher {
 }
 
 /// Inline child origin used when a forward rule fires. Carries the action plus
-/// optional request modifiers and identifying metadata.
+/// optional request modifiers. Compatibility metadata fields remain parseable
+/// but are not copied into the compiled child origin.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ForwardRuleOrigin {
     /// Optional identifier used in metrics and logs.
     #[serde(default)]
     pub id: Option<String>,
-    /// Optional hostname tag (informational; the parent origin's hostname is what routed the request).
+    /// Compatibility-only hostname tag. The parent origin's hostname
+    /// routes the request; this value is not consumed.
     #[serde(default)]
     pub hostname: Option<String>,
-    /// Optional workspace identifier.
+    /// Compatibility-only workspace identifier; not consumed.
     #[serde(default)]
     pub workspace_id: Option<String>,
-    /// Optional version label.
+    /// Compatibility-only version label; not consumed.
     #[serde(default)]
     pub version: Option<String>,
     /// Action executed when the rule fires. Stays as raw JSON because action
@@ -5364,7 +5419,8 @@ pub struct ResponseModifierConfig {
     /// Header set/add/remove operations.
     #[serde(default)]
     pub headers: Option<HeaderModifiers>,
-    /// Override the response status code and optional reason text.
+    /// Override the response status code. A supplied `text` value is
+    /// accepted for compatibility but ignored.
     #[serde(default)]
     pub status: Option<StatusOverride>,
     /// Response body replacement.
@@ -5383,7 +5439,8 @@ pub struct ResponseModifierConfig {
 pub struct StatusOverride {
     /// The HTTP status code to set.
     pub code: u16,
-    /// Optional reason phrase (not sent in HTTP/2, informational only).
+    /// Compatibility-only reason phrase. The runtime applies `code`
+    /// and ignores this value for every HTTP version.
     #[serde(default)]
     pub text: Option<String>,
 }
@@ -5417,16 +5474,15 @@ pub struct HeaderModifiers {
 
 /// Top-level secrets management configuration.
 ///
-/// Controls which vault backend is used to resolve `secret:` references in
-/// config values and how secret rotation is handled.
+/// The live surface is [`SecretsConfig::backends`], selected by provider URI
+/// references. The legacy single-backend and rotation fields remain parseable
+/// for compatibility but are not consumed by the OSS runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SecretsConfig {
-    /// Backend to use for resolving secrets.
-    ///
-    /// Supported values: `"env"` (default), `"local"`, `"hashicorp"`.
+    /// Legacy single-backend selector. Use [`SecretsConfig::backends`].
     #[serde(default = "default_secrets_backend")]
     pub backend: String,
-    /// HashiCorp Vault connection settings. Required when `backend = "hashicorp"`.
+    /// Legacy HashiCorp block. Declare a named `hashicorp` backend instead.
     #[serde(default)]
     pub hashicorp: Option<HashiCorpSecretsConfig>,
     /// Logical name to vault path mapping. INERT since the removal of
@@ -5435,12 +5491,11 @@ pub struct SecretsConfig {
     /// Use `secret://<backend>/<name>` references instead.
     #[serde(default)]
     pub map: HashMap<String, String>,
-    /// Secret rotation settings.
+    /// Reserved rotation shape; no OSS scheduler consumes it.
     #[serde(default)]
     pub rotation: Option<RotationConfig>,
-    /// Fallback strategy when the vault backend is unavailable.
-    ///
-    /// Supported values: `"cache"` (default), `"reject"`, `"env"`.
+    /// Legacy fallback selector; provider URI resolution fails loudly and does
+    /// not consult this value.
     #[serde(default = "default_fallback")]
     pub fallback: String,
     /// Named secret backends that provider-URI references resolve against
@@ -5673,7 +5728,10 @@ pub enum K8sBackendAuth {
     },
 }
 
-/// HashiCorp Vault connection settings.
+/// Legacy HashiCorp Vault connection settings.
+///
+/// The OSS resolver consumes the `hashicorp` variant in
+/// [`SecretsConfig::backends`], not this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct HashiCorpSecretsConfig {
     /// Vault server address (e.g. `"https://vault.example.com:8200"`).
@@ -5686,7 +5744,9 @@ pub struct HashiCorpSecretsConfig {
     pub mount: String,
 }
 
-/// Secret rotation configuration.
+/// Reserved secret-rotation configuration.
+///
+/// No OSS scheduler consumes this compatibility block.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RotationConfig {
     /// Seconds the previous secret value remains valid after rotation.

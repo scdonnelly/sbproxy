@@ -652,12 +652,18 @@ fn lower_credentials_into_origin_virtual_keys(file: &mut crate::types::ConfigFil
             .map(|cred| {
                 // Convert the per-credential attrs to the legacy
                 // ai_project / ai_user / tags / metadata shape.
-                let metadata: serde_json::Map<String, serde_json::Value> = cred
+                let mut metadata: serde_json::Map<String, serde_json::Value> = cred
                     .attrs
                     .metadata
                     .iter()
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
+                if let Some(cost_center) = &cred.attrs.cost_center {
+                    metadata.insert(
+                        "cost_center".to_string(),
+                        serde_json::Value::String(cost_center.clone()),
+                    );
+                }
                 let key = cred.key.clone().unwrap_or_default();
                 let key_id = format!(
                     "cfg:{}:{}:{}:{}:{}",
@@ -1202,6 +1208,20 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
     // new shapes coexist (operator must pick one).
     let yaml = migrate_features_to_extensions(&yaml)?;
 
+    // WOR-1976: make every explicitly configured compatibility-only key
+    // visible at boot. Inspect the raw YAML so omitted serde-defaulted fields
+    // stay quiet; the same registry is enforced against the generated schema
+    // by the build-time reader guard.
+    if let Ok(raw_yaml) = serde_yaml::from_str::<serde_yaml::Value>(&yaml) {
+        for key in crate::key_registry::configured_config_only_keys(&raw_yaml) {
+            tracing::warn!(
+                config_key = key.path,
+                reason = key.note.unwrap_or("no live OSS consumer"),
+                "config-only key is set and does not activate runtime behavior"
+            );
+        }
+    }
+
     // Reject the legacy `virtual_keys:` YAML key with a pointer to
     // the migration guide. The credentials epic replaces it with the
     // canonical `credentials:` block; an operator with the old shape
@@ -1260,6 +1280,41 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
              Fix the spelling, or nest an out-of-tree block under `proxy.extensions:` (or \
              the origin's `extensions:`).",
             nested_unknowns.join(", ")
+        );
+    }
+
+    {
+        let mut names = std::collections::HashSet::with_capacity(config_file.flags.len());
+        for flag in &config_file.flags {
+            if flag.name.trim().is_empty() {
+                anyhow::bail!("config compile: flags[].name must not be empty");
+            }
+            if !names.insert(flag.name.as_str()) {
+                anyhow::bail!(
+                    "config compile: duplicate top-level feature flag name `{}`",
+                    flag.name
+                );
+            }
+            if flag.rules.rollout_percent > 100 {
+                anyhow::bail!(
+                    "config compile: flag `{}` has rollout_percent {}; expected 0..=100",
+                    flag.name,
+                    flag.rules.rollout_percent
+                );
+            }
+        }
+    }
+
+    if config_file
+        .proxy
+        .http3
+        .as_ref()
+        .is_some_and(|http3| http3.enabled)
+    {
+        anyhow::bail!(
+            "config compile: proxy.http3.enabled=true is not supported because HTTP/3 is not \
+             served by this build. Set `enabled: false` or remove the `http3` block. Native \
+             HTTP/3 support is tracked in WOR-1969."
         );
     }
 
@@ -1466,11 +1521,14 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         // `sbproxy-core` (which depends on the classifier crate); this
         // crate stays ignorant of the typed resolver.
         agent_classes: config_file.agent_classes,
-        // WOR-1130: top-level workspace rate-limit budget + audit sink.
+        // WOR-1130: top-level workspace rate-limit budget plus the
+        // compatibility-only audit selector.
         rate_limits: config_file.rate_limits,
         audit: config_file.audit,
         // WOR-1186: session-ledger emission config.
         session_ledger: config_file.session_ledger,
+        // WOR-1971: hand the complete top-level flag set to the binary.
+        flags: config_file.flags,
     })
 }
 
@@ -1880,6 +1938,85 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn top_level_feature_flags_compile_into_the_runtime_snapshot() {
+        let compiled = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: false
+    rules:
+      allow_list: [alice]
+      block_list: [mallory]
+      rollout_percent: 25
+"#,
+        )
+        .expect("top-level flags should compile");
+
+        assert_eq!(compiled.flags.len(), 1);
+        let flag = &compiled.flags[0];
+        assert_eq!(flag.name, "new-checkout");
+        assert!(!flag.default);
+        assert_eq!(flag.rules.allow_list, ["alice"]);
+        assert_eq!(flag.rules.block_list, ["mallory"]);
+        assert_eq!(flag.rules.rollout_percent, 25);
+    }
+
+    #[test]
+    fn duplicate_top_level_feature_flag_names_fail_compile() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: new-checkout
+    default: true
+  - name: new-checkout
+    default: false
+"#,
+        )
+        .err()
+        .expect("duplicate flag names must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("duplicate"), "{message}");
+        assert!(message.contains("new-checkout"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_rollout_percent_must_be_at_most_one_hundred() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: impossible-rollout
+    rules:
+      rollout_percent: 101
+"#,
+        )
+        .err()
+        .expect("an out-of-range rollout must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("impossible-rollout"), "{message}");
+        assert!(message.contains("0..=100"), "{message}");
+    }
+
+    #[test]
+    fn feature_flag_segments_are_rejected_until_cel_accepts_a_segment() {
+        let error = compile_config(
+            r#"
+flags:
+  - name: segment-only
+    rules:
+      segments: [beta]
+"#,
+        )
+        .err()
+        .expect("an unread segment rule must be rejected");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("segments"), "{message}");
+        assert!(message.contains("unknown field"), "{message}");
+    }
+
     fn custom_field(
         name: &str,
         value: Option<&str>,
@@ -2155,6 +2292,70 @@ origins:
                 "{reachable} reaches beyond loopback"
             );
         }
+    }
+
+    #[test]
+    fn http3_enabled_is_rejected_because_it_is_not_served() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let error = compile_config(yaml)
+            .err()
+            .expect("proxy.http3.enabled=true must fail config compilation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("proxy.http3.enabled")
+                && message.contains("not served")
+                && message.contains("WOR-1969"),
+            "error must name the unsupported setting, explain that it is not served, and point \
+             to the implementation ticket: {message}"
+        );
+    }
+
+    #[test]
+    fn http3_explicitly_disabled_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+  http3:
+    enabled: false
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("disabled HTTP/3 config remains valid");
+        assert_eq!(
+            compiled.server.http3.as_ref().map(|config| config.enabled),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn http3_omitted_remains_valid() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+
+        let compiled = compile_config(yaml).expect("omitted HTTP/3 config remains valid");
+        assert!(compiled.server.http3.is_none());
     }
 
     // WOR-1140: unknown-config-key handling.
@@ -2588,6 +2789,7 @@ proxy:
       key: ${OPENAI_API_KEY}
       attrs:
         project: shared
+        cost_center: research
         tags: [tier-shared]
 origins:
   ai.local:
@@ -2613,6 +2815,10 @@ origins:
         assert_eq!(vks[0]["project"], "shared");
         assert_eq!(vks[0]["allowed_providers"][0], "openai");
         assert_eq!(vks[0]["tags"][0], "tier-shared");
+        assert_eq!(
+            vks[0]["metadata"]["cost_center"], "research",
+            "cost_center must be lifted into the runtime metadata map"
+        );
     }
 
     /// `route_to_model` and `inject_tools` set on a credentials-block

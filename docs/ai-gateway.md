@@ -1,6 +1,6 @@
 # SBproxy AI gateway guide
 
-*Last modified: 2026-07-19*
+*Last modified: 2026-07-23*
 
 ![the same OpenAI-shape request answered by OpenAI, Claude, and Gemini, switched only by Host header](assets/ai-gateway.gif)
 
@@ -361,14 +361,19 @@ The same block hosts the legacy `llm_aware.context_compress` shorthand, which ma
 
 ## Shadow eval
 
-Mirror each request to a second provider concurrently. The primary's response is what the client sees; the shadow body is drained and metrics are emitted at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish_reason). Useful for prompt regression checks before swapping a primary model.
+Mirror a sampled set of non-streaming chat evaluation requests to a second provider. V1 includes Chat Completions plus Messages and Responses requests after those native formats are normalized to the chat hub. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The copy is taken after request policy, guardrails, model rewrites, and context compression. Shadow admission is bounded by both 16 in-flight tasks and a 64 MiB reservation budget per live AI client, and the upstream call is fire-and-forget: a slow, failed, timed-out, policy-disallowed, or saturated shadow never delays or rejects the primary. Streaming requests are intentionally skipped.
+
+The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target=sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Configured usage sinks also receive a separate row with `tag: shadow` and a fresh server-generated request ID ending in `:shadow`. That row estimates shadow cost for comparison, but it never debits the primary budget tracker.
 
 ```yaml
 shadow:
   provider: anthropic
   sample_rate: 0.1
   timeout_ms: 30000
+  task_timeout_ms: 30000
 ```
+
+The shadow provider must appear in `providers`. Set `enabled: false` on a shadow-only provider to exclude it from primary routing; explicit shadow selection still uses it. Credential `allowed_providers` and `blocked_providers` rules apply to it independently; a disallowed shadow is suppressed while the primary continues. The `x-sbproxy-disallow-prompt-training` opt-out also suppresses a shadow provider unless it declares `no_prompt_training: true`. If the hosting process attaches a purpose-scoped egress authorizer to `AiClient`, v1 shadow dispatch fails closed because the shadow transport cannot yet consume authorized DNS pins and redirect checks. `sbproxy_ai_shadow_dropped_total{reason=...}` reports the closed skip/drop reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Deliberate sample misses are not failures and do not increment that counter.
 
 See [examples/ai-shadow](../examples/ai-shadow/sb.yml).
 
@@ -846,7 +851,7 @@ origins:
 | `models.deny` | list of string | `[]` | Takes precedence over `models.allow`. |
 | `principals` | list | `[]` | Principal selectors gating who may use the credential. Empty matches everyone. |
 | `policies` | list | `[]` | Closed set: `rate_limit` (with `rpm`) and `require_pii_redaction`. There is no per-key tokens-per-minute knob; cap token spend with `attrs.budget.max_tokens`. |
-| `attrs` | object | unset | Attribution: `project`, `user`, `team`, `cost_center`, `tags`, `metadata`, and `budget` (`max_tokens`, `max_cost_usd`, `reset`). The per-key budget is independent of the global `budget` block. |
+| `attrs` | object | unset | Attribution: `project`, `user`, `cost_center`, `tags`, `metadata`, and `budget`. `team` is accepted with a config-only warning but is not copied into the principal; use `tags` or `metadata` instead. `budget.max_tokens` and `.max_cost_usd` add total per-key ceilings; `.reset` is also accepted with a config-only warning and does not install a reset schedule. The per-key budget is independent of the global `budget` block. |
 | `route_to_model` | string | unset | Pins every request from this credential to one model. |
 | `compression_profile` | string | unset | Selects `on`, `off`, or a named compression profile declared by this AI route. |
 | `inject_tools` | list | `[]` | Provider-native tool definitions injected into requests from this credential. |
