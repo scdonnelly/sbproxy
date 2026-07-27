@@ -11,21 +11,18 @@ mod context_poisoning_rules;
 // constants without duplicating the lists.
 pub mod injection;
 mod jailbreak;
-// The LLM classifier backend lives here rather than in `sbproxy-core`
-// (where the ONNX embedding backend has to live) because it has no ONNX
-// dependency, so it can sit next to the trait it implements.
-pub mod llm_classifier;
 pub mod mesh;
 mod pii;
 mod regex_guard;
+mod safety_classifier;
 mod schema;
 pub mod stream;
 mod toxicity;
 
 pub use agent_alignment::{AgentAlignmentConfig, AgentAlignmentGuardrail, AgentAlignmentMode};
 pub use classifier::{
-    build_classifier, register_classifier_factory, AsyncTextClassifier, ClassifierBackendConfig,
-    ClassifierConfig, ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
+    build_classifier, register_classifier_factory, ClassifierBackendConfig, ClassifierConfig,
+    ClassifierFactory, ClassifierGuardrail, ClassifierScope, ClassifierVerdict,
     EmbeddingBackendConfig, TextClassifier,
 };
 pub use content_safety::ContentSafetyGuardrail;
@@ -36,13 +33,10 @@ pub use context_poisoning::{
 pub use context_poisoning_rules::{ContextPoisoningRule, CONTEXT_POISONING_RULES};
 pub use injection::InjectionGuardrail;
 pub use jailbreak::JailbreakGuardrail;
-pub use llm_classifier::{
-    ChatCompletionsTransport, ClassifierTransportError, LlmBackendConfig, LlmClassifier,
-    ReqwestChatTransport,
-};
 pub use mesh::{GuardrailMesh, GuardrailMeshConfig, MeshDecision};
 pub use pii::{PiiAction, PiiGuardrail};
 pub use regex_guard::{RegexAction, RegexGuardrail};
+pub use safety_classifier::{SafetyClassifierGuardrail, SafetyGuardrailKind};
 pub use schema::SchemaGuardrail;
 pub use toxicity::ToxicityGuardrail;
 
@@ -58,6 +52,23 @@ pub struct GuardrailBlock {
     pub name: String,
     /// Human-readable reason describing why the request was blocked.
     pub reason: String,
+}
+
+/// A non-enforcing label emitted for routing or policy decisions.
+#[derive(Debug, Clone)]
+pub struct GuardrailLabel {
+    /// Stable label exposed to the AI policy plane.
+    pub name: String,
+    /// Human-readable explanation of how the label was selected.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum GuardrailFinding {
+    Security(GuardrailBlock),
+    Routing(GuardrailLabel),
+    SecurityBackendFailure(GuardrailBlock),
+    RoutingBackendFailure,
 }
 
 /// Per-entry streaming evaluation policy (WOR-1810, absorbing the
@@ -92,6 +103,9 @@ pub enum Guardrail {
     Jailbreak(JailbreakGuardrail),
     /// Content safety classifier guardrail (e.g. self-harm, violence).
     ContentSafety(ContentSafetyGuardrail),
+    /// Classifier-backed enforcement under one of the three built-in
+    /// safety guardrail names.
+    SafetyClassifier(SafetyClassifierGuardrail),
     /// JSON schema validation guardrail for structured output.
     Schema(SchemaGuardrail),
     /// Regular expression based deny-list guardrail.
@@ -107,9 +121,7 @@ pub enum Guardrail {
     /// body so it can read the structured tool-call shape, which
     /// `Message` would otherwise strip.
     AgentAlignment(AgentAlignmentGuardrail),
-    /// Class labeler, backed either by a local embedding model
-    /// (`kind: embedding`) or by an LLM over an OpenAI-compatible
-    /// endpoint (`kind: llm`). Emits the predicted class as the
+    /// Embedding-backed class labeler. Emits the predicted class as the
     /// guardrail label so the CEL policy plane can route on it. Never
     /// blocks on its own.
     Classifier(classifier::ClassifierGuardrail),
@@ -124,6 +136,7 @@ impl Guardrail {
             Self::Toxicity(_) => "toxicity",
             Self::Jailbreak(_) => "jailbreak",
             Self::ContentSafety(_) => "content_safety",
+            Self::SafetyClassifier(g) => g.name(),
             Self::Schema(_) => "schema",
             Self::Regex(_) => "regex",
             Self::ContextPoisoning(_) => "context_poisoning",
@@ -140,6 +153,7 @@ impl Guardrail {
             Self::Toxicity(g) => g.check(content),
             Self::Jailbreak(g) => g.check(content),
             Self::ContentSafety(g) => g.check(content),
+            Self::SafetyClassifier(g) => g.check(content),
             Self::Schema(g) => g.check(content),
             Self::Regex(g) => g.check(content),
             Self::ContextPoisoning(g) => g.check(content),
@@ -177,12 +191,72 @@ impl Guardrail {
             // text-fallback path so alignment does not flag on
             // every benign user message.
             Self::AgentAlignment(_) => None,
-            // Only the sync (embedding) backend answers here; an LLM
-            // backend needs a network call, which the mesh runs from
-            // its async entry point instead of blocking a worker
-            // thread on this one.
-            Self::Classifier(g) => g.check_messages(content, messages),
+            // A classifier emits a routing label, not a security verdict.
+            // The mesh and `GuardrailPipeline::classify_input` collect it
+            // through `finding_with_text`; the serial enforcement path must
+            // never convert it into a block.
+            Self::Classifier(_) => None,
+            Self::SafetyClassifier(g) => g.check_messages(content, messages),
             _ => self.check(content),
+        }
+    }
+
+    pub(crate) fn finding_with_text(
+        &self,
+        content: &str,
+        messages: &[Message],
+    ) -> Option<GuardrailFinding> {
+        match self {
+            Self::Classifier(g) => match g.classify_messages(content, messages) {
+                Ok(Some(label)) => Some(GuardrailFinding::Routing(label)),
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "classifier inference failed; mesh verdict will not be cached"
+                    );
+                    Some(GuardrailFinding::RoutingBackendFailure)
+                }
+            },
+            Self::SafetyClassifier(g) => match g.check_messages_outcome(content, messages) {
+                safety_classifier::SafetyClassifierOutcome::Allow => None,
+                safety_classifier::SafetyClassifierOutcome::Block(block) => {
+                    Some(GuardrailFinding::Security(block))
+                }
+                safety_classifier::SafetyClassifierOutcome::BackendFailure(block) => {
+                    Some(GuardrailFinding::SecurityBackendFailure(block))
+                }
+            },
+            _ => self
+                .check_with_text(content, messages)
+                .map(GuardrailFinding::Security),
+        }
+    }
+
+    pub(crate) fn cache_scope_tag(&self) -> &str {
+        match self {
+            Self::Classifier(g) => match g.scope() {
+                ClassifierScope::LastUserMessage => "classifier:last_user_message",
+                ClassifierScope::FullText => "classifier:full_text",
+            },
+            Self::SafetyClassifier(g) => match (g.name(), g.scope()) {
+                ("toxicity", ClassifierScope::LastUserMessage) => {
+                    "toxicity:classifier:last_user_message"
+                }
+                ("toxicity", ClassifierScope::FullText) => "toxicity:classifier:full_text",
+                ("jailbreak", ClassifierScope::LastUserMessage) => {
+                    "jailbreak:classifier:last_user_message"
+                }
+                ("jailbreak", ClassifierScope::FullText) => "jailbreak:classifier:full_text",
+                ("content_safety", ClassifierScope::LastUserMessage) => {
+                    "content_safety:classifier:last_user_message"
+                }
+                ("content_safety", ClassifierScope::FullText) => {
+                    "content_safety:classifier:full_text"
+                }
+                _ => "safety_classifier",
+            },
+            _ => self.name(),
         }
     }
 
@@ -249,6 +323,8 @@ impl Guardrail {
             Self::Jailbreak(_) => true,
             Self::Toxicity(_) => true,
             Self::Injection(_) => true,
+            // Full-text classifier verdicts are not prefix-stable.
+            Self::SafetyClassifier(_) => false,
             // Alignment judges tool calls, not text: the stream
             // session assembles streamed tool_calls deltas and judges
             // each completed call instead of running a text check, so
@@ -262,9 +338,18 @@ impl Guardrail {
     }
 }
 
-/// Per-pipeline mesh verdict cache: a bounded LRU from a SHA-256 of the
-/// prompt to the flagged labels + reasons (WOR-1694).
-type MeshVerdictCache = lru::LruCache<[u8; 32], (Vec<String>, Vec<String>)>;
+#[derive(Debug, Clone)]
+pub(crate) struct CachedMeshDecision {
+    labels: Vec<String>,
+    routing_labels: Vec<String>,
+    security_labels: Vec<String>,
+    reasons: Vec<String>,
+    fail_closed: bool,
+}
+
+/// Per-pipeline mesh verdict cache: a bounded LRU from a structured prompt
+/// identity to separated routing labels and security verdicts (WOR-1694).
+type MeshVerdictCache = lru::LruCache<[u8; 32], CachedMeshDecision>;
 
 /// The guardrail pipeline - runs input and output checks.
 #[derive(Debug, Default)]
@@ -282,11 +367,12 @@ pub struct GuardrailPipeline {
     /// is rebuilt each request) so verdicts persist across requests for
     /// one compiled config while never bleeding across origins: two
     /// origins with the same guardrail *types* but different configured
-    /// patterns hold separate pipelines, hence separate caches. Keyed by
-    /// a SHA-256 of the prompt text (256-bit, so a crafted collision that
-    /// makes a benign prompt inherit a blocked prompt's verdict is
-    /// infeasible). `None` until the mesh first stores under it; only
-    /// populated when `mesh.cache` is opted in.
+    /// patterns hold separate pipelines, hence separate caches. Keyed by a
+    /// SHA-256 of prompt text, message role/content structure, and role-aware
+    /// scope (256-bit, so a crafted collision that makes a benign prompt
+    /// inherit a blocked prompt's verdict is infeasible). `None` until the
+    /// mesh first stores under it; only populated when `mesh.cache` is opted
+    /// in.
     pub(crate) verdict_cache: parking_lot::Mutex<Option<MeshVerdictCache>>,
 }
 
@@ -328,6 +414,18 @@ impl GuardrailPipeline {
             }
         }
         None
+    }
+
+    /// Collect non-enforcing classifier labels for the serial input path.
+    pub fn classify_input(&self, messages: &[Message]) -> Vec<GuardrailLabel> {
+        let content = extract_text_from_messages(messages);
+        self.input
+            .iter()
+            .filter_map(|guard| match guard {
+                Guardrail::Classifier(g) => g.check_messages(&content, messages),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Check raw input text. Used for surfaces that don't carry a
@@ -374,13 +472,130 @@ impl GuardrailPipeline {
 
     /// Check output content. Returns first block encountered.
     pub fn check_output(&self, content: &str) -> Option<GuardrailBlock> {
+        let classifier_subject = assistant_response_text(content);
         for guard in &self.output {
-            if let Some(block) = guard.check(content) {
+            let block = match guard {
+                Guardrail::SafetyClassifier(classifier) => match classifier_subject.as_deref() {
+                    Some(subject) => classifier.check_output(subject),
+                    None => Some(GuardrailBlock {
+                        name: classifier.name().to_string(),
+                        reason: format!(
+                            "{} classifier could not extract a canonical assistant response; \
+                                 failed closed",
+                            classifier.name()
+                        ),
+                    }),
+                },
+                _ => guard.check(content),
+            };
+            if let Some(block) = block {
                 return Some(block);
             }
         }
         None
     }
+
+    /// Check a buffered output body without treating invalid UTF-8 as a
+    /// harmless non-classifier response.
+    pub fn check_output_bytes(&self, content: &[u8]) -> Option<GuardrailBlock> {
+        match std::str::from_utf8(content) {
+            Ok(content) => self.check_output(content),
+            Err(_) => self.output.iter().find_map(|guard| match guard {
+                Guardrail::SafetyClassifier(classifier) => Some(GuardrailBlock {
+                    name: classifier.name().to_string(),
+                    reason: format!(
+                        "{} classifier could not decode a canonical assistant response; failed closed",
+                        classifier.name()
+                    ),
+                }),
+                _ => None,
+            }),
+        }
+    }
+}
+
+/// Extract the assistant text that the streaming hub emits as text deltas.
+///
+/// Buffered responses can leave the gateway in OpenAI Chat, Anthropic
+/// Messages, or OpenAI Responses shape. Classifier-backed output safety
+/// guards must classify the same text in every shape and in streaming
+/// mode, while non-classifier guards continue to inspect the raw body.
+fn assistant_response_text(content: &str) -> Option<String> {
+    fn append_content(value: &serde_json::Value, out: &mut String) -> bool {
+        match value {
+            serde_json::Value::String(text) => {
+                out.push_str(text);
+                true
+            }
+            serde_json::Value::Array(parts) => {
+                let mut recognized = false;
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                        out.push_str(text);
+                        recognized = true;
+                    }
+                }
+                recognized
+            }
+            _ => false,
+        }
+    }
+
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let mut out = String::new();
+
+    if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
+        let mut recognized = false;
+        let mut indexed_choices: Vec<(u64, usize, &serde_json::Value)> = choices
+            .iter()
+            .enumerate()
+            .map(|(position, choice)| {
+                (
+                    choice
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(position as u64),
+                    position,
+                    choice,
+                )
+            })
+            .collect();
+        indexed_choices.sort_by_key(|(index, position, _)| (*index, *position));
+        for (_, _, choice) in indexed_choices {
+            if let Some(message) = choice.get("message") {
+                if let Some(message_content) = message.get("content") {
+                    recognized |= append_content(message_content, &mut out);
+                }
+            }
+        }
+        return recognized.then_some(out);
+    }
+
+    if let Some(output) = value.get("output").and_then(serde_json::Value::as_array) {
+        let mut recognized = false;
+        for item in output {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                && item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            {
+                if let Some(message_content) = item.get("content") {
+                    recognized |= append_content(message_content, &mut out);
+                }
+            }
+        }
+        return recognized.then_some(out);
+    }
+
+    let is_anthropic_message = value.get("type").and_then(serde_json::Value::as_str)
+        == Some("message")
+        && value.get("role").and_then(serde_json::Value::as_str) == Some("assistant");
+    if is_anthropic_message {
+        return value
+            .get("content")
+            .filter(|message_content| append_content(message_content, &mut out))
+            .map(|_| out);
+    }
+
+    None
 }
 
 /// Public text view of a slice of messages, used by the guardrail mesh as
@@ -390,25 +605,28 @@ pub fn message_text(messages: &[Message]) -> String {
     extract_text_from_messages(messages)
 }
 
+pub(crate) fn message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>();
+            (!text.is_empty()).then(|| text.join("\n"))
+        }
+        _ => None,
+    }
+}
+
 /// Extract text content from a slice of messages.
 /// Handles both string content and multimodal arrays.
 fn extract_text_from_messages(messages: &[Message]) -> String {
-    let mut parts = Vec::new();
-    for msg in messages {
-        match &msg.content {
-            serde_json::Value::String(s) => parts.push(s.as_str().to_owned()),
-            serde_json::Value::Array(arr) => {
-                for item in arr {
-                    // Multimodal format: [{"type": "text", "text": "..."}]
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    parts.join("\n")
+    messages
+        .iter()
+        .filter_map(|message| message_content_text(&message.content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Compile a guardrail from a JSON config value.
@@ -438,13 +656,29 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
         "injection" | "prompt_injection" => Ok(Guardrail::Injection(serde_json::from_value(
             config.clone(),
         )?)),
-        "toxicity" => Ok(Guardrail::Toxicity(serde_json::from_value(config.clone())?)),
-        "jailbreak" => Ok(Guardrail::Jailbreak(serde_json::from_value(
-            config.clone(),
-        )?)),
-        "content_safety" => Ok(Guardrail::ContentSafety(serde_json::from_value(
-            config.clone(),
-        )?)),
+        "toxicity" | "jailbreak" | "content_safety" => {
+            let kind = SafetyGuardrailKind::from_type_name(type_name)
+                .expect("matched safety guardrail type has a kind");
+            safety_classifier::validate_config(kind, config)?;
+            if safety_classifier::mode(config)?
+                == safety_classifier::SafetyGuardrailMode::Classifier
+            {
+                return Ok(Guardrail::SafetyClassifier(
+                    SafetyClassifierGuardrail::from_config(kind, config)?,
+                ));
+            }
+            match kind {
+                SafetyGuardrailKind::Toxicity => {
+                    Ok(Guardrail::Toxicity(serde_json::from_value(config.clone())?))
+                }
+                SafetyGuardrailKind::Jailbreak => Ok(Guardrail::Jailbreak(serde_json::from_value(
+                    config.clone(),
+                )?)),
+                SafetyGuardrailKind::ContentSafety => Ok(Guardrail::ContentSafety(
+                    serde_json::from_value(config.clone())?,
+                )),
+            }
+        }
         "context_poisoning" => {
             let cfg: ContextPoisoningConfig = serde_json::from_value(config.clone())?;
             Ok(Guardrail::ContextPoisoning(ContextPoisoningGuardrail::new(
@@ -495,62 +729,93 @@ pub fn compile_guardrail(config: &serde_json::Value) -> Result<Guardrail> {
     }
 }
 
-/// Guards the one-time warning below. A guardrail pipeline recompiles
-/// whenever the memoization in `sbproxy-core` misses, which can be per
-/// request, so the log line has to be emitted at most once per process.
-static ASYNC_CLASSIFIER_WITHOUT_MESH: std::sync::Once = std::sync::Once::new();
-
 /// Compile a full guardrail pipeline from a GuardrailsConfig.
 pub fn compile_pipeline(config: &GuardrailsConfig) -> Result<GuardrailPipeline> {
+    validate_pipeline_config(config)?;
     let mut pipeline = GuardrailPipeline::default();
     for guard_cfg in &config.input {
         pipeline.input.push(compile_guardrail(guard_cfg)?);
     }
-    // A `kind: llm` classifier only ever runs on the mesh's async pass.
-    // With no `mesh:` block the dispatch path takes the serial
-    // `check_input` route, which cannot await, so the guardrail is
-    // silently inert forever. Say so rather than failing: a later reload
-    // may add the mesh block, and a routing hint must never be able to
-    // take an origin's real guards down with it.
-    if config.mesh.is_none()
-        && pipeline
-            .input
-            .iter()
-            .any(|g| matches!(g, Guardrail::Classifier(c) if c.is_async()))
-    {
-        ASYNC_CLASSIFIER_WITHOUT_MESH.call_once(|| {
-            tracing::warn!(
-                "a `type: classifier` guardrail with `backend.kind: llm` is configured \
-                 without a `guardrails.mesh` block; it needs one to run at all, because \
-                 the serial input path cannot await it, so it emits no label today. Add \
-                 a `mesh:` block, with `block_threshold: 0` for label-only routing use"
-            );
-        });
-    }
     for guard_cfg in &config.output {
         let guardrail = compile_guardrail(guard_cfg)?;
-        // The classifier guardrail is input-only: `check` unconditionally
-        // returns `None` because classification needs the message list to
-        // honor `last_user_message` scope, and the output paths (buffered
-        // `check_output` and the streaming `on_close` close-policy path)
-        // only ever call `check`. Accepting it here would compile fine and
-        // then silently do nothing forever, so reject it as a hard config
-        // error instead.
-        if let Guardrail::Classifier(_) = &guardrail {
-            bail!("the `classifier` guardrail is input-only; move it from `output:` to `input:`");
-        }
+        let classifier_backed = matches!(guardrail, Guardrail::SafetyClassifier(_));
         pipeline.output.push(guardrail);
         // Per-entry streaming policy rides the same raw entry; unknown
         // to the individual guardrail structs (serde ignores it there).
-        let policy = guard_cfg
-            .get("stream_policy")
-            .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
-            .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?
-            .unwrap_or_default();
+        let policy = match guard_cfg.get("stream_policy") {
+            Some(value) => serde_json::from_value::<StreamPolicy>(value.clone())
+                .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?,
+            None if classifier_backed => StreamPolicy::Close,
+            None => StreamPolicy::default(),
+        };
         pipeline.output_policies.push(policy);
     }
     Ok(pipeline)
+}
+
+/// Validate a full pipeline without loading classifier artifacts.
+///
+/// This runs at AI action compilation, before a candidate configuration can
+/// be published. It deliberately validates every non-classifier by compiling
+/// its in-memory matcher while parsing classifiers structurally, because
+/// validation-only plans do not install the runtime ONNX factory.
+pub fn validate_pipeline_config(config: &GuardrailsConfig) -> Result<()> {
+    for guard_cfg in &config.input {
+        validate_guardrail_config(guard_cfg)?;
+    }
+    for guard_cfg in &config.output {
+        if guard_cfg.get("type").and_then(|v| v.as_str()) == Some("classifier") {
+            bail!("the `classifier` guardrail is input-only; move it from `output:` to `input:`");
+        }
+        validate_guardrail_config(guard_cfg)?;
+        let stream_policy = guard_cfg
+            .get("stream_policy")
+            .map(|v| serde_json::from_value::<StreamPolicy>(v.clone()))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid stream_policy: {e}"))?;
+        if let Some(kind) = guard_cfg
+            .get("type")
+            .and_then(|value| value.as_str())
+            .and_then(SafetyGuardrailKind::from_type_name)
+        {
+            if safety_classifier::mode(guard_cfg)?
+                == safety_classifier::SafetyGuardrailMode::Classifier
+            {
+                if stream_policy == Some(StreamPolicy::Chunk) {
+                    bail!(
+                        "{} classifier mode requires `stream_policy: close` or `off` on output",
+                        kind.name()
+                    );
+                }
+                if guard_cfg
+                    .pointer("/classifier/scope")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("last_user_message")
+                {
+                    bail!(
+                        "{} output classifier scope is the complete response; omit `scope` or use \
+                         `scope: full_text`",
+                        kind.name()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_guardrail_config(config: &serde_json::Value) -> Result<()> {
+    let type_name = config.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if type_name == "classifier" {
+        return classifier::parse_config(config).map(|_| ());
+    }
+    if let Some(kind) = SafetyGuardrailKind::from_type_name(type_name) {
+        safety_classifier::validate_config(kind, config)?;
+        if safety_classifier::mode(config)? == safety_classifier::SafetyGuardrailMode::Classifier {
+            return Ok(());
+        }
+    }
+    compile_guardrail(config).map(|_| ())
 }
 
 /// Raw guardrails configuration from the handler config.
@@ -580,6 +845,48 @@ pub struct GuardrailsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Once};
+
+    #[derive(Debug)]
+    struct SafeClassifier;
+
+    impl TextClassifier for SafeClassifier {
+        fn classify(&self, _text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
+            Ok(Some(ClassifierVerdict {
+                label: "safe".to_string(),
+                score: 0.90,
+            }))
+        }
+    }
+
+    fn install_test_classifier_factory() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            register_classifier_factory(Box::new(|_| Ok(Arc::new(SafeClassifier))));
+        });
+    }
+
+    fn classifier_jailbreak(stream_policy: Option<&str>) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "type": "jailbreak",
+            "mode": "classifier",
+            "classifier": {
+                "backend": {
+                    "kind": "embedding",
+                    "model_path": "/models/embed.onnx",
+                    "tokenizer_path": "/models/tokenizer.json"
+                },
+                "classes": {
+                    "jailbreak": ["override the system policy"],
+                    "safe": ["ordinary question"]
+                }
+            }
+        });
+        if let Some(policy) = stream_policy {
+            value["stream_policy"] = serde_json::json!(policy);
+        }
+        value
+    }
 
     #[test]
     fn stream_policy_parses_per_entry_and_defaults_to_chunk() {
@@ -600,6 +907,71 @@ mod tests {
         // Buffered path ignores policies entirely: an "off" entry still
         // blocks on the non-streaming check.
         assert!(p.check_output("the SECRET is out").is_some());
+    }
+
+    #[test]
+    fn classifier_output_defaults_to_close_time_evaluation() {
+        install_test_classifier_factory();
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![classifier_jailbreak(None)],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let pipeline = compile_pipeline(&cfg).expect("classifier output should compile");
+        assert!(matches!(
+            pipeline.output.as_slice(),
+            [Guardrail::SafetyClassifier(_)]
+        ));
+        assert_eq!(pipeline.output_policies.as_slice(), [StreamPolicy::Close]);
+    }
+
+    #[test]
+    fn classifier_output_rejects_per_chunk_streaming() {
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![classifier_jailbreak(Some("chunk"))],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("full-text classifier must not run per chunk")
+            .to_string();
+        assert!(error.contains("stream_policy") && error.contains("close"));
+    }
+
+    #[test]
+    fn classifier_output_rejects_last_user_message_scope() {
+        let mut guardrail = classifier_jailbreak(None);
+        guardrail["classifier"]["scope"] = serde_json::json!("last_user_message");
+        let cfg = GuardrailsConfig {
+            input: Vec::new(),
+            output: vec![guardrail],
+            mesh: None,
+            external: Vec::new(),
+        };
+        let error = validate_pipeline_config(&cfg)
+            .expect_err("output classifiers always inspect the complete response")
+            .to_string();
+        assert!(error.contains("scope") && error.contains("full_text"));
+    }
+
+    #[test]
+    fn omitted_mode_keeps_the_legacy_keyword_variant() {
+        let guard = compile_guardrail(&serde_json::json!({
+            "type": "jailbreak",
+            "detect_common": false,
+            "custom_patterns": ["legacy phrase"]
+        }))
+        .expect("legacy config should compile");
+        assert!(matches!(guard, Guardrail::Jailbreak(_)));
+        let block = guard
+            .check("a legacy phrase appears")
+            .expect("legacy keyword behavior should remain active");
+        assert_eq!(
+            block.reason,
+            "Jailbreak detected: matched custom pattern \"legacy phrase\""
+        );
     }
 
     fn make_msg(content: &str) -> Message {
@@ -1002,53 +1374,6 @@ mod tests {
         let pipeline = compile_pipeline(&cfg).expect("mixed pipeline should compile");
         assert_eq!(pipeline.input.len(), 2);
         assert!(pipeline.input[1].check("this is SECRET").is_some());
-    }
-
-    #[test]
-    fn an_unresolvable_api_key_does_not_break_a_mixed_pipeline() {
-        // The failure this guards is the worst one available: an LLM
-        // classifier whose `${VAR}` was unset on this host used to error
-        // out of `compile_pipeline`, and the caller in `sbproxy-core`
-        // turns a compile failure into "run with no guardrails at all".
-        // One unset variable would then disable PII, injection, and
-        // regex on the origin, and re-log the warning per request
-        // because the failure is not negatively cached.
-        //
-        // The classifier itself is expected to go quiet. Its sibling is
-        // not. GuardrailsConfig does not derive Default, and every field
-        // carries #[serde(default)], so build it through serde.
-        let cfg: GuardrailsConfig = serde_json::from_value(serde_json::json!({
-            "input": [
-                {
-                    "type": "classifier",
-                    "backend": {
-                        "kind": "llm",
-                        "base_url": "http://localhost:11434/v1/chat/completions",
-                        "model": "qwen3-coder:30b",
-                        "api_key": "${SBPROXY_TEST_PIPELINE_KEY_UNSET}"
-                    },
-                    "classes": { "documentation": ["write the readme"] }
-                },
-                {"type": "regex", "patterns": ["SECRET"]}
-            ]
-        }))
-        .expect("config should deserialize");
-        let pipeline = compile_pipeline(&cfg).expect("an unset key must not fail the pipeline");
-        assert_eq!(pipeline.input.len(), 2);
-        assert!(
-            pipeline.input[1].check("this is SECRET").is_some(),
-            "the sibling guardrail must still run"
-        );
-        let Guardrail::Classifier(classifier) = &pipeline.input[0] else {
-            panic!("first entry should be the classifier");
-        };
-        assert!(
-            !classifier.is_async(),
-            "the classifier degraded to inert; a live LLM backend would report async"
-        );
-        assert!(pipeline.input[0]
-            .check_with_text("write the readme", &[])
-            .is_none());
     }
 
     #[test]

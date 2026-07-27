@@ -1503,7 +1503,71 @@ per_surface_rate_limits:
 | `output` | list | `[]` | Guardrails evaluated against the model output. |
 | `mesh` | object | unset | Runs input detectors as a cascade and fuses verdicts under a quorum rule (`block_threshold`, `redact_on_flag`, `cache`, `cache_capacity`, `latency_budget_ms`). See [ai-guardrail-mesh.md](ai-guardrail-mesh.md). |
 
-Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+Each `input` / `output` entry is an object with a `type` field and type-specific config. Built-in types: `pii`, `secrets`, `injection` (alias `prompt_injection`), `toxicity`, `jailbreak`, `content_safety`, `schema`, `regex`, `regex_guard`, `context_poisoning`, `agent_alignment`, `classifier`. See [ai-gateway.md](ai-gateway.md#guardrails) for per-guardrail fields.
+
+##### Safety guardrail modes
+
+`toxicity`, `jailbreak`, and `content_safety` default to `mode: keyword`.
+That mode preserves the existing case-insensitive substring matchers and
+requires no model. It catches only configured or built-in literal terms; it
+does not provide semantic or ML detection.
+
+Set `mode: classifier` to make one of those guardrails enforce the local
+embedding classifier. This is an explicit, fail-closed configuration choice:
+the proxy rejects an unavailable backend, an incomplete class taxonomy, or
+keyword-only fields that would otherwise be ignored. It never substitutes the
+keyword backend after classifier mode was requested.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `mode` | `keyword` or `classifier` | `keyword` | Selects the literal matcher or local classifier. |
+| `classifier` | object | required in classifier mode | Uses the same `backend`, threshold, class-example, `scope`, and `max_chars` fields as the classifier input guardrail below. Rejected in keyword mode. |
+| `blocked_categories` | list | type-specific | In classifier mode, valid only for `content_safety`, must be nonempty, and may contain `violence`, `self_harm`, `sexual`, `hate_speech`, or `illegal`. |
+| `stream_policy` | `chunk`, `close`, or `off` | mode-specific | Output classifier mode defaults to `close`, accepts `close` or `off`, and rejects `chunk`. Keyword mode retains the normal streaming default. |
+
+Classifier class maps must be exact:
+
+- `toxicity`: `toxic`, `safe`
+- `jailbreak`: `jailbreak`, `safe`
+- `content_safety`: `violence`, `self_harm`, `sexual`, `hate_speech`,
+  `illegal`, `safe`
+
+Input classifier mode defaults to `scope: last_user_message`; `full_text` is
+also available. Output classifier mode always evaluates the complete response:
+omit `scope` or set it to `full_text`. An explicit `last_user_message` output
+scope is rejected.
+
+See [Safety guardrail modes](ai-gateway.md#safety-guardrail-modes) and the
+[ai-safety-classifiers](../examples/ai-safety-classifiers/) example.
+
+##### Classifier input guardrail
+
+`type: classifier` is input-only. It maps prompt text onto operator-defined
+classes using a local embedding model and exposes the winning class through
+the guardrail label set. It is rejected under `output:` rather than accepted
+as a no-op.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | object | required | Tagged backend config. The shipped backend requires `kind: embedding`. |
+| `backend.model_path` | string | required | Nonblank path to the ONNX sentence-embedding model. |
+| `backend.tokenizer_path` | string | required | Nonblank path to the matching Hugging Face `tokenizer.json`. |
+| `backend.min_score` | float | `0.30` | Minimum cosine similarity for the winning class; finite and between `0` and `1`. |
+| `backend.min_margin` | float | `0.05` | Minimum winning-score gap over the runner-up; finite and between `0` and `2`. |
+| `backend.max_model_bytes` | int | loader default | Optional ONNX file-size limit in bytes. |
+| `classes` | map of string to list | required | Nonblank class labels and representative prompts. At least one class and one nonblank example per class are required; each example must fit `max_chars`. |
+| `scope` | enum | `last_user_message` | `last_user_message` or `full_text`. |
+| `max_chars` | int | `2000` | Character cap applied to request subjects and centroid examples before tokenization. Must be above zero. |
+
+The root JSON schema keeps each origin's `action` as raw JSON because actions
+are module-registry values, so editor completion cannot enumerate this nested
+table. The guardrail pipeline compiler parses and validates the classifier
+shape while compiling the AI action, before a candidate configuration can
+serve traffic. Unknown classifier or backend fields are rejected so a typo
+cannot silently change routing behavior. Classifier labels are nonblocking and
+do not count toward a mesh security quorum. For a complete routing
+configuration, see [ai-classifier-routing](../examples/ai-classifier-routing/)
+and the [embedding classifier guide](ai-gateway.md#embedding-classifier).
 
 See the [AI Gateway Guide](ai-gateway.md) for CEL selectors, Lua hooks, guardrails, context window validation, per-request attribution, and streaming behavior.
 

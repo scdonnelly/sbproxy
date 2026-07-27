@@ -29,9 +29,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Average `vectors` into a single unit vector.
 ///
-/// Vectors whose dimension does not match the first entry are skipped.
-/// Returns `None` when there is nothing usable to average or when the
-/// sum has no direction, which is the case for an all-zero input.
+/// Every vector must be non-empty, finite, and have the same dimension.
+/// Returns `None` when the input is malformed or when the sum has no
+/// direction, which is the case for an all-zero input.
 ///
 /// Summing and then normalizing is equivalent to averaging and then
 /// normalizing, so the element count never enters the arithmetic.
@@ -42,19 +42,16 @@ pub(super) fn build_centroid(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
         return None;
     }
     let mut sum = vec![0f32; dim];
-    let mut used = 0usize;
-    for v in vectors.iter().filter(|v| v.len() == dim) {
+    for v in vectors {
+        if v.len() != dim || v.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
         for (s, x) in sum.iter_mut().zip(v.iter()) {
             *s += x;
         }
-        used += 1;
-    }
-    if used == 0 {
-        return None;
     }
     let norm = dot(&sum, &sum).sqrt();
-    // NaN compares false against everything, so it needs an explicit check.
-    if norm.is_nan() || norm <= f32::EPSILON {
+    if !norm.is_finite() || norm <= f32::EPSILON {
         return None;
     }
     for s in sum.iter_mut() {
@@ -105,6 +102,48 @@ pub(super) fn nearest_centroid(
     })
 }
 
+/// Validate one query embedding before applying score and margin thresholds.
+///
+/// Structural embedding defects are classifier errors. A valid vector that
+/// does not clear the configured thresholds remains an ordinary abstention.
+#[cfg(any(feature = "inprocess-classify", test))]
+fn classify_embedding(
+    embedding: &[f32],
+    centroids: &[(String, Vec<f32>)],
+    min_score: f32,
+    min_margin: f32,
+) -> anyhow::Result<Option<ClassifierVerdict>> {
+    let expected_dimension = centroids
+        .first()
+        .map(|(_, centroid)| centroid.len())
+        .filter(|dimension| *dimension > 0)
+        .ok_or_else(|| anyhow::anyhow!("classifier has no usable centroid dimension"))?;
+    if embedding.is_empty() {
+        anyhow::bail!("classifier query embedding is empty");
+    }
+    if embedding.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("classifier query embedding contains a non-finite value");
+    }
+    let norm = dot(embedding, embedding).sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        anyhow::bail!("classifier query embedding has no usable direction");
+    }
+    if embedding.len() != expected_dimension {
+        anyhow::bail!(
+            "classifier query embedding dimension {} does not match {expected_dimension}",
+            embedding.len()
+        );
+    }
+    if centroids.iter().any(|(_, centroid)| {
+        centroid.len() != expected_dimension || centroid.iter().any(|value| !value.is_finite())
+    }) {
+        anyhow::bail!("classifier contains a malformed centroid");
+    }
+    Ok(nearest_centroid(
+        embedding, centroids, min_score, min_margin,
+    ))
+}
+
 /// Nearest-centroid classifier over the in-process MiniLM embedder.
 #[cfg(feature = "inprocess-classify")]
 struct CentroidClassifier {
@@ -136,10 +175,17 @@ impl std::fmt::Debug for CentroidClassifier {
 
 #[cfg(feature = "inprocess-classify")]
 impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
-    fn classify(&self, text: &str) -> Option<ClassifierVerdict> {
+    fn classify(&self, text: &str) -> anyhow::Result<Option<ClassifierVerdict>> {
         let started = std::time::Instant::now();
-        let embedded = self.embedder.embed(text);
-        let result = if embedded.is_ok() { "ok" } else { "error" };
+        let classified = self.embedder.embed(text).and_then(|output| {
+            classify_embedding(
+                &output.values,
+                &self.centroids,
+                self.min_score,
+                self.min_margin,
+            )
+        });
+        let result = if classified.is_ok() { "ok" } else { "error" };
         sbproxy_observe::metrics::record_inference(
             "classify",
             "inprocess",
@@ -147,24 +193,190 @@ impl sbproxy_ai::guardrails::TextClassifier for CentroidClassifier {
             result,
             started.elapsed().as_secs_f64(),
         );
-        let out = match embedded {
-            Ok(o) => o,
+        match classified {
+            Ok(verdict) => Ok(verdict),
             Err(e) => {
                 tracing::warn!(error = %e, "classifier embedding failed; no label emitted");
-                return None;
+                Err(e)
             }
-        };
-        nearest_centroid(
-            &out.values,
-            &self.centroids,
-            self.min_score,
-            self.min_margin,
-        )
+        }
     }
 }
 
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ArtifactIdentity {
+    /// Absolute configured pathname before resolving symlinks. This lets a
+    /// reload retire the previous generation when the same symlink is
+    /// repointed to a different canonical file.
+    source_path: std::path::PathBuf,
+    canonical_path: std::path::PathBuf,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug)]
+struct ArtifactSnapshot {
+    identity: ArtifactIdentity,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmbedderCacheKey {
+    model: ArtifactIdentity,
+    tokenizer: ArtifactIdentity,
+    max_model_bytes: Option<u64>,
+}
+
+#[cfg(feature = "inprocess-classify")]
+#[derive(Debug)]
+struct EmbedderArtifactSnapshots {
+    key: EmbedderCacheKey,
+    model: ArtifactSnapshot,
+    tokenizer: ArtifactSnapshot,
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn cache_entry_is_stale(cached: &EmbedderCacheKey, current: &EmbedderCacheKey) -> bool {
+    let same_model_source = cached.model.source_path == current.model.source_path
+        || cached.model.canonical_path == current.model.canonical_path;
+    let same_tokenizer_source = cached.tokenizer.source_path == current.tokenizer.source_path
+        || cached.tokenizer.canonical_path == current.tokenizer.canonical_path;
+    let replaced_model = same_model_source && cached.model != current.model;
+    let replaced_tokenizer = same_tokenizer_source && cached.tokenizer != current.tokenizer;
+    replaced_model || replaced_tokenizer
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn artifact_snapshot(
+    path: &std::path::Path,
+    kind: &str,
+    max_bytes: u64,
+) -> anyhow::Result<ArtifactSnapshot> {
+    use anyhow::{anyhow, Context};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let source_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve the current directory for classifier artifacts")?
+            .join(path)
+    };
+    let canonical_path = std::fs::canonicalize(&source_path)
+        .with_context(|| format!("failed to resolve classifier {kind} at {source_path:?}"))?;
+    // Open once, then derive both the digest and the exact parser input from
+    // this handle. A rename can replace `canonical_path` after this point
+    // without changing the generation represented by `file`.
+    let mut file = std::fs::File::open(&canonical_path)
+        .with_context(|| format!("failed to open classifier {kind} at {canonical_path:?}"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect classifier {kind} at {canonical_path:?}"))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} is not a regular file"
+        ));
+    }
+    let byte_len = metadata.len();
+    if max_bytes != 0 && byte_len > max_bytes {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} is {byte_len} bytes, \
+             exceeding the configured {max_bytes}-byte limit"
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let initial_capacity = usize::try_from(byte_len.min(1024 * 1024))
+        .context("classifier artifact length does not fit in memory")?;
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    let mut bytes_read = 0_u64;
+    loop {
+        let count = file.read(&mut buffer).with_context(|| {
+            format!("failed to snapshot classifier {kind} at {canonical_path:?}")
+        })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(count as u64)
+            .ok_or_else(|| anyhow!("classifier {kind} size overflow while reading"))?;
+        if max_bytes != 0 && bytes_read > max_bytes {
+            return Err(anyhow!(
+                "classifier {kind} at {canonical_path:?} grew beyond the configured \
+                 {max_bytes}-byte limit while it was read"
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    let after_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to re-inspect classifier {kind} at {canonical_path:?}"))?;
+    if bytes_read != byte_len || after_metadata.len() != byte_len {
+        return Err(anyhow!(
+            "classifier {kind} at {canonical_path:?} changed while its snapshot was read"
+        ));
+    }
+
+    Ok(ArtifactSnapshot {
+        identity: ArtifactIdentity {
+            source_path,
+            canonical_path,
+            byte_len,
+            sha256: hasher.finalize().into(),
+        },
+        bytes,
+    })
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn embedder_artifact_snapshots(
+    cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+) -> anyhow::Result<EmbedderArtifactSnapshots> {
+    let model_limit = cfg
+        .max_model_bytes
+        .unwrap_or(sbproxy_classifiers::MAX_MODEL_BYTES_DEFAULT);
+    let model = artifact_snapshot(std::path::Path::new(&cfg.model_path), "model", model_limit)?;
+    let tokenizer = artifact_snapshot(
+        std::path::Path::new(&cfg.tokenizer_path),
+        "tokenizer",
+        sbproxy_classifiers::MAX_MODEL_BYTES_DEFAULT,
+    )?;
+    let key = EmbedderCacheKey {
+        model: model.identity.clone(),
+        tokenizer: tokenizer.identity.clone(),
+        max_model_bytes: cfg.max_model_bytes,
+    };
+    Ok(EmbedderArtifactSnapshots {
+        key,
+        model,
+        tokenizer,
+    })
+}
+
+#[cfg(all(feature = "inprocess-classify", test))]
+fn embedder_cache_key(
+    cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
+) -> anyhow::Result<EmbedderCacheKey> {
+    Ok(embedder_artifact_snapshots(cfg)?.key)
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn load_embedder_from_snapshots_with<T>(
+    snapshots: &EmbedderArtifactSnapshots,
+    options: &sbproxy_classifiers::LoadOptions,
+    loader: impl FnOnce(&[u8], &[u8], &sbproxy_classifiers::LoadOptions) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    loader(&snapshots.model.bytes, &snapshots.tokenizer.bytes, options)
+}
+
 /// Load the embedder for `cfg`, reusing an already-loaded one when the
-/// same model and tokenizer pair has been seen before.
+/// same immutable artifacts and size policy have been seen before.
 ///
 /// Loading parses the ONNX graph and can take hundreds of milliseconds,
 /// so two origins that point at the same model share one instance.
@@ -173,74 +385,141 @@ fn shared_embedder(
     cfg: &sbproxy_ai::guardrails::EmbeddingBackendConfig,
 ) -> anyhow::Result<std::sync::Arc<sbproxy_classifiers::OnnxEmbedder>> {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-    /// Already-loaded embedders keyed by their (model_path, tokenizer_path)
-    /// pair, so two classifier origins pointed at the same files share one
-    /// loaded model instead of parsing the ONNX graph twice.
-    type EmbedderCache = HashMap<(String, String), Arc<sbproxy_classifiers::OnnxEmbedder>>;
+    /// Already-loaded embedders keyed by artifact content and the requested
+    /// model-size policy. Paths alone are insufficient: a hot reload can
+    /// replace either artifact in place, and a stricter origin must not reuse
+    /// a model that bypassed its own limit. Weak values ensure the cache never
+    /// pins a model after every reload-managed pipeline using it is gone.
+    type EmbedderCache = HashMap<EmbedderCacheKey, Weak<sbproxy_classifiers::OnnxEmbedder>>;
 
     static CACHE: OnceLock<Mutex<EmbedderCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (cfg.model_path.clone(), cfg.tokenizer_path.clone());
-    if let Ok(map) = cache.lock() {
-        if let Some(e) = map.get(&key) {
-            return Ok(Arc::clone(e));
+    // Capture the exact bytes and derive their identity before any cache
+    // lookup. The eventual parser consumes these buffers rather than
+    // reopening the configured pathname.
+    let snapshots = embedder_artifact_snapshots(cfg)?;
+    let key = snapshots.key.clone();
+    if let Ok(mut map) = cache.lock() {
+        // Drop an older generation at these paths before looking up the
+        // current identity. Existing pipelines keep their Arc until their
+        // in-flight requests finish, while the process-global cache no longer
+        // pins the stale files.
+        map.retain(|cached, embedder| {
+            !cache_entry_is_stale(cached, &key) && embedder.strong_count() > 0
+        });
+        if let Some(embedder) = map.get(&key).and_then(Weak::upgrade) {
+            return Ok(embedder);
+        }
+        // The file-size policy was checked before this lookup. Reusing the
+        // same immutable artifacts across two acceptable limits is safe and
+        // avoids parsing the ONNX graph twice; record the current policy as
+        // an alias so subsequent lookups are exact.
+        if let Some(existing) = map.iter().find_map(|(cached, embedder)| {
+            (cached.model == key.model && cached.tokenizer == key.tokenizer)
+                .then(|| embedder.upgrade())
+                .flatten()
+        }) {
+            map.insert(key, Arc::downgrade(&existing));
+            return Ok(existing);
         }
     }
     let mut options = sbproxy_classifiers::LoadOptions::default();
     if let Some(bytes) = cfg.max_model_bytes {
         options = options.with_max_model_bytes(bytes);
     }
-    let embedder = Arc::new(sbproxy_classifiers::OnnxEmbedder::load_with_options(
-        std::path::Path::new(&cfg.model_path),
-        std::path::Path::new(&cfg.tokenizer_path),
+    let embedder = Arc::new(load_embedder_from_snapshots_with(
+        &snapshots,
         &options,
+        sbproxy_classifiers::OnnxEmbedder::load_from_bytes_with_options,
     )?);
     if let Ok(mut map) = cache.lock() {
-        map.insert(key, Arc::clone(&embedder));
+        map.insert(key, Arc::downgrade(&embedder));
     }
     Ok(embedder)
 }
 
 /// Build a classifier backend for `cfg`.
 ///
-/// Embeds every example prompt once and folds each class into a unit
-/// centroid. A class whose examples all fail to embed is dropped with a
-/// warning rather than failing the whole load, so one bad example does
-/// not cost the operator the other classes.
+/// Embed every configured example and require each class to produce a unit
+/// centroid. A malformed example rejects construction because skipping it
+/// would silently change the configured classifier.
+#[cfg(feature = "inprocess-classify")]
+fn embed_class_examples(
+    cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+    label: &str,
+    examples: &[String],
+    mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let mut vectors = Vec::with_capacity(examples.len());
+    let mut expected_dimension = None;
+    for (index, example) in examples.iter().enumerate() {
+        let bounded = cfg.bounded_text(example);
+        let values = embed(bounded).map_err(|error| {
+            anyhow::anyhow!("classifier class `{label}` example {index} embedding failed: {error}")
+        })?;
+        if values.is_empty() {
+            anyhow::bail!("classifier class `{label}` example {index} embedding is empty");
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            anyhow::bail!(
+                "classifier class `{label}` example {index} embedding contains a non-finite value"
+            );
+        }
+        match expected_dimension {
+            Some(dimension) if values.len() != dimension => {
+                anyhow::bail!(
+                    "classifier class `{label}` example {index} embedding dimension {} \
+                     does not match {dimension}",
+                    values.len()
+                );
+            }
+            None => expected_dimension = Some(values.len()),
+            Some(_) => {}
+        }
+        vectors.push(values);
+    }
+    Ok(vectors)
+}
+
+#[cfg(feature = "inprocess-classify")]
+fn build_class_centroids(
+    cfg: &sbproxy_ai::guardrails::ClassifierConfig,
+    mut embed: impl FnMut(&str) -> anyhow::Result<Vec<f32>>,
+) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+    let mut centroids = Vec::with_capacity(cfg.classes.len());
+    let mut expected_dimension = None;
+    for (label, examples) in &cfg.classes {
+        let vectors = embed_class_examples(cfg, label, examples, &mut embed)?;
+        let centroid = build_centroid(&vectors)
+            .ok_or_else(|| anyhow::anyhow!("classifier class `{label}` has no usable centroid"))?;
+        match expected_dimension {
+            Some(dimension) if centroid.len() != dimension => {
+                anyhow::bail!(
+                    "classifier class `{label}` centroid dimension {} does not match {dimension}",
+                    centroid.len()
+                );
+            }
+            None => expected_dimension = Some(centroid.len()),
+            Some(_) => {}
+        }
+        centroids.push((label.clone(), centroid));
+    }
+    Ok(centroids)
+}
+
 #[cfg(feature = "inprocess-classify")]
 fn build_backend(
     cfg: &sbproxy_ai::guardrails::ClassifierConfig,
 ) -> anyhow::Result<std::sync::Arc<dyn sbproxy_ai::guardrails::TextClassifier>> {
-    // This factory only serves the embedding backend. The LLM backend
-    // is async and is built inside sbproxy-ai, so it never reaches
-    // here; the guard exists so a future third variant fails loudly
-    // instead of being silently treated as an embedding one.
-    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend else {
-        anyhow::bail!("the in-process classifier factory only builds `kind: embedding` backends");
-    };
+    // Only one backend variant exists today, so this destructure is
+    // irrefutable.
+    let sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(backend) = &cfg.backend;
     let embedder = shared_embedder(backend)?;
-    let mut centroids: Vec<(String, Vec<f32>)> = Vec::new();
-    for (label, examples) in &cfg.classes {
-        let vectors: Vec<Vec<f32>> = examples
-            .iter()
-            .filter_map(|e| match embedder.embed(e) {
-                Ok(o) => Some(o.values),
-                Err(err) => {
-                    tracing::warn!(error = %err, class = %label, "skipping unembeddable example");
-                    None
-                }
-            })
-            .collect();
-        match build_centroid(&vectors) {
-            Some(c) => centroids.push((label.clone(), c)),
-            None => tracing::warn!(class = %label, "class has no usable examples; dropping it"),
-        }
-    }
-    if centroids.is_empty() {
-        anyhow::bail!("classifier has no usable class centroids");
-    }
+    let centroids = build_class_centroids(cfg, |example| {
+        embedder.embed(example).map(|output| output.values)
+    })?;
     let model_label = std::path::Path::new(&backend.model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -309,9 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn centroid_skips_vectors_of_the_wrong_dimension() {
-        let c = build_centroid(&[vec![1.0, 0.0], vec![1.0, 0.0, 0.0]]).expect("centroid");
-        assert_eq!(c.len(), 2);
+    fn centroid_rejects_vectors_of_the_wrong_dimension() {
+        assert!(build_centroid(&[vec![1.0, 0.0], vec![1.0, 0.0, 0.0]]).is_none());
     }
 
     #[test]
@@ -397,6 +675,230 @@ mod tests {
     }
 
     #[test]
+    fn malformed_request_embeddings_are_classifier_errors() {
+        let centroids = vec![
+            (label("documentation"), vec![1.0, 0.0]),
+            (label("coding"), vec![0.0, 1.0]),
+        ];
+        for malformed in [
+            Vec::new(),
+            vec![0.0, 0.0],
+            vec![f32::NAN, 0.0],
+            vec![f32::INFINITY, 0.0],
+            vec![1.0, 0.0, 0.0],
+        ] {
+            assert!(
+                classify_embedding(&malformed, &centroids, 0.30, 0.05).is_err(),
+                "malformed request embedding must not become a threshold abstention: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_threshold_and_margin_abstentions_remain_ok_none() {
+        let centroids = vec![
+            (label("documentation"), vec![1.0, 0.0]),
+            (label("coding"), vec![0.0, 1.0]),
+        ];
+        assert_eq!(
+            classify_embedding(&[0.2, 0.1], &centroids, 0.30, 0.05)
+                .expect("a weak finite embedding is not a backend error"),
+            None
+        );
+        let inv = 1.0f32 / 2.0f32.sqrt();
+        assert_eq!(
+            classify_embedding(&[inv, inv], &centroids, 0.30, 0.05)
+                .expect("an ambiguous finite embedding is not a backend error"),
+            None
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    fn classifier_config_with_max_chars(
+        max_chars: usize,
+    ) -> sbproxy_ai::guardrails::ClassifierConfig {
+        sbproxy_ai::guardrails::ClassifierConfig {
+            backend: sbproxy_ai::guardrails::ClassifierBackendConfig::Embedding(
+                sbproxy_ai::guardrails::EmbeddingBackendConfig {
+                    model_path: "/unused/model.onnx".to_string(),
+                    tokenizer_path: "/unused/tokenizer.json".to_string(),
+                    min_score: 0.30,
+                    min_margin: 0.05,
+                    max_model_bytes: None,
+                },
+            ),
+            classes: std::collections::BTreeMap::from([(
+                "documentation".to_string(),
+                vec!["write docs".to_string()],
+            )]),
+            scope: sbproxy_ai::guardrails::ClassifierScope::LastUserMessage,
+            max_chars,
+        }
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn centroid_example_at_exact_character_cap_is_unchanged() {
+        let cfg = classifier_config_with_max_chars(4);
+        let examples = vec!["éabc".to_string()];
+        let mut seen = Vec::new();
+
+        let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
+            seen.push(text.to_string());
+            Ok(vec![1.0])
+        })
+        .expect("valid example embeddings");
+
+        assert_eq!(seen, ["éabc"]);
+        assert_eq!(vectors, [vec![1.0]]);
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn centroid_example_over_character_cap_is_truncated_before_embedding() {
+        let cfg = classifier_config_with_max_chars(4);
+        let examples = vec!["éabcd".to_string()];
+        let mut seen = Vec::new();
+
+        let vectors = embed_class_examples(&cfg, "documentation", &examples, |text| {
+            seen.push(text.to_string());
+            Ok(vec![1.0])
+        })
+        .expect("valid example embeddings");
+
+        assert_eq!(seen, ["éabc"]);
+        assert_eq!(vectors, [vec![1.0]]);
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_requires_a_centroid_for_every_configured_class() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec!["ordinary conversation".to_string()],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "ordinary conversation" {
+                anyhow::bail!("fixture embedding failure");
+            }
+            Ok(vec![1.0, 0.0])
+        })
+        .expect_err("a missing required centroid must fail classifier construction");
+
+        assert!(
+            error.to_string().contains("safe"),
+            "error must identify the class without a usable centroid: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_mismatched_class_dimensions() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec!["ordinary conversation".to_string()],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "ordinary conversation" {
+                Ok(vec![1.0, 0.0, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("all configured class centroids must have the same dimension");
+
+        assert!(
+            error.to_string().contains("dimension"),
+            "error must explain the malformed centroid dimensions: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_an_empty_example_embedding() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "empty vector".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "empty vector" {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one empty example embedding must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_a_non_finite_example_embedding() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "infinite vector".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "infinite vector" {
+                Ok(vec![f32::INFINITY, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one non-finite example embedding must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn classifier_construction_rejects_a_wrong_dimension_example_within_its_class() {
+        let mut cfg = classifier_config_with_max_chars(2000);
+        cfg.classes.insert(
+            "safe".to_string(),
+            vec![
+                "ordinary conversation".to_string(),
+                "wrong dimension".to_string(),
+            ],
+        );
+
+        let error = build_class_centroids(&cfg, |text| {
+            if text == "wrong dimension" {
+                Ok(vec![1.0, 0.0, 0.0])
+            } else {
+                Ok(vec![1.0, 0.0])
+            }
+        })
+        .expect_err("one wrong-dimension example must reject the configured class");
+
+        assert!(
+            error.to_string().contains("safe") && error.to_string().contains("example 1"),
+            "error must identify the malformed configured example: {error}"
+        );
+    }
+
+    #[test]
     fn factory_rejects_a_config_whose_model_is_missing() {
         // The factory must return an error rather than panicking, because
         // the guardrail turns that error into an inert guardrail.
@@ -418,5 +920,110 @@ mod tests {
             max_chars: 2000,
         };
         assert!(build_backend(&cfg).is_err());
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_cache_key_includes_the_requested_model_size_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"small-model").expect("model fixture");
+        std::fs::write(&tokenizer, b"tokenizer").expect("tokenizer fixture");
+
+        let permissive = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+        let mut strict = permissive.clone();
+        strict.max_model_bytes = Some(5);
+
+        let permissive_key = embedder_cache_key(&permissive).expect("permissive key");
+        assert!(
+            embedder_cache_key(&strict).is_err(),
+            "a stricter limit must be enforced before a cache lookup can reuse the model"
+        );
+        assert_eq!(permissive_key.max_model_bytes, Some(100));
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_cache_key_changes_when_an_artifact_changes_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"model-v1").expect("model fixture");
+        std::fs::write(&tokenizer, b"tokenizer").expect("tokenizer fixture");
+        let cfg = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+
+        let before = embedder_cache_key(&cfg).expect("first key");
+        std::fs::write(&model, b"model-v2").expect("replace model fixture");
+        let after = embedder_cache_key(&cfg).expect("second key");
+
+        assert_ne!(
+            before, after,
+            "replacing a model at the same path must invalidate cached state"
+        );
+        assert!(
+            cache_entry_is_stale(&before, &after),
+            "the cache must release the superseded artifact generation"
+        );
+    }
+
+    #[cfg(feature = "inprocess-classify")]
+    #[test]
+    fn embedder_loader_consumes_the_fingerprinted_snapshot_during_aba_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let replacement = dir.path().join("model-b.onnx");
+        let restoration = dir.path().join("model-a-restored.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"model-a").expect("model A fixture");
+        std::fs::write(&replacement, b"model-b").expect("model B fixture");
+        std::fs::write(&restoration, b"model-a").expect("restored model A fixture");
+        std::fs::write(&tokenizer, b"tokenizer-a").expect("tokenizer fixture");
+        let cfg = sbproxy_ai::guardrails::EmbeddingBackendConfig {
+            model_path: model.display().to_string(),
+            tokenizer_path: tokenizer.display().to_string(),
+            min_score: 0.30,
+            min_margin: 0.05,
+            max_model_bytes: Some(100),
+        };
+
+        let snapshots =
+            embedder_artifact_snapshots(&cfg).expect("capture fingerprinted artifact bytes");
+        let consumed = load_embedder_from_snapshots_with(
+            &snapshots,
+            &sbproxy_classifiers::LoadOptions::default(),
+            |model_bytes, tokenizer_bytes, _| {
+                std::fs::remove_file(&model).expect("remove model A");
+                std::fs::rename(&replacement, &model).expect("install model B");
+                assert_eq!(
+                    std::fs::read(&model).expect("read path during load"),
+                    b"model-b"
+                );
+                std::fs::remove_file(&model).expect("remove model B");
+                std::fs::rename(&restoration, &model).expect("restore model A");
+                Ok((model_bytes.to_vec(), tokenizer_bytes.to_vec()))
+            },
+        )
+        .expect("snapshot consumer");
+
+        assert_eq!(consumed.0, b"model-a");
+        assert_eq!(consumed.1, b"tokenizer-a");
+        assert_eq!(
+            snapshots.key,
+            embedder_cache_key(&cfg).expect("identity after ABA restoration"),
+            "the A-to-B-to-A path identity is intentionally unchanged"
+        );
     }
 }

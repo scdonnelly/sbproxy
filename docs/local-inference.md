@@ -1,12 +1,14 @@
 # Local inference (embeddings and prompt-injection classify)
-*Last modified: 2026-07-04*
+*Last modified: 2026-07-22*
 
-SBproxy can run two AI-gateway features on local ONNX models instead of paid
+SBproxy can run three AI-gateway features on local ONNX models instead of paid
 APIs:
 
 - The **embedding semantic cache** vectorizes prompts to serve near-duplicate
   requests from cache.
 - **Prompt-injection v2** classifies prompts for injection attempts.
+- The **embedding classifier guardrail** maps prompts onto operator-defined
+  classes that can feed model-routing policy.
 
 For running a full **LLM** locally (the gateway pulls weights, fits an engine
 to the GPU, and supervises it), see [model-host.md](model-host.md). This page
@@ -211,6 +213,54 @@ The released `sbproxy` binary is built with the `inprocess-embed` feature, so
 default features, add `--features inprocess-embed`; without it, `source:
 inprocess` returns a clear error and the cache treats lookups as misses.
 
+## Enable classifier-backed routing
+
+The `classifier` input guardrail uses the same `OnnxEmbedder` implementation
+to build a nearest-centroid classifier from operator-provided examples. The
+released binary includes `inprocess-classify`; a source build without default
+features must enable it.
+
+Multiple classifier entries share one loaded embedder when the resolved model
+and tokenizer paths and digests match and each entry's model-size limit
+accepts the artifact. Replacing either file at the same path invalidates reuse
+on reload. The implementation lives in `sbproxy-core` behind the
+`TextClassifier` trait from `sbproxy-ai`: `sbproxy-classifiers` depends on
+`sbproxy-ai`, so placing the concrete ONNX implementation in `sbproxy-ai`
+would introduce a crate cycle.
+
+Classifier results are always non-enforcing routing labels; no mesh override
+is required to prevent them from blocking. The complete configuration and
+model download commands are in
+[ai-classifier-routing](../examples/ai-classifier-routing/).
+
+## Enable classifier-backed safety enforcement
+
+The `toxicity`, `jailbreak`, and `content_safety` guardrails can use the same
+in-process embedding backend for enforcing verdicts. Set
+`mode: classifier` and nest the classifier configuration under
+`classifier:`. Unlike the routing-only `type: classifier` entry, these modes
+block when their configured unsafe class wins.
+
+Classifier mode is never an automatic upgrade. Keyword mode remains the
+zero-dependency default, and it is a literal substring matcher. When
+classifier mode is explicit, publication validates the configuration structure
+without opening the model or tokenizer. The published handler loads those
+artifacts lazily when its guardrail pipeline is first used. An unavailable
+artifact fails that request and every later request on the same handler
+generation closed with a configuration error instead of quietly weakening the
+guardrail.
+
+The three guardrails use separate closed class taxonomies but share the
+process-level model cache. Multiple entries that point at the same resolved
+model and tokenizer therefore load one embedder while maintaining independent
+centroids, thresholds, and verdicts. `content_safety` also requires a
+nonempty `blocked_categories` subset.
+
+For a configuration covering input scope, output streaming behavior,
+taxonomies, and metrics, see
+[ai-safety-classifiers](../examples/ai-safety-classifiers/). The normative
+field table is [Safety guardrail modes](configuration.md#safety-guardrail-modes).
+
 ## Metrics and usage tracking
 
 Local inference and the semantic cache emit `sbproxy_*` metrics, attributed per
@@ -221,6 +271,7 @@ tenant where relevant (see [metrics-stability.md](./metrics-stability.md)):
 | `sbproxy_semantic_cache_results_total{tenant,origin,source,result}` | Cache hit / miss / error rate by embedding source |
 | `sbproxy_inference_requests_total{kind,backend,model,result}` | Embed and classify call counts |
 | `sbproxy_inference_duration_seconds{kind,backend,model}` | Embed and classify latency |
+| `sbproxy_ai_safety_guardrail_verdicts_total{guardrail,class,backend,verdict}` | Safety verdicts and whether they came from the keyword or classifier path |
 | `sbproxy_ai_tokens_saved_total{tenant,origin,model,kind}` | Tokens a cache hit avoided |
 | `sbproxy_ai_cost_saved_micros_total{tenant,origin,model}` | Micro-USD a cache hit avoided |
 
