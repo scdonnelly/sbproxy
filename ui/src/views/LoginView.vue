@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { useAuth } from "../composables/useAuth";
 import { ApiError } from "../api";
 import BrandMark from "../components/BrandMark.vue";
 
-const { login } = useAuth();
+const { login, sessionExpired } = useAuth();
+const route = useRoute();
+const router = useRouter();
 const username = ref("");
 const password = ref("");
 const submitting = ref(false);
@@ -16,6 +19,15 @@ async function submit() {
   submitting.value = true;
   try {
     await login(username.value, password.value);
+    // Return the operator to whatever they were trying to reach. Only
+    // same-app paths are honoured: `next` comes from the query string, so
+    // treating it as a raw location would let a crafted link bounce a
+    // freshly authenticated operator to another origin.
+    const next = route.query.next;
+    const target = typeof next === "string" && next.startsWith("/") && !next.startsWith("//")
+      ? next
+      : "/";
+    await router.replace(target);
   } catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       error.value = "Invalid username or password.";
@@ -32,6 +44,11 @@ async function submit() {
   <div class="login">
     <form class="sb-card card" @submit.prevent="submit">
       <BrandMark class="card__brand" :size="30" />
+      <!-- Say why they are back here. A sign-in screen that just appears
+           mid-session reads like a bug. -->
+      <p v-if="sessionExpired" class="notice" role="status">
+        Your session expired. Sign in again to continue.
+      </p>
       <label>
         <span class="lbl">Username</span>
         <input v-model="username" class="sb-input" autocomplete="username" />
@@ -89,5 +106,12 @@ label {
   color: #c0392b;
   font-size: 0.85rem;
   margin: 0;
+}
+.notice {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  font-size: 13px;
+  border: 1px solid var(--sb-border, #d8d2c4);
+  background: var(--sb-surface-2, #f2efe6);
 }
 </style>

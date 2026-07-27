@@ -15,6 +15,27 @@
  */
 
 // In-memory CSRF token for the current session; null when unauthenticated
+// Called when the server rejects a request as unauthenticated, so the app
+// can drop to the sign-in screen instead of leaving the operator on a shell
+// where every panel quietly errors. Registered by `useAuth`; a callback
+// rather than a direct import because `useAuth` already imports this module.
+let onUnauthorized: (() => void) | null = null;
+
+/** Register the handler invoked when a request comes back 401. */
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
+/**
+ * Paths that legitimately answer 401 without meaning "your session died":
+ * the login attempt itself, and the session probe used to discover that
+ * there is no session yet. Firing the handler for these would fight the
+ * sign-in flow.
+ */
+function isAuthProbePath(path: string): boolean {
+  return path.startsWith("/admin/login") || path.startsWith("/admin/session");
+}
+
 // or authenticated via Basic. Set from the login / session responses.
 let csrfToken: string | null = null;
 export function setCsrfToken(token: string | null): void {
@@ -198,6 +219,12 @@ async function request(
     } catch {
       // ignore
     }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }
   return res;
@@ -260,6 +287,12 @@ async function sendRaw(
     } catch {
       // ignore
     }
+    if (res.status === 401 && !isAuthProbePath(path)) {
+      // The session lapsed mid-use. Tell the app so it can send the
+      // operator to sign in, rather than leaving them on a console where
+      // every panel reports "Not authorized" with no way forward.
+      onUnauthorized?.();
+    }
     throw new ApiError(res.status, `${method} ${path} failed (${res.status})`, text);
   }
   return await res.text();
@@ -272,6 +305,34 @@ export interface HealthComponent {
   status?: string;
   detail?: string;
   message?: string;
+}
+
+
+/** One externalized compression record, content-free. */
+export interface CompressionRecord {
+  id: string;
+  backend: string;
+  consistency: string;
+  tenant_id: string;
+  origin: string;
+  logical_version: number;
+  protected_prefix_count: number;
+  covered_history_count: number;
+  covered_input_tokens: number;
+  summary_tokens: number;
+  summarizer_provider: string;
+  summarizer_model: string;
+  writer_node: string;
+  conflict_detected: boolean;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+  expires_at_unix_ms: number;
+  kind: string;
+}
+
+export interface CompressionSessionPage {
+  records: CompressionRecord[];
+  next_cursor?: string | null;
 }
 
 export interface HealthResponse {
@@ -1835,6 +1896,18 @@ export interface LoginResult {
   csrf_token: string;
 }
 
+/** A console login, as reported by `/api/admin/users`. Never carries a password. */
+export interface AdminUser {
+  username: string;
+  role: "admin" | "read_only";
+  /** The top-level admin credential, which always has the full-access role. */
+  primary: boolean;
+}
+
+export interface AdminUsersResponse {
+  users: AdminUser[];
+}
+
 // Windowed spend from the durable usage rollups (WOR-1875).
 export interface SpendWindowBucket {
   ts_secs: number;
@@ -1912,6 +1985,18 @@ export const api = {
   },
 
   // Overview
+  /** Compression session records: the externalized context state the AI
+   *  gateway keeps per conversation. Content is never included here; the
+   *  detail route gates summary text behind its own audited call. */
+  compressionSessions: (limit?: number, cursor?: string) => {
+    const q = new URLSearchParams();
+    if (limit) q.set("limit", String(limit));
+    if (cursor) q.set("cursor", cursor);
+    const qs = q.toString();
+    return getJson<CompressionSessionPage>(
+      `/admin/compression/sessions${qs ? `?${qs}` : ""}`,
+    );
+  },
   health: () => getJson<HealthResponse>("/health"),
   stats: () => getJson<StatsResponse>("/api/stats"),
   modelHostStatus: () => getJson<ModelHostStatus>("/admin/model-host/status"),
@@ -2029,6 +2114,10 @@ export const api = {
 
   // Metrics
   metrics: () => getText("/metrics"),
+  // Who can sign in to this console. Passwords are never returned;
+  // accounts are managed in config, not through this route.
+  adminUsers: () => getJson<AdminUsersResponse>("/api/admin/users"),
+
   // Windowed spend history from the durable rollups (WOR-1875).
   spendWindow: (window: string, groupBy: string) =>
     getJson<SpendWindowResponse>(
