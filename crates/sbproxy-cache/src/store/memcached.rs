@@ -300,8 +300,16 @@ mod tests {
 
     fn make_entry(ttl_secs: u64) -> CachedResponse {
         CachedResponse {
+            generation: 0,
             status: 200,
-            headers: vec![("x-test".into(), "value".into())],
+            headers: vec![
+                ("x-test".into(), "value".into()),
+                ("etag".into(), r#""memcached-v1""#.into()),
+                (
+                    "last-modified".into(),
+                    "Sun, 06 Nov 1994 08:49:37 GMT".into(),
+                ),
+            ],
             body: b"memcached test".to_vec(),
             cached_at: now_secs(),
             ttl_secs,
@@ -371,6 +379,7 @@ mod tests {
         // a 1970 timestamp and the item expired the moment it was
         // written, so long-TTL entries never cached at all.
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],
@@ -402,6 +411,7 @@ mod tests {
     #[test]
     fn remaining_ttl_expired_entry() {
         let entry = CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: vec![],
@@ -423,6 +433,8 @@ mod tests {
         let got = store.get("mc_test_key").unwrap().expect("should hit");
         assert_eq!(got.status, 200);
         assert_eq!(got.body, b"memcached test");
+        assert_eq!(got.etag(), Some(r#""memcached-v1""#));
+        assert_eq!(got.last_modified(), Some("Sun, 06 Nov 1994 08:49:37 GMT"));
 
         store.delete("mc_test_key").unwrap();
         assert!(store.get("mc_test_key").unwrap().is_none());

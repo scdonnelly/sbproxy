@@ -29,7 +29,9 @@ use sbproxy_cache::{
     RedisCacheStore, RedisReserve,
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
-use sbproxy_modules::compile::{compile_action, compile_auth, compile_policy, compile_transform};
+use sbproxy_modules::compile::{
+    compile_action, compile_action_for_origin, compile_auth, compile_policy, compile_transform,
+};
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
 
@@ -1192,7 +1194,12 @@ impl CompiledPipeline {
 
         for origin in &config.origins {
             // Compile action (required for every origin).
-            let action = compile_action(&origin.action_config)?;
+            let action_identity = routing_action_identity(
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+                None,
+            );
+            let action = compile_action_for_origin(&origin.action_config, &action_identity)?;
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1219,7 +1226,10 @@ impl CompiledPipeline {
                 config.l2_store.clone(),
                 origin.origin_id.as_str(),
             )?;
-            enforcers.push(compile_builtin_enforcers(policies_for_enforcers));
+            enforcers.push(compile_builtin_enforcers(
+                policies_for_enforcers,
+                origin.hostname.as_str(),
+            ));
             policies.push(origin_policies);
 
             // Compile transforms (zero or more per origin).
@@ -1252,7 +1262,11 @@ impl CompiledPipeline {
             transforms.push(origin_transforms);
 
             // Compile forward rules (zero or more per origin).
-            let origin_fwd_rules = compile_forward_rules(&origin.forward_rules)?;
+            let origin_fwd_rules = compile_forward_rules(
+                &origin.forward_rules,
+                origin.workspace_id.as_str(),
+                origin.origin_id.as_str(),
+            )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
@@ -1709,12 +1723,27 @@ fn compile_origin_policy_chain(
     Ok(chain)
 }
 
+fn routing_action_identity(
+    workspace_id: &str,
+    origin_id: &str,
+    forward_rule_index: Option<usize>,
+) -> String {
+    let scope = forward_rule_index
+        .map(|index| format!("forward-rule:{index}"))
+        .unwrap_or_else(|| "main".to_string());
+    serde_json::to_string(&(workspace_id, origin_id, scope))
+        .expect("routing action identity fields are serializable")
+}
+
 fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
+    workspace_id: &str,
+    origin_id: &str,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
-    for rule_val in raw_rules {
-        let fwd = compile_single_forward_rule(rule_val)?;
+    for (rule_index, rule_val) in raw_rules.iter().enumerate() {
+        let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
+        let fwd = compile_single_forward_rule(rule_val, &rule_id)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -1749,7 +1778,10 @@ fn compile_forward_rules(
 /// same `path` block, precedence is `template` > `regex` > `exact` >
 /// `prefix`. The shorthand `match: <prefix>` field is always treated as a
 /// prefix match.
-fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<CompiledForwardRule> {
+fn compile_single_forward_rule(
+    val: &serde_json::Value,
+    rule_id: &str,
+) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
         .and_then(|v| v.as_array())
@@ -1782,7 +1814,7 @@ fn compile_single_forward_rule(val: &serde_json::Value) -> anyhow::Result<Compil
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = compile_action_for_origin(action_config, rule_id)?;
 
     // Parse request modifiers (optional).
     // Supports both Rust format ({ headers: { set: ... } }) and Go format
@@ -2014,6 +2046,18 @@ mod tests {
     use super::*;
     use compact_str::CompactString;
     use std::collections::HashMap;
+
+    #[test]
+    fn routing_state_namespace_is_workspace_and_rule_scoped() {
+        let workspace_a = routing_action_identity("workspace-a", "shared-origin", None);
+        let workspace_b = routing_action_identity("workspace-b", "shared-origin", None);
+        let first_rule = routing_action_identity("workspace-a", "shared-origin", Some(0));
+        let second_rule = routing_action_identity("workspace-a", "shared-origin", Some(1));
+
+        assert_ne!(workspace_a, workspace_b);
+        assert_ne!(workspace_a, first_rule);
+        assert_ne!(first_rule, second_rule);
+    }
 
     fn make_config(
         hostname: &str,
@@ -3318,6 +3362,7 @@ origins: {}
         // Still reports the wrapped backend, and actually encrypts.
         assert_eq!(store.backend_name(), "memory");
         let entry = sbproxy_cache::CachedResponse {
+            generation: 0,
             status: 200,
             headers: vec![],
             body: b"needle-in-the-haystack".to_vec(),

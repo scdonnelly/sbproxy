@@ -12,6 +12,11 @@ the next version cut.
 
 ### Added
 
+- **Trust tier is now live policy input.** The request path combines
+  authentication and agent-detection evidence into `suspicious`, `strong`,
+  `named`, or `anonymous`; CEL expression and assertion policies can read
+  `request.trust_tier`, and `sbproxy_trust_tier_requests_total` reports the
+  closed-set distribution. Verified Web Bot Auth resolves to `strong`.
 - **Operate a config authority from the command line.** Running one used
   to mean hand-rolled `curl`. `sbproxy config authority init` generates
   the Ed25519 signing key owner-only, writes the verifying-key file

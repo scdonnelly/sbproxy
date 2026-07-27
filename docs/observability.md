@@ -1,5 +1,5 @@
 # Observability
-*Last modified: 2026-07-12*
+*Last modified: 2026-07-23*
 
 SBproxy ships metrics, logs, and traces from one process. This guide covers the Wave 1 substrate: the SLO catalog, the metric label budget, the log schema and redaction policy, the trace propagation contract, the health endpoints, the dashboards, and the reference Compose stack you can boot in one command.
 
@@ -270,6 +270,7 @@ PromQL recording rules pre-compute each SLI at 1m, 5m, 1h, 6h, and 24h windows. 
 | `sbproxy_agent_detect_total` | 3 000 | Labels: `agent_id` (sanitised, empty when anonymous), `provenance` (signed\|unsigned-named\|unsigned-anonymous). Per-request agent-detect scorer verdicts. |
 | `sbproxy_agent_detect_score_bucket` | 11 | Histogram buckets over the 0-100 agent-detect score. No labels. |
 | `sbproxy_agent_detect_inference_seconds_bucket` | 9 | Histogram buckets 50us..10ms for in-process scorer latency. No labels. |
+| `sbproxy_trust_tier_requests_total` | 4 | Label: `tier` (`suspicious`\|`strong`\|`named`\|`anonymous`). One closed-set observation per request after identity enrichment and authentication. |
 | `sbproxy_object_authz_violations_total` | 200 | Labels: `origin`, `kind` (bola\|bfla\|enumeration). Counts BOLA / BFLA / enumeration violations the object-authz policy refused. |
 | `sbproxy_waf_persistent_blocks_total` | 600 | Labels: `origin`, `event` (rule_match\|ip_blocklisted\|anomaly_threshold), `key_kind` (ip\|jwt_sub\|api_key\|session). Counts the WAF blocks that landed on the persistent (cross-process) blocklist as opposed to the in-process rate-limit decision path. |
 | `sbproxy_bot_auth_nonce_replay_total` | 50 | Labels: `policy` (sanitised). Counts requests rejected because the Web-Bot-Auth nonce was already seen within the replay window. |
@@ -958,6 +959,34 @@ Three tiers, each with explicit on-call semantics:
 - **Page (P1, immediate human action).** Goes to PagerDuty; on-call acks within 15 minutes. Examples: ledger down, audit-log write failure, rail quorum loss, restore-drill miss.
 - **Ticket (P2, next business day).** Files an issue in the on-call queue. Examples: latency p95 sustained breach, webhook delivery failure rate, classifier drift (Wave 5).
 - **Log-only (P3).** Records the alert in Alertmanager but routes to log destinations only. Examples: cardinality near budget (90% of cap), deprecated-flag use, exemplar emission rate dropping.
+
+When `proxy.alerting.channels` is configured, the in-process evaluator publishes
+these seven built-in rules:
+
+| Rule | Default input and threshold |
+|---|---|
+| `budget_exhaustion` | Highest configured budget utilization. Warning at 80%, critical at 95%. |
+| `error_rate_spike` | AI-provider errors over attempts in the latest minute. Warning above 10%, critical above 20%; inactive below 10 attempts. |
+| `burn_rate` | Proxy request availability against a 99% target. The existing multi-window objectives use 14.4x, 6x, and 3x burn thresholds as their required windows mature. |
+| `latency_slo` | Proxy-wide request p99 for the latest minute. Warning above 200 ms, critical above 400 ms. |
+| `rate_limit_approaching` | Rejected route and tenant rate-limit decisions as a fraction of all decisions in the latest minute. Warning above 80%, critical at 95%. |
+| `cert_expiry` | Soonest certificate in the active ACME store. Warning at 30 days remaining, critical at 7 days. |
+| `circuit_breaker_trip` | A configured load-balancer target remains firing while its breaker is open or probing in half-open state. Only closing or removing that breaker resolves its incident. |
+
+Each rule reports `firing`, `ok`, or `inactive` in the admin alert snapshot.
+`inactive` means the evaluator did not receive a complete usable input, not
+that the condition is healthy. An inactive sample neither opens an incident nor
+resolves one already open. ACME expiry snapshots are atomic across configured
+hostnames, so a missing, unreadable, or invalid certificate makes the rule
+inactive instead of allowing a partial healthy snapshot to resolve an alert. A
+complete empty circuit-breaker snapshot is different: it means no breakers are
+configured and resolves incidents for breakers removed during reload.
+
+Burn-rate history is a bounded, process-local ring of 1,440 wall-clock
+one-minute buckets. Once request metrics are available, idle minutes occupy
+zero-request buckets so old failures age out after 24 hours. The ring is not
+persisted and starts empty after every process restart, so the longer burn
+windows need to mature again.
 
 Burn-rate windows for the page tier: 5m AND 1h at 14.4x, 30m AND 6h at 6x. Ticket tier: 2h AND 24h at 3x. Each paging alert carries a `runbook_id` label so on-call has a stable correlation key into deployment-specific runbooks.
 

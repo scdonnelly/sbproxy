@@ -7,6 +7,7 @@
 //! every helper into scope. Behavior-preserving move, no logic changes.
 
 use super::*;
+use crate::context::{LoadBalancerActionKey, LoadBalancerAttemptToken};
 
 fn active_action<'a>(pipeline: &'a CompiledPipeline, ctx: &RequestContext) -> Option<&'a Action> {
     let origin_idx = ctx.origin_idx?;
@@ -147,19 +148,142 @@ fn engage_validated_graphql_idempotency(
     false
 }
 
-/// Stable admin-console label for the generic load balancer's closed
-/// algorithm set.
-fn load_balancer_algorithm_name(algorithm: &sbproxy_modules::action::Algorithm) -> &'static str {
-    use sbproxy_modules::action::Algorithm;
-    match algorithm {
-        Algorithm::RoundRobin => "round_robin",
-        Algorithm::WeightedRandom => "weighted_random",
-        Algorithm::LeastConnections => "least_connections",
-        Algorithm::IpHash => "ip_hash",
-        Algorithm::UriHash => "uri_hash",
-        Algorithm::HeaderHash { .. } => "header_hash",
-        Algorithm::CookieHash { .. } => "cookie_hash",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadBalancerAttemptOutcome {
+    Success,
+    Failure,
+    Neutral,
+}
+
+fn load_balancer_for_action_key(
+    pipeline: &CompiledPipeline,
+    action_key: LoadBalancerActionKey,
+) -> Option<&sbproxy_modules::LoadBalancerAction> {
+    let action = if let Some(forward_rule_index) = action_key.forward_rule_index {
+        pipeline
+            .forward_rules
+            .get(action_key.origin_index)
+            .and_then(|rules| rules.get(forward_rule_index))
+            .map(|rule| &rule.action)
+    } else {
+        pipeline.actions.get(action_key.origin_index)
+    }?;
+    match action {
+        Action::LoadBalancer(load_balancer) => Some(load_balancer.as_ref()),
+        _ => None,
     }
+}
+
+fn finish_load_balancer_attempt(ctx: &mut RequestContext, outcome: LoadBalancerAttemptOutcome) {
+    let Some(attempt) = ctx.lb_attempt.take() else {
+        return;
+    };
+
+    let pipeline = ctx.pipeline.clone();
+    let Some(load_balancer) = load_balancer_for_action_key(&pipeline, attempt.action) else {
+        warn!(
+            origin_index = attempt.action.origin_index,
+            forward_rule_index = ?attempt.action.forward_rule_index,
+            target_index = attempt.target_index,
+            "load balancer attempt owner disappeared from its pinned pipeline"
+        );
+        return;
+    };
+
+    let success = match outcome {
+        LoadBalancerAttemptOutcome::Success => Some(true),
+        LoadBalancerAttemptOutcome::Failure => Some(false),
+        LoadBalancerAttemptOutcome::Neutral => None,
+    };
+    if let Some(success) = success {
+        load_balancer.record_strategy_outcome(
+            attempt.target_index,
+            sbproxy_modules::RoutingOutcome {
+                success,
+                latency: attempt.started_at.elapsed(),
+            },
+        );
+        if success {
+            load_balancer.record_target_success(attempt.target_index);
+            load_balancer.record_breaker_success(attempt.target_index);
+        } else {
+            load_balancer.record_target_failure(attempt.target_index);
+            load_balancer.record_breaker_failure(attempt.target_index);
+        }
+    }
+    load_balancer.record_disconnect(attempt.target_index);
+}
+
+fn begin_load_balancer_attempt(
+    ctx: &mut RequestContext,
+    action: LoadBalancerActionKey,
+    selection: &sbproxy_modules::action::TargetSelection,
+) {
+    // Defensive replacement cleanup. Normal retry/error paths finish the old
+    // token before Pingora asks for another peer, but this guard keeps a
+    // surprise second selection from leaking or underflowing connection state.
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Neutral);
+
+    let pipeline = ctx.pipeline.clone();
+    let Some(load_balancer) = load_balancer_for_action_key(&pipeline, action) else {
+        warn!(
+            origin_index = action.origin_index,
+            forward_rule_index = ?action.forward_rule_index,
+            target_index = selection.target_index,
+            "cannot start load balancer attempt without its owning action"
+        );
+        return;
+    };
+    load_balancer.record_connect(selection.target_index);
+    ctx.lb_attempt = Some(LoadBalancerAttemptToken {
+        action,
+        target_index: selection.target_index,
+        started_at: std::time::Instant::now(),
+        observed_upstream_status: None,
+    });
+    ctx.admin_load_balancer_strategy = Some(selection.selection_method.clone());
+    ctx.admin_load_balancer_target = Some(format!("{}:{}", selection.host, selection.port));
+}
+
+fn capture_load_balancer_upstream_response(
+    ctx: &mut RequestContext,
+    upstream_response: &pingora_http::ResponseHeader,
+) {
+    if let Some(attempt) = ctx.lb_attempt.as_mut() {
+        attempt.observed_upstream_status = Some(upstream_response.status.as_u16());
+    }
+}
+
+fn active_load_balancer_target_index(ctx: &RequestContext) -> Option<usize> {
+    ctx.lb_attempt.as_ref().map(|attempt| attempt.target_index)
+}
+
+fn terminal_load_balancer_attempt_outcome(
+    status: u16,
+    error_source: Option<&pingora_error::ErrorSource>,
+) -> LoadBalancerAttemptOutcome {
+    if status >= 500 || matches!(error_source, Some(pingora_error::ErrorSource::Upstream)) {
+        LoadBalancerAttemptOutcome::Failure
+    } else if error_source.is_some() {
+        // Downstream, internal, and unclassified failures are not evidence
+        // against the selected upstream.
+        LoadBalancerAttemptOutcome::Neutral
+    } else {
+        LoadBalancerAttemptOutcome::Success
+    }
+}
+
+fn finish_terminal_load_balancer_attempt(
+    ctx: &mut RequestContext,
+    error_source: Option<&pingora_error::ErrorSource>,
+) {
+    let observed_upstream_status = ctx
+        .lb_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.observed_upstream_status)
+        .unwrap_or(0);
+    let outcome = terminal_load_balancer_attempt_outcome(observed_upstream_status, error_source);
+    finish_load_balancer_attempt(ctx, outcome);
 }
 
 /// Scheme-agnostic host + path of an upstream URL (WOR-1698).
@@ -324,11 +448,7 @@ async fn maybe_retry_upstream_status(
     }
 
     let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
-    if let (Action::LoadBalancer(lb), Some(target_idx)) = (action, ctx.lb_target_idx) {
-        lb.record_target_failure(target_idx);
-        lb.record_breaker_failure(target_idx);
-        ctx.lb_target_idx = None;
-    }
+    finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
 
     ctx.status_retry_skip_reason = None;
     ctx.retry_count += 1;
@@ -469,6 +589,11 @@ impl ProxyHttp for SbProxy {
             peer
         }
 
+        // `upstream_peer` starts a new attempt. Every ordinary retry path
+        // already finishes the prior token, while this neutral guard handles
+        // Pingora replacement paths that bypass those callbacks.
+        finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Neutral);
+
         if let Some(backoff_ms) = ctx.retry_backoff_ms.take() {
             if backoff_ms > 0 {
                 debug!(
@@ -485,6 +610,7 @@ impl ProxyHttp for SbProxy {
             warn!("upstream_peer called without origin_idx");
             Error::new(ErrorType::HTTPStatus(500))
         })?;
+        let load_balancer_action_key = LoadBalancerActionKey::new(origin_idx, ctx.forward_rule_idx);
 
         // If a forward rule matched, use its action instead of the origin's.
         let effective_action: &Action = if let Some(fwd_idx) = ctx.forward_rule_idx {
@@ -582,36 +708,45 @@ impl ProxyHttp for SbProxy {
                 Ok(Box::new(peer))
             }
             Action::LoadBalancer(lb) => {
-                let client_ip_str = ctx.client_ip.map(|ip| ip.to_string());
-                let uri = _session.req_header().uri.path();
-                let headers = &_session.req_header().headers;
+                let request_header = _session.req_header();
+                let path = request_header.uri.path_and_query().map_or_else(
+                    || request_header.uri.path().to_string(),
+                    |value| value.to_string(),
+                );
+                let mut routing_request = sbproxy_modules::RoutingRequest::new(
+                    request_header.method.as_str(),
+                    path,
+                    ctx.hostname.as_str(),
+                );
+                routing_request.headers = request_header.headers.clone();
+                routing_request.client_ip = ctx.client_ip.map(|ip| ip.to_string());
+                let selection = lb.select_target_for_request(routing_request).map_err(|e| {
+                    warn!(error = %e, "load balancer target selection failed");
+                    Error::because(ErrorType::ConnectError, "lb target selection failed", e)
+                })?;
 
-                let (host, port, tls, target_idx) = lb
-                    .select_target(client_ip_str.as_deref(), uri, headers)
-                    .map_err(|e| {
-                        warn!(error = %e, "load balancer target selection failed");
-                        Error::because(ErrorType::ConnectError, "lb target selection failed", e)
-                    })?;
+                guard_upstream(
+                    &selection.host,
+                    selection.port,
+                    selection.tls,
+                    allow_private,
+                )
+                .await?;
 
-                guard_upstream(&host, port, tls, allow_private).await?;
-
-                lb.record_connect(target_idx);
-                ctx.lb_target_idx = Some(target_idx);
-                ctx.admin_load_balancer_strategy =
-                    Some(load_balancer_algorithm_name(&lb.algorithm).to_string());
-                ctx.admin_load_balancer_target = Some(format!("{host}:{port}"));
+                begin_load_balancer_attempt(ctx, load_balancer_action_key, &selection);
 
                 debug!(
                     hostname = %ctx.hostname,
-                    upstream_host = %host,
-                    upstream_port = %port,
-                    tls = %tls,
-                    target_idx = %target_idx,
+                    upstream_host = %selection.host,
+                    upstream_port = %selection.port,
+                    tls = %selection.tls,
+                    target_idx = %selection.target_index,
+                    selection_method = %selection.selection_method,
                     "load balancer routing request to upstream"
                 );
 
-                let addr = format!("{host}:{port}");
-                let peer = tune_peer(HttpPeer::new(&*addr, tls, host));
+                let addr = format!("{}:{}", selection.host, selection.port);
+                let peer = tune_peer(HttpPeer::new(&*addr, selection.tls, selection.host));
                 Ok(Box::new(peer))
             }
             Action::A2a(a2a) => {
@@ -916,8 +1051,7 @@ impl ProxyHttp for SbProxy {
                             .clone()
                             .or_else(|| parsed_upstream_url(&p.url).host.clone())
                     }
-                    Action::LoadBalancer(lb) => ctx
-                        .lb_target_idx
+                    Action::LoadBalancer(lb) => active_load_balancer_target_index(ctx)
                         .and_then(|i| lb.targets.get(i))
                         .and_then(|t| {
                             fc = t.forwarding;
@@ -1617,6 +1751,7 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        capture_load_balancer_upstream_response(ctx, upstream_response);
         maybe_retry_upstream_status(session, upstream_response, ctx).await
     }
 
@@ -2360,7 +2495,7 @@ impl ProxyHttp for SbProxy {
                         let resp_headers = upstream_response.headers.clone();
                         for policy in policies {
                             if let Policy::Assertion(a) = policy {
-                                let passed = a.evaluate(
+                                let passed = a.evaluate_with_trust_tier(
                                     &method,
                                     &path,
                                     &req_headers,
@@ -2370,6 +2505,7 @@ impl ProxyHttp for SbProxy {
                                     resp_status,
                                     &resp_headers,
                                     None,
+                                    Some(ctx.trust_tier.as_str()),
                                 );
                                 if passed {
                                     tracing::info!(
@@ -2466,28 +2602,6 @@ impl ProxyHttp for SbProxy {
 
         // Capture response status for metrics in the logging phase.
         ctx.response_status = Some(upstream_response.status.as_u16());
-
-        // --- Outlier detection + circuit breaker: per-target signals ---
-        // 5xx counts as a failure for both the sliding-window outlier
-        // detector and the formal circuit breaker. Earlier phases
-        // already record connect/timeout failures via Pingora's
-        // upstream error path; here we capture application-level
-        // errors from the response itself.
-        if let Some(target_idx) = ctx.lb_target_idx {
-            let pipeline_o = ctx.pipeline.clone();
-            if let Some(origin_idx) = ctx.origin_idx {
-                if let Some(Action::LoadBalancer(lb)) = pipeline_o.actions.get(origin_idx) {
-                    let status = upstream_response.status.as_u16();
-                    if status >= 500 {
-                        lb.record_target_failure(target_idx);
-                        lb.record_breaker_failure(target_idx);
-                    } else {
-                        lb.record_target_success(target_idx);
-                        lb.record_breaker_success(target_idx);
-                    }
-                }
-            }
-        }
 
         // --- Distributed tracing: echo traceparent/tracestate to downstream client ---
         if let Some(ref trace_ctx) = ctx.trace_ctx {
@@ -3004,6 +3118,27 @@ impl ProxyHttp for SbProxy {
             }
             if end_of_stream {
                 let collected = ctx.request_body_buf.take().unwrap_or_default();
+                // A verified header signature that covers content-digest is
+                // provisional until the complete pre-transform body arrives.
+                // Authenticate that body before any validator can short
+                // circuit so a mismatch is always attributed to the failed
+                // proof and never reaches the upstream.
+                if !crate::trust_tier::verify_and_finalize_body_proof(
+                    ctx,
+                    &session.req_header().headers,
+                    &collected,
+                ) {
+                    debug!("bot_auth content-digest body binding check failed; rejecting request");
+                    let body_str = serde_json::json!({
+                        "error": "bot_auth: content-digest body mismatch",
+                    })
+                    .to_string();
+                    ctx.validator_failed = Some((401, body_str, "application/json".into()));
+                    return Err(pingora_error::Error::explain(
+                        pingora_error::ErrorType::HTTPStatus(401),
+                        "bot_auth: content-digest body binding failed",
+                    ));
+                }
                 let pipeline = ctx.pipeline.clone();
                 let content_type = session
                     .req_header()
@@ -3221,50 +3356,30 @@ impl ProxyHttp for SbProxy {
                         "request body failed schema validation",
                     ));
                 }
-                // WOR-805 F1.6.1: the auth phase flagged that
-                // `bot_auth` verified a signature covering
-                // `content-digest`, so the body's actual SHA-256 has
-                // to match the `Content-Digest` header value the
-                // signature attests to. Run the deferred check now
-                // that the body is fully buffered. A failure here is
-                // an authentication failure (the body the client
-                // sent does not match the body the client signed),
-                // so map it to 401 with a generic message.
-                if ctx.bot_auth_digest_check_required {
-                    let header_value = session
+                // Body validation and idempotency share the same request
+                // buffer. When both are active, the validator branch owns
+                // the end-of-stream chunk and must also register the
+                // idempotency miss; otherwise the response is never cached
+                // and the key-only replay path cannot engage.
+                if ctx.idempotency_buffering {
+                    let body_hash = sbproxy_middleware::idempotency::hash_body(&collected);
+                    let header_name = ctx
+                        .origin_idx
+                        .and_then(|i| pipeline.idempotencies.get(i))
+                        .and_then(|opt| opt.as_ref())
+                        .map(|i| i.header_name.clone())
+                        .unwrap_or_else(|| "Idempotency-Key".to_string());
+                    let key = session
                         .req_header()
                         .headers
-                        .get("content-digest")
-                        .or_else(|| session.req_header().headers.get("repr-digest"))
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
-                    let ok = match header_value.as_deref() {
-                        Some(hv) => {
-                            sbproxy_middleware::digest::verify_content_digest(hv, &collected)
-                        }
-                        // A signature that covered `content-digest`
-                        // without a corresponding header is a wire-
-                        // shape contradiction; reject.
-                        None => false,
-                    };
-                    if !ok {
-                        debug!(
-                            "bot_auth content-digest body binding check failed; rejecting request"
-                        );
-                        let body_str = serde_json::json!({
-                            "error": "bot_auth: content-digest body mismatch",
-                        })
+                        .get(header_name.as_str())
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::trim)
+                        .unwrap_or_default()
                         .to_string();
-                        ctx.validator_failed = Some((401, body_str, "application/json".into()));
-                        return Err(pingora_error::Error::explain(
-                            pingora_error::ErrorType::HTTPStatus(401),
-                            "bot_auth: content-digest body binding failed",
-                        ));
-                    }
-                    // Mirror the content_digest-policy path: surface
-                    // a single audit flag so downstream composition
-                    // can attest "body matches signed digest".
-                    ctx.content_digest_verified = true;
+                    ctx.idempotency_miss = Some((key, body_hash));
+                    ctx.idempotency_response_body_buf = Some(bytes::BytesMut::with_capacity(8192));
+                    ctx.idempotency_buffering = false;
                 }
                 // Validation passed - release the buffered body as one
                 // chunk so the upstream sees the full payload.
@@ -3679,6 +3794,7 @@ impl ProxyHttp for SbProxy {
                     let pipeline_for_write = ctx.pipeline.clone();
                     if let Some(cache_store) = pipeline_for_write.cache_store.clone() {
                         let entry = sbproxy_cache::CachedResponse {
+                            generation: sbproxy_cache::new_cache_generation(),
                             status,
                             headers,
                             body: body_buf.to_vec(),
@@ -4170,6 +4286,7 @@ impl ProxyHttp for SbProxy {
         mut e: Box<Error>,
     ) -> Box<Error> {
         let pipeline = ctx.pipeline.clone();
+        finish_load_balancer_attempt(ctx, LoadBalancerAttemptOutcome::Failure);
         let Some(origin_idx) = ctx.origin_idx else {
             return e;
         };
@@ -4200,14 +4317,6 @@ impl ProxyHttp for SbProxy {
             return e;
         }
         let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
-        // For LB, mark the failed target so the next select_target
-        // skips it via outlier detection AND advances the breaker
-        // state (a connect failure is a failure for both signals).
-        if let (Some(Action::LoadBalancer(lb)), Some(idx)) = (action, ctx.lb_target_idx) {
-            lb.record_target_failure(idx);
-            lb.record_breaker_failure(idx);
-            ctx.lb_target_idx = None;
-        }
         ctx.retry_count += 1;
         ctx.retry_backoff_ms = Some(backoff_ms);
         // The timeout metric keys on the error class, not on which
@@ -4256,14 +4365,15 @@ impl ProxyHttp for SbProxy {
         let mut e = e.more_context(format!("Peer: {peer}"));
         e.retry
             .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
-        if e.retry() {
-            return e;
-        }
 
         let pipeline = ctx.pipeline.clone();
+        finish_terminal_load_balancer_attempt(ctx, Some(e.esource()));
         let Some(action) = active_action(&pipeline, ctx) else {
             return e;
         };
+        if e.retry() {
+            return e;
+        }
         let Some(cfg) = retry_config_for_action(action) else {
             return e;
         };
@@ -4281,14 +4391,6 @@ impl ProxyHttp for SbProxy {
         };
 
         let backoff_ms = cfg.backoff_for_attempt(ctx.retry_count);
-        // A timed-out target is a failure for both the outlier
-        // detector and the per-target breaker, exactly like the
-        // connect-error and status-retry paths.
-        if let (Action::LoadBalancer(lb), Some(idx)) = (action, ctx.lb_target_idx) {
-            lb.record_target_failure(idx);
-            lb.record_breaker_failure(idx);
-            ctx.lb_target_idx = None;
-        }
         ctx.retry_count += 1;
         ctx.retry_backoff_ms = Some(backoff_ms);
         sbproxy_observe::metrics::record_upstream_timeout_retry(ctx.hostname.as_str(), phase);
@@ -4488,6 +4590,12 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // A body-bound BotAuth signature is provisional during the header
+        // and policy phases. If a short circuit prevented the body verifier
+        // from running, close the observation conservatively without
+        // granting Strong from the unverified body binding.
+        crate::trust_tier::finalize_pending_body_proof_at_request_end(ctx);
+
         // Decrement active connections gauge (global + per-origin).
         metrics().active_connections.dec();
 
@@ -4707,15 +4815,10 @@ impl ProxyHttp for SbProxy {
                 .inc();
         }
 
-        // Decrement load balancer connection count if this request used one.
-        if let Some(target_idx) = ctx.lb_target_idx.take() {
-            if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = ctx.pipeline.clone();
-                if let Action::LoadBalancer(lb) = &pipeline.actions[origin_idx] {
-                    lb.record_disconnect(target_idx);
-                }
-            }
-        }
+        // Close any attempt that did not already end in a retry/error
+        // callback. The token resolves its own main or forward-rule action, so
+        // strategy, outlier, breaker, and connection state are updated once.
+        finish_terminal_load_balancer_attempt(ctx, e.map(|error| error.esource()));
 
         // --- Access log emission (Prereq.A) ---
         //
@@ -4903,6 +5006,19 @@ mod tests {
     use super::*;
     use pingora_error::ErrorSource;
 
+    fn target_selection(
+        target_index: usize,
+        selection_method: &str,
+    ) -> sbproxy_modules::action::TargetSelection {
+        sbproxy_modules::action::TargetSelection {
+            host: format!("target-{target_index}.example.com"),
+            port: 443,
+            tls: true,
+            target_index,
+            selection_method: selection_method.to_string(),
+        }
+    }
+
     fn pending_compression_value() -> sbproxy_ai::PendingCompressionValue {
         let run = sbproxy_ai::compression::CompressionRun {
             messages: Vec::new(),
@@ -4935,33 +5051,332 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admin_load_balancer_algorithm_names_are_closed_and_stable() {
-        use sbproxy_modules::action::Algorithm;
+    fn lifecycle_load_balancer_action(target_urls: &[&str], open_duration_secs: u64) -> Action {
+        let targets = target_urls
+            .iter()
+            .map(|url| serde_json::json!({ "url": url }))
+            .collect::<Vec<_>>();
+        sbproxy_modules::compile_action(&serde_json::json!({
+            "type": "load_balancer",
+            "targets": targets,
+            "circuit_breaker": {
+                "failure_threshold": 1,
+                "success_threshold": 1,
+                "open_duration_secs": open_duration_secs
+            },
+            "outlier_detection": {
+                "threshold": 0.5,
+                "window_secs": 60,
+                "min_requests": 1,
+                "ejection_duration_secs": 60
+            }
+        }))
+        .unwrap()
+    }
 
-        let cases = [
-            (Algorithm::RoundRobin, "round_robin"),
-            (Algorithm::WeightedRandom, "weighted_random"),
-            (Algorithm::LeastConnections, "least_connections"),
-            (Algorithm::IpHash, "ip_hash"),
-            (Algorithm::UriHash, "uri_hash"),
-            (
-                Algorithm::HeaderHash {
-                    header: "x-tenant".to_string(),
-                },
-                "header_hash",
-            ),
-            (
-                Algorithm::CookieHash {
-                    cookie: "session".to_string(),
-                },
-                "cookie_hash",
-            ),
-        ];
+    fn lifecycle_pipeline_with_breaker_duration(
+        open_duration_secs: u64,
+    ) -> std::sync::Arc<CompiledPipeline> {
+        let mut pipeline = CompiledPipeline::default();
+        pipeline.actions.push(lifecycle_load_balancer_action(
+            &["http://main-a:8080", "http://main-b:8080"],
+            open_duration_secs,
+        ));
+        pipeline
+            .forward_rules
+            .push(vec![crate::pipeline::CompiledForwardRule {
+                matchers: Vec::new(),
+                action: lifecycle_load_balancer_action(
+                    &["http://forward-a:8080", "http://forward-b:8080"],
+                    open_duration_secs,
+                ),
+                request_modifiers: Vec::new(),
+                parameters: Vec::new(),
+            }]);
+        std::sync::Arc::new(pipeline)
+    }
 
-        for (algorithm, expected) in cases {
-            assert_eq!(load_balancer_algorithm_name(&algorithm), expected);
+    fn lifecycle_pipeline() -> std::sync::Arc<CompiledPipeline> {
+        lifecycle_pipeline_with_breaker_duration(60)
+    }
+
+    fn load_balancer(action: &Action) -> std::sync::Arc<sbproxy_modules::LoadBalancerAction> {
+        match action {
+            Action::LoadBalancer(load_balancer) => std::sync::Arc::clone(load_balancer),
+            other => panic!("expected load balancer, got {other:?}"),
         }
+    }
+
+    fn breaker_state(
+        load_balancer: &sbproxy_modules::LoadBalancerAction,
+        target_index: usize,
+    ) -> sbproxy_platform::CircuitState {
+        load_balancer.circuit_breakers.as_ref().unwrap()[target_index].state()
+    }
+
+    #[test]
+    fn retry_finishes_the_previous_attempt_before_selecting_a_replacement() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(main.connection_count(1), 1);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Open,
+            "the failed retry attempt must train its own breaker",
+        );
+    }
+
+    #[test]
+    fn selection_replacement_disconnects_an_unfinished_attempt_without_training_it() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(main.connection_count(1), 1);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(
+            !main
+                .outlier_detector
+                .as_ref()
+                .unwrap()
+                .is_ejected(&main.target_id(0)),
+            "replacement cleanup is neutral, not a fabricated failure"
+        );
+    }
+
+    #[test]
+    fn forward_rule_success_cleans_up_its_own_attempt() {
+        let pipeline = lifecycle_pipeline_with_breaker_duration(0);
+        let main = load_balancer(&pipeline.actions[0]);
+        let forward = load_balancer(&pipeline.forward_rules[0][0].action);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        forward.record_breaker_failure(0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::HalfOpen
+        );
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, Some(0)),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Success);
+
+        assert_eq!(forward.connection_count(0), 0);
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "success must close the forward rule's half-open breaker"
+        );
+        assert!(ctx.lb_attempt.is_none());
+    }
+
+    #[test]
+    fn forward_rule_failure_updates_its_own_breaker_and_outlier() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let forward = load_balancer(&pipeline.forward_rules[0][0].action);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, Some(0)),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+
+        assert_eq!(forward.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&forward, 0),
+            sbproxy_platform::CircuitState::Open
+        );
+        assert!(forward
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&forward.target_id(0)));
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+    }
+
+    #[test]
+    fn terminal_attempt_cleanup_is_exactly_once_without_counter_underflow() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, None),
+            &target_selection(0, "bandit"),
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Success);
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Failure);
+
+        assert_eq!(main.connection_count(0), 0);
+        assert!(ctx.lb_attempt.is_none());
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "the second cleanup must not record a second outcome"
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+    }
+
+    #[test]
+    fn downstream_errors_do_not_train_a_healthy_upstream_as_failed() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        begin_load_balancer_attempt(
+            &mut ctx,
+            LoadBalancerActionKey::new(0, None),
+            &target_selection(0, "bandit"),
+        );
+        let downstream_outcome =
+            terminal_load_balancer_attempt_outcome(200, Some(&ErrorSource::Downstream));
+        finish_load_balancer_attempt(&mut ctx, downstream_outcome);
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+        assert_eq!(downstream_outcome, LoadBalancerAttemptOutcome::Neutral);
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(200, Some(&ErrorSource::Upstream)),
+            LoadBalancerAttemptOutcome::Failure
+        );
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(200, None),
+            LoadBalancerAttemptOutcome::Success
+        );
+        assert_eq!(
+            terminal_load_balancer_attempt_outcome(503, Some(&ErrorSource::Downstream)),
+            LoadBalancerAttemptOutcome::Failure,
+            "a downstream write error must not erase an upstream 5xx"
+        );
+    }
+
+    #[test]
+    fn attempt_feedback_uses_observed_upstream_status_not_rewritten_downstream_status() {
+        let pipeline = lifecycle_pipeline();
+        let main = load_balancer(&pipeline.actions[0]);
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let action = LoadBalancerActionKey::new(0, None);
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(0, "bandit"));
+        let upstream_ok = pingora_http::ResponseHeader::build(200, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_ok);
+        ctx.response_status = Some(503);
+        finish_terminal_load_balancer_attempt(&mut ctx, Some(&ErrorSource::Downstream));
+
+        assert_eq!(main.connection_count(0), 0);
+        assert_eq!(
+            breaker_state(&main, 0),
+            sbproxy_platform::CircuitState::Closed,
+            "a downstream 5xx rewrite must not train an observed upstream 200 as failed"
+        );
+        assert!(!main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(0)));
+
+        begin_load_balancer_attempt(&mut ctx, action, &target_selection(1, "bandit"));
+        let upstream_failure = pingora_http::ResponseHeader::build(503, None).unwrap();
+        capture_load_balancer_upstream_response(&mut ctx, &upstream_failure);
+        ctx.response_status = Some(200);
+        finish_terminal_load_balancer_attempt(&mut ctx, None);
+
+        assert_eq!(main.connection_count(1), 0);
+        assert_eq!(
+            breaker_state(&main, 1),
+            sbproxy_platform::CircuitState::Open,
+            "a downstream 2xx rewrite must not erase an observed upstream 503"
+        );
+        assert!(main
+            .outlier_detector
+            .as_ref()
+            .unwrap()
+            .is_ejected(&main.target_id(1)));
+    }
+
+    #[test]
+    fn deferred_strategy_selection_records_the_builtin_algorithm() {
+        let pipeline = lifecycle_pipeline();
+        let mut ctx = RequestContext {
+            pipeline: std::sync::Arc::clone(&pipeline),
+            ..RequestContext::default()
+        };
+        let selection = target_selection(0, "round_robin");
+
+        begin_load_balancer_attempt(&mut ctx, LoadBalancerActionKey::new(0, None), &selection);
+
+        assert_eq!(
+            ctx.admin_load_balancer_strategy.as_deref(),
+            Some("round_robin")
+        );
+        assert_eq!(
+            ctx.admin_load_balancer_target.as_deref(),
+            Some("target-0.example.com:443")
+        );
+        finish_load_balancer_attempt(&mut ctx, LoadBalancerAttemptOutcome::Neutral);
     }
 
     #[test]

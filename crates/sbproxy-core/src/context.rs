@@ -135,6 +135,39 @@ impl AdminCacheStatus {
     }
 }
 
+/// Stable location of a load-balancer action inside the request's pinned
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadBalancerActionKey {
+    pub(crate) origin_index: usize,
+    pub(crate) forward_rule_index: Option<usize>,
+}
+
+impl LoadBalancerActionKey {
+    pub(crate) const fn new(origin_index: usize, forward_rule_index: Option<usize>) -> Self {
+        Self {
+            origin_index,
+            forward_rule_index,
+        }
+    }
+}
+
+/// One selected load-balancer target and the action that owns its mutable
+/// connection, breaker, outlier, and strategy state.
+///
+/// The pinned pipeline plus this key keeps retry and terminal cleanup attached
+/// to the action that created the attempt, even when that action came from a
+/// forward rule.
+#[derive(Debug)]
+pub(crate) struct LoadBalancerAttemptToken {
+    pub(crate) action: LoadBalancerActionKey,
+    pub(crate) target_index: usize,
+    pub(crate) started_at: Instant,
+    /// Status received from the selected upstream before any proxy response
+    /// fallback or modifier can rewrite the downstream status.
+    pub(crate) observed_upstream_status: Option<u16>,
+}
+
 /// Per-request state threaded through all Pingora phases as CTX.
 pub struct RequestContext {
     // --- Identity ---
@@ -169,6 +202,14 @@ pub struct RequestContext {
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
     pub auth_result: Option<AuthDecision>,
+    /// Conservative trust tier derived once after identity enrichment and
+    /// authentication. Downstream policies and scripting read this field
+    /// instead of independently combining signature, agent, and deny signals.
+    pub trust_tier: sbproxy_modules::auth::TrustTier,
+    /// Whether the request's final trust-tier metric observation has been
+    /// emitted. Body-bound Web Bot Auth remains provisional until the body
+    /// digest is checked, so the metric writer must be exactly-once.
+    pub(crate) trust_tier_metric_recorded: bool,
 
     // --- Flags ---
     /// Whether the force-SSL redirect check has already been performed.
@@ -184,8 +225,9 @@ pub struct RequestContext {
     pub short_circuit_content_type: Option<String>,
 
     // --- Load balancer state ---
-    /// Index of the selected load balancer target (for connection tracking).
-    pub lb_target_idx: Option<usize>,
+    /// Currently active target attempt, tied to the exact main or forward-rule
+    /// load-balancer action that owns its mutable runtime state.
+    pub(crate) lb_attempt: Option<LoadBalancerAttemptToken>,
 
     // --- Upstream retry state ---
     /// Number of retry attempts already made for this request.
@@ -1163,7 +1205,7 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
-            lb_target_idx: None,
+            lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,
             status_retry_skip_reason: None,
@@ -1205,6 +1247,8 @@ impl RequestContext {
             response_body_bytes: 0,
             mirror_pending: None,
             auth_result: None,
+            trust_tier: sbproxy_modules::auth::TrustTier::Anonymous,
+            trust_tier_metric_recorded: false,
             force_ssl_checked: false,
             short_circuit_status: None,
             short_circuit_body: None,
@@ -1381,6 +1425,7 @@ mod tests {
         assert!(ctx.client_ip.is_none());
         assert!(ctx.hostname.is_empty());
         assert!(ctx.origin_idx.is_none());
+        assert!(ctx.lb_attempt.is_none());
         assert!(ctx.auth_result.is_none());
         assert!(!ctx.force_ssl_checked);
         assert!(ctx.short_circuit_status.is_none());
@@ -1395,6 +1440,11 @@ mod tests {
         assert!(ctx.upstream_content_type.is_none());
         assert!(ctx.forward_rule_idx.is_none());
         assert!(!ctx.fallback_triggered);
+        assert_eq!(
+            ctx.trust_tier,
+            sbproxy_modules::auth::TrustTier::Anonymous,
+            "missing evidence must default to the least-privileged tier"
+        );
     }
 
     #[test]

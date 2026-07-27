@@ -2359,21 +2359,13 @@ pub const METRICS: &[MetricCapability] = &[
     MetricCapability {
         name: "sbproxy_rate_limit_decisions_total",
         kind: MetricKind::Counter,
-        writer: Writer::Nothing,
-        support: SupportLevel::ConfigOnly,
+        writer: Writer::Recorder("record_rate_limit_decision"),
+        support: SupportLevel::Stable,
         compat: CompatTier::Alpha,
         registry: Registry::Default,
         labels: &["policy", "result"],
         description: "Rate-limit middleware decisions, by policy and outcome.",
-        dead_reason: Some(
-            "nothing calls it, not even a test. This is a finer-grained view than the \
-             already-Stable sbproxy_policy_triggers_total{policy_type=\"rate_limit\"} (which \
-             only distinguishes allow/deny): its allow/throttle_route/throttle_tenant/disabled \
-             result set requires the per-route rate-limit policy in \
-             crates/sbproxy-modules/src/policy/rate_limit.rs (RateLimitPolicy::allow_with_info*) \
-             to call it, which is out of this lane's file allowlist. Wire it there or delete \
-             under WOR-1898",
-        ),
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_rate_limit_suspend_total",
@@ -2644,6 +2636,17 @@ pub const METRICS: &[MetricCapability] = &[
              above; see that entry for the call-site detail. Wire or delete both together \
              under WOR-1898",
         ),
+    },
+    MetricCapability {
+        name: "sbproxy_trust_tier_requests_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_trust_tier"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Proxy,
+        labels: &["tier"],
+        description: "Requests partitioned by the conservative trust-tier decision.",
+        dead_reason: None,
     },
     MetricCapability {
         name: "sbproxy_unrouted_requests_total",

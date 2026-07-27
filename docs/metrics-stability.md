@@ -230,7 +230,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_policy_evaluation_duration_seconds` | Histogram | `stable` | `beta` | `origin`, `verdict` | Wall-clock latency of one full policy-chain evaluation. |
 | `sbproxy_policy_triggers_total` | Counter | `stable` | `stable` | `origin`, `policy_type`, `action`, `agent_id`, `agent_class` | Policy enforcement results. |
 | `sbproxy_projection_render_failures_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `projection` | Well-known projection render failures, by projection. |
-| `sbproxy_rate_limit_decisions_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
+| `sbproxy_rate_limit_decisions_total` | Counter | `stable` | `alpha` | `policy`, `result` | Rate-limit middleware decisions, by policy and outcome. |
 | `sbproxy_rate_limit_suspend_total` | Counter | `stable` | `beta` | `workspace` | Workspace auto-suspend transitions. |
 | `sbproxy_rate_limit_total` | Counter | `stable` | `beta` | `workspace`, `result` | Workspace rate-limit budget outcomes by workspace and result (soft/throttle). |
 | `sbproxy_redis_kv_connections_total` | Counter | `stable` | `beta` | `result` | Redis KV connection attempts by result. |
@@ -252,6 +252,7 @@ Two name prefixes are sanctioned. `sbproxy_` covers the proxy and its gateway su
 | `sbproxy_tokens_attributed_total` | Counter | `stable` | `beta` | `project`, `user`, `tag`, `direction` | AI token usage attributed to a credential's project / user / tag. |
 | `sbproxy_transport_duration_seconds` | Histogram | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer request duration, by protocol and outcome. |
 | `sbproxy_transport_requests_total` | Counter | `config_only` (nothing emits this yet) | `alpha` | `protocol`, `result` | Transport-layer requests, by protocol and outcome. |
+| `sbproxy_trust_tier_requests_total` | Counter | `stable` | `beta` | `tier` | Requests partitioned by the conservative trust-tier decision. |
 | `sbproxy_unrouted_requests_total` | Counter | `stable` | `beta` | `reason` | Requests rejected before origin resolution, by reason. |
 | `sbproxy_upstream_status_retries_total` | Counter | `stable` | `beta` | `origin`, `status` | Upstream retries triggered by a configured response status, by origin and matched status. |
 | `sbproxy_upstream_timeout_retries_total` | Counter | `stable` | `beta` | `origin`, `phase` | Upstream retries triggered by a timeout-classed failure, by origin and phase (connect or upstream). |
