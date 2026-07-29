@@ -8700,6 +8700,7 @@ dependencies = [
  "sbproxy-classifier-client",
  "sbproxy-config",
  "sbproxy-extension",
+ "sbproxy-httpkit",
  "sbproxy-model-host",
  "sbproxy-platform",
  "sbproxy-plugin",
@@ -9028,6 +9029,8 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "parking_lot",
+ "reqwest 0.12.28",
+ "tokio",
 ]
 
 [[package]]

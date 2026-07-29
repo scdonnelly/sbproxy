@@ -1,4 +1,4 @@
-//! Compiled pipeline: config + instantiated module enums + enterprise hooks.
+//! Compiled pipeline: config + instantiated module enums + optional hooks.
 //!
 //! [`CompiledPipeline`] bridges the gap between `sbproxy-config` (which stores
 //! JSON `serde_json::Value` blobs) and `sbproxy-modules` (which defines typed
@@ -11,9 +11,8 @@
 //!   response cache: whichever backend `proxy.response_cache_store`
 //!   selects, or, when that block is absent, Redis if `config.l2_store`
 //!   is set and an in-memory LRU otherwise,
-//! * an enterprise [`Hooks`](crate::hooks::Hooks) bundle of optional traits
-//!   that OSS leaves as `None` and enterprise populates via the
-//!   [`EnterpriseStartupHook`](crate::hooks::EnterpriseStartupHook) pattern.
+//! * an optional [`Hooks`](crate::hooks::Hooks) bundle of traits populated by a
+//!   [`PipelineLifecycleHook`](crate::hooks::PipelineLifecycleHook) when registered.
 //!
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
@@ -30,7 +29,8 @@ use sbproxy_cache::{
 };
 use sbproxy_config::{CompiledConfig, Parameter, RequestModifierConfig};
 use sbproxy_modules::compile::{
-    compile_action, compile_action_for_origin, compile_auth, compile_policy, compile_transform,
+    compile_action_for_origin, compile_action_for_origin_for_validation, compile_auth,
+    compile_policy, compile_transform,
 };
 use sbproxy_modules::transform::{CompiledTransform, TransformConfig};
 use sbproxy_modules::{Action, Auth, BotDetection, Policy, ThreatProtection};
@@ -466,7 +466,7 @@ impl ReserveAdmission {
 /// Build the OSS Cache Reserve backend from the YAML config block.
 ///
 /// Returns `(None, None)` when the block is absent, disabled, or
-/// targets an enterprise backend the OSS pipeline does not know how
+/// targets an extension-provided backend the pipeline does not know how
 /// to instantiate. Failures during construction (e.g. an invalid
 /// Redis URL) are logged at `warn` level and surfaced as `(None, None)`
 /// so a misconfigured reserve degrades to plain hot-cache behavior
@@ -514,7 +514,7 @@ fn build_cache_reserve(
         },
         sbproxy_config::CacheReserveBackendConfig::Other => {
             tracing::warn!(
-                "cache_reserve backend type is unknown to OSS; if this is an enterprise backend, the enterprise startup hook should attach it"
+                "cache_reserve backend type is unknown; a pipeline lifecycle hook may attach an implementation"
             );
             None
         }
@@ -1036,11 +1036,11 @@ pub struct CompiledPipeline {
     /// path doesn't have to re-walk `config.server.cache_reserve` on
     /// every put.
     pub cache_reserve_admission: Option<ReserveAdmission>,
-    /// Enterprise hooks bundle.
+    /// Optional pipeline hooks bundle.
     ///
-    /// All fields default to `None` in OSS builds. Enterprise registers
+    /// All fields default to `None`. A lifecycle extension registers
     /// implementations (classifier, semantic cache, etc.) via the
-    /// `EnterpriseStartupHook` pattern. Request-path code invokes these
+    /// `PipelineLifecycleHook` pattern. Request-path code invokes these
     /// optionally and no-ops when they are `None`.
     pub hooks: crate::hooks::Hooks,
     /// Pre-parsed CIDRs from `proxy.trusted_proxies`. When the immediate
@@ -1207,7 +1207,15 @@ impl CompiledPipeline {
                 origin.origin_id.as_str(),
                 None,
             );
-            let action = compile_action_for_origin(&origin.action_config, &action_identity)?;
+            let action = match mode {
+                PipelineConstructionMode::Runtime => {
+                    compile_action_for_origin(&origin.action_config, &action_identity)?
+                }
+                PipelineConstructionMode::Validation => compile_action_for_origin_for_validation(
+                    &origin.action_config,
+                    &action_identity,
+                )?,
+            };
             actions.push(action);
 
             // Compile auth (optional per origin).
@@ -1274,11 +1282,12 @@ impl CompiledPipeline {
                 &origin.forward_rules,
                 origin.workspace_id.as_str(),
                 origin.origin_id.as_str(),
+                mode,
             )?;
             forward_rules.push(origin_fwd_rules);
 
             // Compile fallback origin (optional per origin).
-            let fallback = compile_fallback(&origin.fallback_origin)?;
+            let fallback = compile_fallback(&origin.fallback_origin, mode)?;
             fallbacks.push(fallback);
 
             // Compile bot detection (optional per origin).
@@ -1402,8 +1411,8 @@ impl CompiledPipeline {
         //
         // Built from the top-level `cache_reserve:` block. The OSS
         // backends (memory / filesystem / redis) are instantiated here;
-        // unknown / enterprise backends drop through to `None` with a
-        // warning so the enterprise startup hook can swap in its own
+        // unknown or extension-provided backends drop through to `None` with a
+        // warning so a pipeline lifecycle hook can swap in its own
         // implementation post-compile.
         let (cache_reserve, cache_reserve_admission) =
             build_cache_reserve(&config.server.cache_reserve);
@@ -1760,11 +1769,12 @@ fn compile_forward_rules(
     raw_rules: &[serde_json::Value],
     workspace_id: &str,
     origin_id: &str,
+    mode: PipelineConstructionMode,
 ) -> anyhow::Result<Vec<CompiledForwardRule>> {
     let mut compiled = Vec::with_capacity(raw_rules.len());
     for (rule_index, rule_val) in raw_rules.iter().enumerate() {
         let rule_id = routing_action_identity(workspace_id, origin_id, Some(rule_index));
-        let fwd = compile_single_forward_rule(rule_val, &rule_id)?;
+        let fwd = compile_single_forward_rule(rule_val, &rule_id, mode)?;
         compiled.push(fwd);
     }
     Ok(compiled)
@@ -1802,6 +1812,7 @@ fn compile_forward_rules(
 fn compile_single_forward_rule(
     val: &serde_json::Value,
     rule_id: &str,
+    mode: PipelineConstructionMode,
 ) -> anyhow::Result<CompiledForwardRule> {
     let rules_arr = val
         .get("rules")
@@ -1835,7 +1846,12 @@ fn compile_single_forward_rule(
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("forward rule origin missing 'action'"))?;
-    let action = compile_action_for_origin(action_config, rule_id)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, rule_id)?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, rule_id)?
+        }
+    };
 
     // Parse request modifiers (optional).
     // Supports both Rust format ({ headers: { set: ... } }) and Go format
@@ -1971,7 +1987,10 @@ fn compile_query_matcher(val: Option<&serde_json::Value>) -> anyhow::Result<Opti
 ///       status_code: 200
 ///       json_body: { ... }
 /// ```
-fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<CompiledFallback>> {
+fn compile_fallback(
+    raw: &Option<serde_json::Value>,
+    mode: PipelineConstructionMode,
+) -> anyhow::Result<Option<CompiledFallback>> {
     let val = match raw {
         Some(v) => v,
         None => return Ok(None),
@@ -2004,7 +2023,12 @@ fn compile_fallback(raw: &Option<serde_json::Value>) -> anyhow::Result<Option<Co
     let action_config = origin_obj
         .get("action")
         .ok_or_else(|| anyhow::anyhow!("fallback origin missing 'action'"))?;
-    let action = compile_action(action_config)?;
+    let action = match mode {
+        PipelineConstructionMode::Runtime => compile_action_for_origin(action_config, "")?,
+        PipelineConstructionMode::Validation => {
+            compile_action_for_origin_for_validation(action_config, "")?
+        }
+    };
 
     Ok(Some(CompiledFallback {
         on_error,

@@ -14,7 +14,7 @@ This guide owns the end-to-end picture: provider setup, wire compatibility, rout
 
 Configure one or more providers under the `action` block. Each provider needs a name, API key, and model list. Callers of hosted providers should send an explicit `model`. A `default_model` can select among locally served models and appears in model metadata, but the hosted dynamic-routing path does not inject one into a request that omitted `model`:
 
-**Fragment** — this is one `origins` entry; it needs a sibling top-level `proxy:` block (at minimum `proxy.http_bind_port`) to be a runnable `sb.yml`. See [Full example](#full-example) below or [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) for a complete file.
+**Fragment:** This is one `origins` entry; it needs a sibling top-level `proxy:` block (at minimum `proxy.http_bind_port`) to be a runnable `sb.yml`. See [Full example](#full-example) below or [`examples/ai-gateway-quickstart/`](../examples/ai-gateway-quickstart/) for a complete file.
 
 ```yaml
 origins:
@@ -44,7 +44,7 @@ Any model a listed provider serves works without extra config. For a self-hosted
 Use `provider_type: managed_model` to route a public model name to a deployment
 owned by `proxy.model_host`:
 
-**Fragment** — nest under a top-level `proxy:` block that also configures `model_host`; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/) for a runnable pairing of both.
+**Fragment:** Nest under a top-level `proxy:` block that also configures `model_host`; see [model-host.md](model-host.md) and [`examples/model-host-managed/`](../examples/model-host-managed/) for a runnable pairing of both.
 
 ```yaml
 origins:
@@ -100,7 +100,7 @@ deployments must set `cold_start` explicitly.
 
 Before the routing strategy runs, the proxy narrows the candidate providers to those that declare the requested model in their `models` list. With one model per provider you get a single OpenAI-compatible endpoint where the `model` field picks the vendor:
 
-**Fragment** — same `origins` entry shape as [Provider setup](#provider-setup) above; nest under `proxy:` to run it. This exact shape (three providers, one model each) is the base config in [`use-case-own-openrouter.md`](use-case-own-openrouter.md) and [`examples/use-case-own-openrouter/sb.yml`](../examples/use-case-own-openrouter/sb.yml).
+**Fragment:** This uses the same `origins` entry shape as [Provider setup](#provider-setup) above; nest it under `proxy:` to run it. This exact shape (three providers, one model each) is the base config in [`use-case-own-openrouter.md`](use-case-own-openrouter.md) and [`examples/use-case-own-openrouter/sb.yml`](../examples/use-case-own-openrouter/sb.yml).
 
 ```yaml
 origins:
@@ -596,7 +596,7 @@ remain unavailable on the OSS path.
 
 Input guardrails inspect the parsed prompt ahead of egress ([config](../examples/ai-guardrails/)).
 
-The proxy supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
+The built-in pipeline supports ten guardrail types: `pii`, `injection`, `jailbreak`, `toxicity`, `content_safety`, `schema`, `regex`, `context_poisoning`, `agent_alignment`, and `classifier`. Built-in guardrails run on input (before the provider call) or output (after), and they can block, flag, or rewrite content. For HTTP policy services, use [external guardrail adapters](guardrails.md). For CEL-based request gating see the CEL section below, and [configuration.md](configuration.md#guardrails-guardrails) for the per-type field schema.
 
 Input guardrails apply to whichever body field the surface carries user text in:
 
@@ -608,7 +608,7 @@ Input guardrails apply to whichever body field the surface carries user text in:
 | `reranking` | `body["query"]` |
 | `moderations` | `body["input"]` |
 
-A single guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the input-guardrail check today because their bodies are forwarded byte-transparently; output-side scanning for those surfaces is reserved for a follow-up.
+A single built-in guardrail block on the AI handler config covers every supported surface; the proxy picks the right field automatically based on the classified surface. Multipart-bodied surfaces (image edits, image variations, audio transcription) bypass the built-in input check today because their bodies are forwarded byte-transparently; built-in output scanning for those surfaces is reserved for a follow-up. External adapters apply their documented [unavailable-content policy](guardrails.md#streaming-and-multipart-content) to multipart bodies.
 
 ### Safety guardrail modes
 
@@ -1406,7 +1406,7 @@ Per-surface knobs live under `per_surface_rate_limits` (see [Per-surface rate li
 
 ### Reranking
 
-`reranking` is not enterprise-gated. The OSS build classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. The only gate is the capability check above: when no configured provider supports reranking, the proxy returns 501 before any upstream call, same as every other surface.
+`reranking` ships in the OSS build. It classifies the surface, dispatches it when a configured provider supports it (Cohere today), and captures the request's document count for per-unit billing. When no configured provider supports reranking, the proxy returns 501 before any upstream call, the same as every other surface.
 
 ## Context handling
 
@@ -1503,7 +1503,7 @@ Both are sourced from the resolved principal, never from a request header, so a 
   used. For an admin-managed governed key, the immutable public `key_id` is
   used instead of its mutable display name.
 
-**Fragment** — an origin's `authentication:` block (alias `auth:`; this page uses the canonical name). Nest under an origin alongside `action:`; see [key-management.md](key-management.md) for the full key lifecycle.
+**Fragment:** This is an origin's `authentication:` block (alias `auth:`; this page uses the canonical name). Nest it under an origin alongside `action:`; see [key-management.md](key-management.md) for the full key lifecycle.
 
 ```yaml
 authentication:
@@ -1578,7 +1578,7 @@ The proxy exposes aggregate AI usage as Prometheus metrics. The `/metrics` endpo
 | `sbproxy_ai_realtime_sessions_active` | Gauge | | Currently open OpenAI Realtime API WebSocket sessions |
 | `sbproxy_ai_realtime_session_duration_seconds` | Histogram | `provider`, `close_reason` | Wall-clock duration of a Realtime WebSocket session, observed at close. `close_reason` is `client_closed` or `error` |
 | `sbproxy_ai_realtime_audio_seconds_total` | Counter | `provider`, `direction` | Cumulative audio seconds forwarded over Realtime sessions. Frame-exact accounting requires terminate-and-relay (not on the OSS path); the OSS dispatcher uses session wall-clock as a duration proxy on close |
-| `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). Reserved for a future enterprise terminate-and-relay path |
+| `sbproxy_ai_realtime_frames_forwarded_total` | Counter | `provider`, `direction`, `kind` | Cumulative frames forwarded over Realtime sessions (`kind` is `text` or `audio`). A future terminate-and-relay implementation would add per-frame inspection. |
 
 Use these to build spending dashboards, set budget alerts, and track provider reliability without any application-level instrumentation.
 
@@ -1722,7 +1722,7 @@ non-`101` provider response does not change that gauge and does not emit
 session-duration or realtime billing events.
 
 What runs during the session:
-- Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames (per-frame guardrails are not on the OSS path; they would require terminate-and-relay, which is reserved for an enterprise build).
+- Pingora forwards WebSocket frames byte-transparently. The proxy does not inspect individual frames. Per-frame guardrails require a future terminate-and-relay implementation.
 - Admission is evaluated once. A hot policy/config update applies to new
   upgrades; a socket that already received 101 continues relaying frames and
   can complete its close handshake.
@@ -1763,7 +1763,7 @@ ws = websocket.create_connection(
 )
 ```
 
-The proxy enforces gating before the upgrade and emits a session-end billing event after close; per-frame inspection is reserved for an enterprise terminate-and-relay path that would land alongside a dedicated Pingora `Service` impl.
+The proxy enforces gating before the upgrade and emits a session-end billing event after close. Per-frame inspection requires a future terminate-and-relay implementation alongside a dedicated Pingora `Service` implementation.
 
 ## Full example
 
