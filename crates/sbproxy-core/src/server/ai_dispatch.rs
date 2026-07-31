@@ -875,7 +875,7 @@ pub(super) async fn realtime_budget_gate(
     ctx: &mut RequestContext,
     model: Option<&str>,
 ) -> std::result::Result<RealtimeAdmission, (u16, String)> {
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared =
         prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref()).await?;
 
@@ -2306,7 +2306,7 @@ pub(super) async fn handle_ai_proxy(
     // Resolve authentication and its immutable effective policy before any AI
     // dispatch branch can return or contact a provider/cache. The key plane and
     // policy snapshots stay pinned for the rest of this request.
-    let key_plane = crate::key_plane::current_key_plane();
+    let key_plane = pipeline.key_plane().cloned();
     let prepared_identity =
         match prepare_ai_request_identity(session, config, pipeline, ctx, key_plane.as_deref())
             .await
@@ -4323,7 +4323,7 @@ pub(super) async fn handle_ai_proxy(
                 origin: hostname.to_string(),
                 model_id,
                 prompt: extracted_prompt.clone(),
-                headers: snapshot_request_headers(session),
+                headers: snapshot_request_headers(session, pipeline),
             };
             if let Some(verdict) = hook.classify_prompt(&classify_req).await {
                 debug!(
@@ -4916,7 +4916,7 @@ pub(super) async fn handle_ai_proxy(
                     origin: hostname.to_string(),
                     model_id: model_id.clone(),
                     prompt: extracted_prompt.clone(),
-                    request_headers: snapshot_request_headers(session),
+                    request_headers: snapshot_request_headers(session, pipeline),
                     request_body: body_bytes.clone(),
                     method: method.as_str().to_string(),
                     path: path.clone(),

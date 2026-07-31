@@ -17,7 +17,7 @@
 //! This struct lives in `sbproxy-core` to avoid a circular dependency:
 //! config -> modules -> config would be circular, but core depends on both.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::builtin_enforcers::{compile_builtin_enforcers, CompiledEnforcer};
@@ -1110,6 +1110,18 @@ pub struct CompiledIdempotency {
 pub struct CompiledPipeline {
     /// The underlying compiled config (origins, host_map, server settings).
     pub config: CompiledConfig,
+    /// Dynamic key plane built from the same immutable config generation.
+    ///
+    /// Request contexts pin the pipeline at ingress, so keeping the plane here
+    /// prevents a reload from changing key resolution, governance, or bound
+    /// upstream credentials underneath an in-flight request.
+    pub(crate) key_plane: Option<Arc<crate::key_plane::KeyPlane>>,
+    /// Sensitive request-header names for this exact config generation.
+    ///
+    /// Requests pin a pipeline at ingress. Keeping custom credential carriers
+    /// here prevents a concurrent reload from changing redaction or outbound
+    /// scrubbing semantics for requests that are still in flight.
+    pub(crate) sensitive_header_names: HashSet<String>,
     /// Bloom filter + HashMap router for fast hostname lookup.
     pub router: HostRouter,
     /// Compiled action for each origin (parallel to config.origins).
@@ -1266,12 +1278,26 @@ pub struct CompiledPipeline {
     pub listings: sbproxy_config::ListingRegistry,
 }
 
+fn compile_sensitive_header_names(config: &CompiledConfig) -> HashSet<String> {
+    let mut names = sbproxy_config::types::SENSITIVE_HEADER_DENYLIST
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    if let Some(key_management) = config.server.key_management.as_ref() {
+        names.extend(key_management.inbound.credential_carrier_names());
+    }
+    names
+}
+
 impl Default for CompiledPipeline {
     fn default() -> Self {
         let config = CompiledConfig::default();
         let router = HostRouter::new(&config);
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         Self {
             config,
+            key_plane: None,
+            sensitive_header_names,
             router,
             actions: Vec::new(),
             compression_runtimes: crate::compression_runtime::CompressionRuntimeRegistry::default(),
@@ -1332,6 +1358,32 @@ fn parse_outbound_credential_config(
 }
 
 impl CompiledPipeline {
+    /// Dynamic key plane for this exact pipeline generation.
+    pub fn key_plane(&self) -> Option<&Arc<crate::key_plane::KeyPlane>> {
+        self.key_plane.as_ref()
+    }
+
+    /// Whether a request header is sensitive for this pipeline generation.
+    pub(crate) fn is_sensitive_header(&self, header_name: &str) -> bool {
+        self.sensitive_header_names.contains(header_name)
+    }
+
+    /// Immutable inbound key configuration pinned to this pipeline.
+    pub(crate) fn inbound_key_config(&self) -> Option<&sbproxy_config::KeyInboundConfig> {
+        self.config
+            .server
+            .key_management
+            .as_ref()
+            .map(|config| &config.inbound)
+    }
+
+    /// Whether a header is a primary credential carrier for this exact
+    /// pipeline generation.
+    pub(crate) fn is_credential_carrier(&self, header_name: &str) -> bool {
+        self.inbound_key_config()
+            .is_some_and(|inbound| inbound.is_credential_carrier(header_name))
+    }
+
     /// The response-cache handle the data path must use for `origin_id`.
     ///
     /// With at-rest encryption on, this is the handle bound to that
@@ -1383,6 +1435,7 @@ impl CompiledPipeline {
         config: CompiledConfig,
         mode: PipelineConstructionMode,
     ) -> anyhow::Result<Self> {
+        let sensitive_header_names = compile_sensitive_header_names(&config);
         let mut actions = Vec::with_capacity(config.origins.len());
         let mut auths = Vec::with_capacity(config.origins.len());
         let mut policies = Vec::with_capacity(config.origins.len());
@@ -1763,8 +1816,17 @@ impl CompiledPipeline {
             }
         };
 
+        let key_plane = match mode {
+            PipelineConstructionMode::Runtime => {
+                crate::key_plane::prepare_key_plane(config.server.key_management.as_ref())?
+            }
+            PipelineConstructionMode::Validation => None,
+        };
+
         let pipeline = Self {
             config,
+            key_plane,
+            sensitive_header_names,
             router,
             actions,
             compression_runtimes,
