@@ -1,6 +1,6 @@
 # SBproxy dynamic key management
 
-*Last modified: 2026-07-26*
+*Last modified: 2026-07-30*
 
 A virtual key is a live, governed resource, not a line of YAML. With the
 `key_management:` block enabled, you mint, revoke, and rotate inbound keys at
@@ -43,11 +43,20 @@ proxy:
       pepper: env:SBPROXY_KEY_PEPPER       # HMAC key for inbound hashing
       master_key: env:SBPROXY_KEY_MASTER   # envelope key for upstream creds
     inbound:
-      headers:                             # swept in order; first match wins
+      headers:                             # one minted token resolves; conflicts deny
         - {name: authorization, scheme: "Bearer "}
         - {name: x-api-key,     scheme: ""}
         - {name: x-sb-api,      scheme: ""}
       require: false                       # 401 when no minted key resolved
+      native_key_policy:
+        allowed_providers: [openai, anthropic]
+        max_requests_per_minute: 600
+        max_tokens_per_minute: 200000
+        max_budget_tokens: 10000000
+        max_budget_usd: 250.00
+        allowed_models: [gpt-5, claude-sonnet-4]
+        blocked_models: []
+        require_pii_redaction: [email]
     failure_mode_allow: false        # fail closed when the store is down
     allow_api_override: false        # config records win on reload
     oidc_claim_map:
@@ -72,14 +81,19 @@ holds the key you would have to have resolved the key already. The default
 covers the three common shapes and you can add your own.
 
 A minted token looks like `sbp_<16 hex>_<64 hex>`, a fixed 85 characters over a
-fixed alphabet. That means a swept header is accepted or rejected on length and
-prefix alone, with no store lookup, so sweeping a header your origin already
-proxies cannot misfire. A caller presenting their own `sk-proj-...` or
-`sk-ant-...` provider key passes straight through to the upstream that owns it.
+fixed alphabet. SBproxy recognizes that shape before store access, then looks
+up the public key id and verifies the secret. Shape recognition alone never
+authenticates a request. A caller presenting their own `sk-proj-...` or
+`sk-ant-...` provider key enters the native-key policy described below and,
+when allowed, passes through to the upstream that owns it.
 
-The header a key arrives in is always removed before the request goes upstream.
-Your key is not an upstream credential, and forwarding it would hand a governed
-secret to every origin the proxy talks to.
+The configured carrier list is also the lookup surface for legacy stored
+`sk-<id>-<secret>` keys and exact `credentials: {type: ai_provider}` values on
+AI routes. Resolution order is canonical `sbp_...`, stored legacy key, a
+verified OIDC/JWT claim mapped to a stored record, exact configured credential,
+then provider-native policy. The winning governed carrier is removed before
+dispatch, so that presented value does not accompany the operator's provider
+credential upstream.
 
 ### Two ways to use it
 
@@ -94,8 +108,9 @@ upstream <- x-api-key: <the real provider key>  (from the bound credential)
 ```
 
 **Sidecar.** The tool keeps sending its own credential, and the minted key
-rides alongside in `x-sb-api`. SBproxy governs the request without ever holding
-the upstream secret.
+rides alongside in `x-sb-api`. SBproxy governs the request without storing or
+managing the caller-owned upstream secret; it still receives and forwards that
+secret on the proxied request.
 
 ```
 client  ->  authorization: Bearer <the tool's own key>
@@ -109,15 +124,79 @@ credential, if any, is written to its own header.
 ### Attributing native provider keys
 
 A request that carries no minted key but does carry a recognizable provider
-credential is attributed to that provider. The rules live under
+credential is attributed to and governed as that provider. The rules live under
 `inbound.provider_hints`, ship with defaults for the common shapes (`sk-ant-`
 is Anthropic, `sk-or-` is OpenRouter, a bare `sk-` bearer is OpenAI,
 `x-goog-api-key` is Gemini, `api-key` is Azure), and are ordered: the first
 match wins, so specific prefixes belong before loose ones.
 
-Attribution is observational. It never refuses a request, and a credential
-matching no rule is admitted unattributed. It exists so native-key traffic
-shows up in metrics, audit, and policy instead of being invisible.
+Recognized native credentials require an explicit
+`inbound.native_key_policy.allowed_providers` allowlist. If the policy is
+absent or the recognized provider is not listed, SBproxy returns 403 before
+dispatch. A credential matching no hint remains unattributed and follows the
+origin's ordinary auth behavior.
+
+The same block is lowered to a secret-free KeyRecord-shaped default. Every
+traffic type gets provider admission, audit attribution, a stable
+tenant/origin/provider identity, and automatic
+`max_requests_per_minute` enforcement. AI routes additionally apply provider
+and model policy, token/cost budget preflight, and PII requirements wherever
+the request shape can be interpreted. JSON POST and PUT/PATCH bodies can be
+inspected and redacted. Multipart and Realtime cannot safely satisfy required
+PII redaction and fail closed when a credential requires it; bodyless or
+otherwise uninterpretable methods fail closed when model policy requires a
+model. Multipart and non-POST responses do not yet settle token/cost counters,
+so those fields are admission signals rather than strict usage ceilings on
+those surfaces.
+
+Limits are bucketed by tenant, origin, and recognized provider. The native
+policy identity is built from those labels and contains no credential bytes.
+
+On a generic proxy route, an allowed caller-owned credential passes upstream
+unchanged, even when that origin also configures `outbound_credential`: native
+mode represents an explicit caller-owned identity, so the origin credential
+must not replace it. SBproxy receives and forwards the caller-owned secret, but
+does not store, manage, or substitute it. An AI provider must opt in as an
+exact credential destination. Set `accept_native_credentials_for` to the
+canonical hint label, and make it match the provider's wire type:
+
+```yaml
+action:
+  type: ai_proxy
+  providers:
+    - name: openai-primary
+      provider_type: openai
+      accept_native_credentials_for: openai
+      base_url: https://api.openai.com/v1
+      api_key: ${OPENAI_API_KEY} # used when the caller is not in native mode
+```
+
+The opt-in belongs to this provider entry and its effective `base_url`.
+`provider_type` selects the wire format; it does not grant a destination access
+to caller credentials. Without the opt-in, a custom endpoint that speaks the
+OpenAI protocol receives only its operator credential. If the native
+credential cannot be re-resolved or no opted-in provider exists, the request
+fails before an upstream call. Minted `sbp_...` keys take precedence and never
+enter native-key policy resolution.
+
+Confidence cascade and race routing are unavailable for native credentials.
+Cascade returns 503 and race returns 403 before request-body processing, cache
+or idempotency lookup, managed-model preparation, streaming dispatch, or the
+first upstream attempt. Sequential fallback can use another provider only when
+that provider entry has its own matching `accept_native_credentials_for`
+binding.
+For the same reason, configured shadow copies are suppressed for native
+traffic: the primary response proceeds normally, while neither the caller
+credential nor an operator credential is sent to the shadow target.
+
+The companion metric
+`sbproxy_inbound_key_requests_total{provider,key_mode,tenant_id,api_key_id}`
+uses the closed `key_mode` values `none`, `minted`, and `native`. An unresolved
+provider or key id is the empty label value. Native `api_key_id` is the stable,
+secret-free tenant/origin/provider policy-bucket id. Access logs, request
+events, and security audit records carry the same `key_provider` and
+`key_mode` fields. No raw provider key is stored in those records or metric
+labels.
 
 ### Requiring a key
 
@@ -144,8 +223,9 @@ policies:
 
 The header carries the presented secret, so bucketing on it means the bucket
 changes when you rotate the key and the caller gets a fresh budget. The key id
-does not change. `request.key_id` is an empty string when no minted key
-resolved, so the expression still evaluates on unauthenticated traffic.
+does not change. `request.key_id` is the secret-free native policy-bucket id for
+admitted native traffic and an empty string when no key policy resolved, so the
+expression still evaluates on unauthenticated traffic.
 
 `concurrent_limit` with `key_by: api_key` already does this for you: it uses the
 resolved key id when there is one and falls back to the header otherwise.

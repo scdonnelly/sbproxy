@@ -1866,6 +1866,51 @@ pub struct ProviderHintConfig {
     pub also_header: Option<String>,
 }
 
+/// Default admission policy for caller-owned native provider keys.
+///
+/// Native keys cannot carry an SBproxy policy record because the caller, not
+/// the operator, owns their secret. This block supplies the equivalent default
+/// policy for every native key recognized by `provider_hints`. Leaving it
+/// absent fails closed for recognized native-key traffic.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct NativeKeyPolicyConfig {
+    /// Canonical provider labels admitted to use caller-owned credentials.
+    ///
+    /// Matching is case-insensitive and ignores surrounding whitespace. The
+    /// list must be non-empty and may not contain duplicates.
+    pub allowed_providers: Vec<String>,
+    /// Max requests per minute for each origin/provider native-key bucket.
+    #[serde(default)]
+    pub max_requests_per_minute: Option<u64>,
+    /// Max input and output tokens per minute.
+    #[serde(default)]
+    pub max_tokens_per_minute: Option<u64>,
+    /// Max total tokens for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_tokens: Option<u64>,
+    /// Max total cost in USD for the native-key budget window.
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
+    /// Models native-key traffic may use (empty = all).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    /// Models native-key traffic may not use.
+    #[serde(default)]
+    pub blocked_models: Vec<String>,
+    /// Named PII redaction rules that must be active before dispatch.
+    #[serde(default)]
+    pub require_pii_redaction: Vec<String>,
+}
+
+impl NativeKeyPolicyConfig {
+    /// Whether this policy admits the canonical provider label.
+    pub fn allows(&self, provider: &str) -> bool {
+        self.allowed_providers
+            .iter()
+            .any(|allowed| allowed.trim().eq_ignore_ascii_case(provider.trim()))
+    }
+}
+
 /// `key_management.inbound:` block. Controls which request headers are swept
 /// for a minted key, and whether a route refuses requests that carry none.
 ///
@@ -1874,9 +1919,10 @@ pub struct ProviderHintConfig {
 /// already. So extraction is configured per route here rather than per key.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct KeyInboundConfig {
-    /// Ordered candidate headers. The first value whose shape parses wins.
-    /// An empty list disables the sweep and leaves the legacy `authorization`
-    /// path as the only front door.
+    /// Ordered candidate headers. One well-shaped minted token resolves; two
+    /// distinct tokens are ambiguous and fail closed. An empty list disables
+    /// the sweep and leaves the legacy `authorization` path as the only front
+    /// door.
     #[serde(default = "default_inbound_headers")]
     pub headers: Vec<InboundHeaderConfig>,
     /// Deny with 401 when no minted key resolved. Off by default, so an
@@ -1885,11 +1931,15 @@ pub struct KeyInboundConfig {
     #[serde(default)]
     pub require: bool,
     /// Ordered rules attributing a native (non-minted) inbound credential to
-    /// a provider. First match wins, so more specific value prefixes belong
-    /// before general ones. Attribution never refuses a request: a credential
-    /// matching no rule is admitted unattributed.
+    /// a provider. First matching hint wins, so more specific value prefixes
+    /// belong before general ones. A matching hint then enters native-key
+    /// policy admission; a credential matching no hint remains unattributed.
     #[serde(default = "default_provider_hints")]
     pub provider_hints: Vec<ProviderHintConfig>,
+    /// Explicit default policy for recognized caller-owned native provider
+    /// keys. Absent by default, which fails closed if a provider hint matches.
+    #[serde(default)]
+    pub native_key_policy: Option<NativeKeyPolicyConfig>,
 }
 
 impl Default for KeyInboundConfig {
@@ -1898,6 +1948,7 @@ impl Default for KeyInboundConfig {
             headers: default_inbound_headers(),
             require: false,
             provider_hints: default_provider_hints(),
+            native_key_policy: None,
         }
     }
 }
@@ -1937,11 +1988,16 @@ fn default_provider_hints() -> Vec<ProviderHintConfig> {
     ]
 }
 
-/// Header names that may never be swept: hop-by-hop and framing headers, plus
+/// Header names that may never be swept: standard hop-by-hop and framing
+/// headers, the widely used de-facto `proxy-connection` hop-by-hop header, plus
 /// `cookie`, which has its own redaction and capture rules.
 pub const FORBIDDEN_SWEEP_HEADERS: &[&str] = &[
     "host",
     "connection",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
     "content-length",
     "transfer-encoding",
     "cookie",
@@ -1961,6 +2017,8 @@ pub fn credential_header_is_reserved(header: &str) -> bool {
             lower.as_str(),
             "upgrade"
                 | "openai-beta"
+                | "proxy-authorization"
+                | "proxy-authenticate"
                 | "traceparent"
                 | "tracestate"
                 | "signature-input"
@@ -2033,6 +2091,54 @@ impl KeyInboundConfig {
                     ));
                 }
             }
+            if credential_header_is_reserved(&hint.header) {
+                return Err(format!(
+                    "key_management.inbound.provider_hints: {:?} may not carry a key",
+                    hint.header
+                ));
+            }
+        }
+        if let Some(policy) = &self.native_key_policy {
+            if policy.allowed_providers.is_empty() {
+                return Err(
+                    "key_management.inbound.native_key_policy.allowed_providers must not be empty"
+                        .to_string(),
+                );
+            }
+            let mut providers = std::collections::HashSet::new();
+            for provider in &policy.allowed_providers {
+                let canonical = provider.trim().to_ascii_lowercase();
+                if canonical.is_empty() {
+                    return Err(
+                        "key_management.inbound.native_key_policy.allowed_providers entries must not be empty"
+                            .to_string(),
+                    );
+                }
+                if !providers.insert(canonical) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.allowed_providers: {provider:?} is listed more than once"
+                    ));
+                }
+            }
+            for (name, value) in [
+                ("max_requests_per_minute", policy.max_requests_per_minute),
+                ("max_tokens_per_minute", policy.max_tokens_per_minute),
+            ] {
+                if value == Some(0) {
+                    return Err(format!(
+                        "key_management.inbound.native_key_policy.{name} must be greater than zero"
+                    ));
+                }
+            }
+            if policy
+                .max_budget_usd
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(
+                    "key_management.inbound.native_key_policy.max_budget_usd must be finite and non-negative"
+                        .to_string(),
+                );
+            }
         }
         Ok(())
     }
@@ -2044,6 +2150,28 @@ impl KeyInboundConfig {
             .iter()
             .map(|entry| entry.name.trim().to_ascii_lowercase())
             .collect()
+    }
+
+    /// Lowercased union of every primary header that may carry an inbound
+    /// credential.
+    ///
+    /// This includes minted/configured carriers and provider-hint carriers.
+    /// `provider_hints[].also_header` is deliberately excluded: it is only
+    /// match metadata and never contains the credential value.
+    pub fn credential_carrier_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.headers.len() + self.provider_hints.len());
+        for name in self
+            .headers
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(self.provider_hints.iter().map(|hint| hint.header.as_str()))
+        {
+            let canonical = name.trim().to_ascii_lowercase();
+            if !canonical.is_empty() && !names.contains(&canonical) {
+                names.push(canonical);
+            }
+        }
+        names
     }
 }
 
@@ -4178,10 +4306,10 @@ pub const SENSITIVE_HEADER_DENYLIST: &[&str] = &[
 /// Extra header names excluded from `*` and glob capture, on top of
 /// [`SENSITIVE_HEADER_DENYLIST`].
 ///
-/// Holds whatever `key_management.inbound.headers` names, set at load and on
-/// every reload. Without it an operator who sweeps a custom header would have
-/// that header captured by a `capture_headers: ["*"]` glob, and the value it
-/// carries is a live minted key.
+/// Holds every primary carrier named by `key_management.inbound.headers` and
+/// `key_management.inbound.provider_hints`, set at load and on every reload.
+/// Without it a custom carrier could be captured by a
+/// `capture_headers: ["*"]` glob.
 static EXTRA_SENSITIVE_HEADERS: std::sync::OnceLock<
     std::sync::RwLock<std::sync::Arc<Vec<String>>>,
 > = std::sync::OnceLock::new();
@@ -4191,7 +4319,7 @@ fn extra_sensitive_slot() -> &'static std::sync::RwLock<std::sync::Arc<Vec<Strin
 }
 
 /// Replace the operator-configured set of key-bearing headers that globs must
-/// never capture. Pass [`KeyInboundConfig::header_names`].
+/// never capture. Pass [`KeyInboundConfig::credential_carrier_names`].
 pub fn set_extra_sensitive_headers(names: Vec<String>) {
     let lowered: Vec<String> = names
         .into_iter()
@@ -4204,7 +4332,7 @@ pub fn set_extra_sensitive_headers(names: Vec<String>) {
 }
 
 /// Whether `header_name` is sensitive: on the built-in denylist, or named by
-/// the operator's inbound key sweep.
+/// the operator's inbound credential configuration.
 pub fn is_sensitive_header(header_name: &str) -> bool {
     if SENSITIVE_HEADER_DENYLIST.contains(&header_name) {
         return true;
@@ -9046,6 +9174,91 @@ mod inbound_key_header_tests {
     use super::*;
 
     #[test]
+    fn native_key_policy_requires_a_nonempty_unique_provider_allowlist() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string(), "anthropic".to_string()],
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: Vec::new(),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("allowed_providers must not be empty"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["OpenAI".to_string(), " openai ".to_string()],
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("listed more than once"));
+    }
+
+    #[test]
+    fn native_key_policy_is_absent_by_default_so_native_traffic_fails_closed() {
+        assert!(KeyInboundConfig::default().native_key_policy.is_none());
+    }
+
+    #[test]
+    fn native_key_policy_accepts_key_record_governance_fields() {
+        let cfg: KeyInboundConfig = serde_yaml::from_str(
+            r#"
+native_key_policy:
+  allowed_providers: [openai]
+  max_requests_per_minute: 12
+  max_tokens_per_minute: 3456
+  max_budget_tokens: 7890
+  max_budget_usd: 1.25
+  allowed_models: [gpt-5]
+  blocked_models: [gpt-4]
+  require_pii_redaction: [email]
+"#,
+        )
+        .expect("native KeyRecord policy fields should deserialize");
+
+        let policy = cfg.native_key_policy.expect("policy");
+        assert_eq!(policy.max_requests_per_minute, Some(12));
+        assert_eq!(policy.max_tokens_per_minute, Some(3456));
+        assert_eq!(policy.max_budget_tokens, Some(7890));
+        assert_eq!(policy.max_budget_usd, Some(1.25));
+        assert_eq!(policy.allowed_models, ["gpt-5"]);
+        assert_eq!(policy.blocked_models, ["gpt-4"]);
+        assert_eq!(policy.require_pii_redaction, ["email"]);
+    }
+
+    #[test]
+    fn native_key_policy_rejects_zero_limits_and_invalid_cost_budget() {
+        let mut cfg = KeyInboundConfig {
+            native_key_policy: Some(NativeKeyPolicyConfig {
+                allowed_providers: vec!["openai".to_string()],
+                max_requests_per_minute: Some(0),
+                ..NativeKeyPolicyConfig::default()
+            }),
+            ..KeyInboundConfig::default()
+        };
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("must be greater than zero"));
+
+        cfg.native_key_policy = Some(NativeKeyPolicyConfig {
+            allowed_providers: vec!["openai".to_string()],
+            max_budget_usd: Some(f64::NAN),
+            ..NativeKeyPolicyConfig::default()
+        });
+        assert!(cfg.validate().unwrap_err().contains("finite"));
+    }
+
+    #[test]
     fn inbound_header_defaults_cover_the_three_common_shapes() {
         let cfg = KeyInboundConfig::default();
         let names: Vec<&str> = cfg.headers.iter().map(|h| h.name.as_str()).collect();
@@ -9068,6 +9281,7 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(bad.validate().is_err());
     }
@@ -9082,6 +9296,7 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -9106,6 +9321,7 @@ mod inbound_key_header_tests {
                 }],
                 require: false,
                 provider_hints: Vec::new(),
+                native_key_policy: None,
             };
             assert!(cfg.validate().is_err(), "{forbidden} must be rejected");
         }
@@ -9126,6 +9342,7 @@ mod inbound_key_header_tests {
             ],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(dupe.validate().is_err());
     }
@@ -9136,6 +9353,7 @@ mod inbound_key_header_tests {
             headers: vec![],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert!(cfg.validate().is_ok());
         assert!(cfg.header_names().is_empty());
@@ -9150,8 +9368,103 @@ mod inbound_key_header_tests {
             }],
             require: false,
             provider_hints: Vec::new(),
+            native_key_policy: None,
         };
         assert_eq!(cfg.header_names(), ["x-tool-auth"]);
+    }
+
+    #[test]
+    fn credential_carrier_names_include_provider_hint_headers_only() {
+        let cfg = KeyInboundConfig {
+            headers: vec![
+                InboundHeaderConfig {
+                    name: "  X-Tool-Auth  ".into(),
+                    scheme: String::new(),
+                },
+                InboundHeaderConfig {
+                    name: "Authorization".into(),
+                    scheme: "Bearer ".into(),
+                },
+            ],
+            require: false,
+            provider_hints: vec![
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "X-Native-Provider-Key".into(),
+                    scheme: String::new(),
+                    value_prefix: "native-".into(),
+                    also_header: Some("X-Provider-Version".into()),
+                },
+                ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: "authorization".into(),
+                    scheme: "Bearer ".into(),
+                    value_prefix: "sk-".into(),
+                    also_header: None,
+                },
+            ],
+            native_key_policy: None,
+        };
+
+        assert_eq!(
+            cfg.credential_carrier_names(),
+            ["x-tool-auth", "authorization", "x-native-provider-key"]
+        );
+        assert!(
+            !cfg.credential_carrier_names()
+                .contains(&"x-provider-version".to_string()),
+            "also_header is match metadata, not a credential carrier"
+        );
+    }
+
+    #[test]
+    fn provider_hint_primary_carriers_reuse_reserved_header_rules() {
+        for reserved in [
+            "cookie",
+            "host",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "traceparent",
+            "proxy-authorization",
+            "sec-websocket-protocol",
+        ] {
+            let cfg = KeyInboundConfig {
+                headers: Vec::new(),
+                require: false,
+                provider_hints: vec![ProviderHintConfig {
+                    provider: "openai".into(),
+                    header: reserved.into(),
+                    scheme: String::new(),
+                    value_prefix: String::new(),
+                    also_header: None,
+                }],
+                native_key_policy: None,
+            };
+            assert!(
+                cfg.validate().is_err(),
+                "{reserved} must not be a provider-hint credential carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_hint_match_metadata_may_use_reserved_headers() {
+        let cfg = KeyInboundConfig {
+            headers: Vec::new(),
+            require: false,
+            provider_hints: vec![ProviderHintConfig {
+                provider: "openai".into(),
+                header: "x-provider-key".into(),
+                scheme: String::new(),
+                value_prefix: String::new(),
+                also_header: Some("traceparent".into()),
+            }],
+            native_key_policy: None,
+        };
+
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
