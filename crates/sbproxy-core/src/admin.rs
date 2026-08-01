@@ -3073,7 +3073,7 @@ fn windowed_spend_response(
         return (
             400,
             "application/json",
-            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|property:<key>|total)"}"#.to_string(),
+            r#"{"error":"unknown group_by (provider|model|tenant|team|api_key|project|origin|agent|property:<key>|total)"}"#.to_string(),
         );
     };
     let requested_property_key = match &group {
@@ -5349,6 +5349,7 @@ mod tests {
                     team: "growth".to_string(),
                     api_key_id: "sk1".to_string(),
                     project: "p".to_string(),
+                    agent_id: String::new(),
                     properties: std::collections::BTreeMap::from([(
                         "feature".to_string(),
                         "assistant".to_string(),
