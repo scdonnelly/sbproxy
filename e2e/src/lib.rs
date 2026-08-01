@@ -253,6 +253,28 @@ impl ProxyHarness {
         Self::start_with_resolved_yaml(&final_yaml, port, None)
     }
 
+    /// Start the proxy with a config built from a YAML string, adding
+    /// `env` to the spawned proxy child's environment.
+    ///
+    /// The variables are scoped to the child via `Command::env`, so a
+    /// test can exercise an env-read path in the proxy without mutating
+    /// the test runner's own process environment (WOR-646).
+    pub fn start_with_yaml_and_env(yaml: &str, env: &[(&str, &str)]) -> anyhow::Result<Self> {
+        let port = pick_free_port()?;
+        let final_yaml = inject_port(yaml, port)?;
+        let owned: Vec<(&str, String)> = env
+            .iter()
+            .map(|(name, value)| (*name, (*value).to_string()))
+            .collect();
+        Self::start_with_resolved_yaml_using_binary(
+            &final_yaml,
+            port,
+            ProxyBinaryFlavor::Default,
+            None,
+            &owned,
+        )
+    }
+
     /// Start the proxy with a test-specific graceful shutdown budget.
     pub fn start_with_yaml_and_shutdown_grace(
         yaml: &str,
@@ -354,6 +376,8 @@ impl ProxyHarness {
 
         let stderr = NamedTempFile::new()?;
         let mut command = Command::new(&bin);
+        // Child-scoped variables: the child process gets them, the
+        // test runner's own environment stays untouched (WOR-646).
         for (name, value) in envs {
             command.env(name, value);
         }
@@ -394,7 +418,7 @@ impl ProxyHarness {
     /// listing loader's "config-file parent is the Repo root"
     /// contract holds.
     pub fn start_with_workspace(yaml: &str, files: &[(&str, &str)]) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None)
+        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, None, &[])
     }
 
     /// Start the proxy in an isolated config workspace with a test-specific
@@ -404,13 +428,41 @@ impl ProxyHarness {
         files: &[(&str, &str)],
         shutdown_grace_ms: u64,
     ) -> anyhow::Result<Self> {
-        Self::start_with_workspace_and_optional_shutdown_grace(yaml, files, Some(shutdown_grace_ms))
+        Self::start_with_workspace_and_optional_shutdown_grace(
+            yaml,
+            files,
+            Some(shutdown_grace_ms),
+            &[],
+        )
+    }
+
+    /// Start the proxy in an isolated config workspace with a
+    /// test-specific graceful shutdown budget, adding `env` to the
+    /// spawned proxy child's environment.
+    ///
+    /// The variables are scoped to the child via `Command::env`, so a
+    /// test can exercise an env-read path in the proxy (or anything
+    /// the proxy spawns) without mutating the test runner's own
+    /// process environment (WOR-646).
+    pub fn start_with_workspace_shutdown_grace_and_env(
+        yaml: &str,
+        files: &[(&str, &str)],
+        shutdown_grace_ms: u64,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Self> {
+        Self::start_with_workspace_and_optional_shutdown_grace(
+            yaml,
+            files,
+            Some(shutdown_grace_ms),
+            env,
+        )
     }
 
     fn start_with_workspace_and_optional_shutdown_grace(
         yaml: &str,
         files: &[(&str, &str)],
         shutdown_grace_ms: Option<u64>,
+        env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
         let port = pick_free_port()?;
         let final_yaml = inject_port(yaml, port)?;
@@ -441,6 +493,11 @@ impl ProxyHarness {
             command
                 .arg("--shutdown-grace-ms")
                 .arg(shutdown_grace_ms.to_string());
+        }
+        // Child-scoped variables: the child process gets them, the
+        // test runner's own environment stays untouched (WOR-646).
+        for (name, value) in env {
+            command.env(name, value);
         }
         let child = command
             .arg("--config")
