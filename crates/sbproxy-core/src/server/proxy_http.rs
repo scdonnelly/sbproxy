@@ -47,6 +47,22 @@ fn emit_graphql_validated_request_body(
     }
 }
 
+/// Hold a consumed request-body chunk back from the upstream without
+/// ending the stream.
+///
+/// This is the one place the `Some(Bytes::new())`-vs-`None` rule lives:
+/// Pingora treats `None` from `request_body_filter` as end-of-body on
+/// both HTTP/1.1 and HTTP/2, so a branch that moved a mid-stream chunk
+/// into a local buffer must leave an empty chunk in the slot. Leaving
+/// `None` ends the upstream body at whatever bytes were already
+/// forwarded and the upstream sees a silently truncated request
+/// (WOR-2138). Every buffering branch that consumes a chunk before
+/// end-of-stream goes through this function rather than writing the
+/// slot directly.
+fn hold_request_body_chunk(body: &mut Option<Bytes>) {
+    *body = Some(Bytes::new());
+}
+
 /// Complete a deferred body-bound authentication proof against the bytes the
 /// client actually sent.
 ///
@@ -3739,11 +3755,11 @@ impl ProxyHttp for SbProxy {
                     }
                 } else {
                     // Hold JSON candidates until the complete body can be
-                    // scanned. Pingora treats `None` as upstream end-of-body,
-                    // so use an empty chunk to pause forwarding without
-                    // terminating the stream. Other body consumers receive
-                    // the released representation after this branch completes.
-                    *body = Some(Bytes::new());
+                    // scanned; `hold_request_body_chunk` documents why the
+                    // slot must not be left `None`. Other body consumers
+                    // receive the released representation after this branch
+                    // completes.
+                    hold_request_body_chunk(body);
                     return Ok(());
                 }
             } else {
@@ -3932,18 +3948,47 @@ impl ProxyHttp for SbProxy {
         // --- Accumulate body for the request validator ---
         //
         // While `validate_request_body` is set we buffer every chunk
-        // locally and emit `None` to Pingora, so the upstream does
-        // not see a partial body until validation passes. On
-        // end-of-stream we run all matching `RequestValidator`
-        // policies; on success we release the buffered bytes as a
-        // single chunk to the upstream. On failure we record a
-        // status + body for the response phase, signal the validator
-        // failure via `validator_failed`, and emit `None` so the
-        // upstream is not contacted.
+        // locally and emit an empty chunk to Pingora (see
+        // `hold_request_body_chunk`), so the upstream does not see a
+        // partial body until validation passes. On end-of-stream we
+        // run all matching `RequestValidator` policies; on success we
+        // release the buffered bytes as a single chunk to the
+        // upstream. On failure we record a status + body for the
+        // response phase, signal the validator failure via
+        // `validator_failed`, and emit `None` so the upstream is not
+        // contacted.
         if ctx.validate_request_body {
+            // Mirror of THREAT_SCAN_HARD_CAP above: the validator
+            // accumulator is the other buffer-then-release dance in
+            // this filter and gets the same bound, so a client that
+            // streams an oversize or unterminated body cannot grow
+            // proxy memory with it (WOR-2137). Overflow takes the same
+            // exit as the threat-scan cap: reject with 413 before the
+            // chunk is buffered, never run the validators, never
+            // contact the upstream.
+            const VALIDATE_BODY_HARD_CAP: usize = 8 * 1024 * 1024;
+
             let buf = ctx
                 .request_body_buf
                 .get_or_insert_with(bytes::BytesMut::new);
+            let incoming_len = body.as_ref().map_or(0, Bytes::len);
+            if buf.len().saturating_add(incoming_len) > VALIDATE_BODY_HARD_CAP {
+                debug!(
+                    received = buf.len().saturating_add(incoming_len),
+                    cap = VALIDATE_BODY_HARD_CAP,
+                    "request body validation blocked request: body exceeds buffering cap"
+                );
+                ctx.validator_failed = Some((
+                    413,
+                    error_json_body("request entity too large"),
+                    "application/json".to_string(),
+                ));
+                *body = None;
+                return Err(pingora_error::Error::explain(
+                    pingora_error::ErrorType::HTTPStatus(413),
+                    "request body validation exceeded buffering cap",
+                ));
+            }
             if let Some(chunk) = body.take() {
                 buf.extend_from_slice(&chunk);
             }
@@ -4233,6 +4278,17 @@ impl ProxyHttp for SbProxy {
                                         }
                                         continue;
                                     }
+                                    // WOR-2137: the generic body scan is
+                                    // opt-in. The enforcer only requests
+                                    // buffering when `enable_body_aware`
+                                    // is set, but the buffer may exist
+                                    // because another policy asked for
+                                    // it, and a body buffered for a
+                                    // validator must not feed a scan the
+                                    // operator switched off.
+                                    if !p.body_aware_enabled() {
+                                        continue;
+                                    }
                                     // WOR-801: body-aware scan. The URI +
                                     // headers were scanned synchronously by
                                     // the request_filter enforcer; here we
@@ -4257,10 +4313,14 @@ impl ProxyHttp for SbProxy {
                                                     label = %result.label,
                                                     "blocked: detector matched request body"
                                                 );
+                                                // WOR-2159: honour the
+                                                // configured content type,
+                                                // as the ai_proxy and A2A
+                                                // block paths already do.
                                                 failed = Some((
                                                     403,
                                                     p.block_body().to_string(),
-                                                    "text/plain; charset=utf-8".to_string(),
+                                                    p.block_content_type().to_string(),
                                                 ));
                                                 break;
                                             }
@@ -4378,8 +4438,13 @@ impl ProxyHttp for SbProxy {
                     }
                 }
             }
+            if !end_of_stream {
+                // The chunk above was consumed into the accumulator;
+                // `hold_request_body_chunk` documents why the slot must
+                // carry an empty chunk here rather than `None`.
+                hold_request_body_chunk(body);
+            }
             emit_graphql_validated_request_body(body, end_of_stream, ctx);
-            // Mid-stream chunks: hold off forwarding until end_of_stream.
             return Ok(());
         }
 
