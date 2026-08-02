@@ -1,6 +1,6 @@
 # SBproxy Configuration Reference
 
-*Last modified: 2026-08-01*
+*Last modified: 2026-08-02*
 
 The complete configuration reference for SBproxy: every option, every field, every action type. Most snippets below are deliberately partial, a skeleton showing which keys nest where or one field in isolation, so they read fast but are not meant to be saved as-is and booted. For a config you can actually run, start from [`examples/`](../examples/) (one runnable `sb.yml` per feature) or a [use-case guide](README.md#solve-a-problem) that walks a complete file end to end; this page is where you look up a field once you know which one you need.
 
@@ -2821,7 +2821,7 @@ policies:
       enabled: true
     action_on_match: block
     test_mode: false
-    fail_open: false
+    failure_posture: closed
     custom_rules: []
 ```
 
@@ -2831,7 +2831,8 @@ policies:
 | `owasp_crs` | object | | OWASP Core Rule Set configuration. |
 | `action_on_match` | string | "block" | Action when a rule matches: `block`, `log`. |
 | `test_mode` | bool | false | If true, log matches but do not block. |
-| `fail_open` | bool | false | If true, allow requests through on WAF engine failure. |
+| `failure_posture` | string | `closed` | What happens to a request the WAF could not fully evaluate: `closed` refuses with 403, `open` admits and claims nothing, `degraded` admits while recording that the WAF guarantee was not made. `observe` is rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
+| `fail_open` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: open`, `false` means `closed`. Still parses and is used only when `failure_posture` is absent. |
 | `custom_rules` | list | | Custom WAF rules (regex patterns or JS-defined matchers). |
 
 ### ddos
@@ -3082,7 +3083,8 @@ Every entry in the `transforms:` list is wrapped with these pipeline-level field
 |-------|------|---------|-------------|
 | `type` | string | required | Transform type discriminator (e.g. `json`, `template`). |
 | `content_types` | list | `[]` | Content-Type substrings the transform applies to. Empty matches all. |
-| `fail_on_error` | bool | false | When true, an error in this transform fails the whole response. |
+| `failure_posture` | string | `open` | What happens to the response when this transform fails: `closed` replaces the body with a generic error instead of forwarding it, `open` skips the failed transform and continues with the next one. `degraded` and `observe` are rejected at config load. The shared vocabulary is defined in [degradation.md](degradation.md). |
+| `fail_on_error` | bool | false | Legacy spelling of the failure axis: `true` means `failure_posture: closed`, `false` means `open`. Still parses and is used only when `failure_posture` is absent; setting both to values that disagree is a config-load error. |
 | `max_body_size` | int | 10485760 | Maximum body size, in bytes, that this transform will buffer. Larger bodies skip the transform. |
 | `disabled` | bool | false | When true, the transform is parsed but not applied. |
 
