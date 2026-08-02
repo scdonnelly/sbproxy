@@ -266,7 +266,7 @@ dereference followed by a virtual or static call.
 
 The `sbproxy-config` crate contains type definitions, serde derives, and the
 compilation step. Its workspace dependencies are limited to `sbproxy-plugin`,
-`sbproxy-platform` (messenger configs plus the `KVStore` trait used by `build_l2_store`),
+`sbproxy-platform` (the `KVStore` trait used by `build_l2_store`),
 and `sbproxy-observe`. It does not pull in Pingora, the module set, or any networking
 runtime.
 
