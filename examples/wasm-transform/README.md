@@ -1,6 +1,6 @@
 # WASM transform
 
-*Last modified: 2026-04-27*
+*Last modified: 2026-08-02*
 
 ![WASM transform](../../docs/assets/wasm-transform.gif)
 
@@ -16,28 +16,37 @@ make run CONFIG=examples/wasm-transform/sb.yml
 
 Run it from the repo root because the config's `module_path` (`examples/wasm/echo-rust/echo.wasm`) is resolved relative to the working directory the proxy is started from; use an absolute path in production.
 
-## Try it
+Or run it containerized; the compose file mounts the pre-built echo module at the same relative path:
 
 ```bash
-# Static body is read by the proxy, fed to echo.wasm on stdin, then
-# emitted from the module on stdout unchanged.
-$ curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
+cd examples/wasm-transform
+docker compose up -d --wait
+```
+
+## Try it
+
+The static body is read by the proxy, fed to `echo.wasm` on stdin, then emitted from the module on stdout unchanged:
+
+```bash
+curl -i -H 'Host: wasm.local' http://127.0.0.1:8080/
+```
+
+```
 HTTP/1.1 200 OK
 content-type: text/plain
 content-length: 18
+Date: Sun, 02 Aug 2026 03:44:27 GMT
+Connection: keep-alive
 
 hello from sbproxy
 ```
 
-```bash
-# Replace module_path with a different wasm32-wasi binary to do real work.
-# A module that uppercased its input would yield: HELLO FROM SBPROXY
-```
+Replace `module_path` with a different wasm32-wasi binary to do real work; a module that uppercased its input would yield `HELLO FROM SBPROXY` instead. A runaway module is aborted at 500ms by the epoch-interruption trap, and under the default `failure_posture: open` the response falls back to the unmodified upstream body via the standard transform error path.
+
+Run the checked smoke case from the repository root with:
 
 ```bash
-# A runaway module is aborted at 500ms by the epoch-interruption trap.
-# Under the default failure_posture: open, the response falls back to the
-# unmodified upstream body via the standard transform error path.
+bash scripts/examples-smoke.sh examples/wasm-transform
 ```
 
 ## What this exercises
