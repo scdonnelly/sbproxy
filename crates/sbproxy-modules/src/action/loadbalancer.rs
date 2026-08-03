@@ -59,7 +59,7 @@ pub enum DeploymentMode {
     /// (targets with `group = "canary"`); remaining traffic uses primary targets.
     #[serde(rename = "canary")]
     Canary {
-        /// Percentage of requests routed to canary targets (0–100).
+        /// Percentage of requests routed to canary targets (0 to 100).
         weight: u8,
     },
 }
@@ -709,6 +709,18 @@ impl LoadBalancerAction {
     /// threshold is met, and feeds the same signal into the shared
     /// outlier detector when one is configured.
     pub fn spawn_health_probes(self: &std::sync::Arc<Self>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        self.spawn_health_probes_on(&handle);
+    }
+
+    /// Spawn health probes on a caller-owned runtime.
+    ///
+    /// Each loop holds only a weak reference while it sleeps. Replacing a
+    /// pipeline generation therefore lets its probes stop as soon as no
+    /// request still pins that generation.
+    pub fn spawn_health_probes_on(self: &std::sync::Arc<Self>, handle: &tokio::runtime::Handle) {
         for (idx, target) in self.targets.iter().enumerate() {
             let cfg = match &target.health_check {
                 Some(c) => c.clone(),
@@ -725,8 +737,8 @@ impl LoadBalancerAction {
                     continue;
                 }
             };
-            let lb = std::sync::Arc::clone(self);
-            tokio::spawn(async move {
+            let lb = std::sync::Arc::downgrade(self);
+            handle.spawn(async move {
                 run_health_probe_loop(lb, idx, probe_url, cfg).await;
             });
         }
@@ -1160,7 +1172,7 @@ fn build_health_probe_url(target_url: &str, probe_path: &str) -> anyhow::Result<
 /// the LB's outlier detector when one is configured (so a single
 /// shared store records both passive and active failures).
 async fn run_health_probe_loop(
-    lb: std::sync::Arc<LoadBalancerAction>,
+    lb: std::sync::Weak<LoadBalancerAction>,
     target_idx: usize,
     probe_url: String,
     cfg: HealthCheckConfig,
@@ -1182,6 +1194,9 @@ async fn run_health_probe_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        let Some(lb) = lb.upgrade() else {
+            return;
+        };
         let ok = match client.get(&probe_url).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
@@ -2697,7 +2712,7 @@ mod tests {
             }
         }
         // With weight=20, approximately 20% should go to canary.
-        // Allow some tolerance: 15–25%.
+        // Allow some tolerance: 15 to 25%.
         assert!(
             (15..=25).contains(&canary_count),
             "canary should receive ~20% of traffic, got {}%",

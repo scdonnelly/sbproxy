@@ -326,6 +326,10 @@ pub struct RequestContext {
     /// risks a panic or a cross-origin config read; the request simply
     /// completes on the config it started with.
     pub pipeline: std::sync::Arc<crate::pipeline::CompiledPipeline>,
+    /// Live Proxy-Wasm HTTP sessions for the pipeline generation pinned to
+    /// this request. The mutex supplies the `Sync` bound required by Pingora;
+    /// request phases still access it serially through their mutable context.
+    pub(crate) proxy_wasm: Option<parking_lot::Mutex<crate::proxy_wasm_http::ProxyWasmHttpState>>,
 
     // --- Auth state ---
     /// Authentication result, populated by the auth phase.
@@ -413,6 +417,8 @@ pub struct RequestContext {
     /// accumulates the body into `request_body_buf` and runs every
     /// matching validator once the stream ends.
     pub validate_request_body: bool,
+    /// Dynamic bundle policies waiting for a complete request body.
+    pub(crate) dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan,
     /// Buffered request body, populated only when `validate_request_body`
     /// is true.
     pub request_body_buf: Option<BytesMut>,
@@ -1533,6 +1539,7 @@ impl RequestContext {
             tenant_id: CompactString::const_new("__default__"),
             origin_idx: None,
             pipeline: crate::reload::current_pipeline_full(),
+            proxy_wasm: None,
             lb_attempt: None,
             retry_count: 0,
             retry_backoff_ms: None,
@@ -1551,6 +1558,7 @@ impl RequestContext {
             concurrent_limit_denial_body: None,
             agent_budget_guards: Vec::new(),
             validate_request_body: false,
+            dynamic_request_body_plan: crate::request_body_plan::DynamicRequestBodyPlan::default(),
             request_body_buf: None,
             threat_scan_pending: false,
             transcode_active: false,
