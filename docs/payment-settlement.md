@@ -106,6 +106,17 @@ Alert on it: the refusal is counted as
 `sbproxy_payment_settlement_total{operation="challenge",
 outcome="unresolved_payment"}` and logged at warn with the intent id.
 
+An ordinary client reaches that state by being early. A crawler that
+retries before its invoice is paid is answered 503, and that same 503
+leaves its intent in `NeedsReconciliation`, because the rail verified the
+payment and did not settle it. Paying afterwards does not clear it:
+nothing on the request path is allowed to try again. The next sweep
+clears it, one `worker.reconcile_interval_ms` later at the outside and
+1000 ms by default, and the retry after that reaches the origin. The
+`Retry-After` on the 503 asks for exactly that wait, so a client that
+honors it never sees the difference, and one that polls faster than the
+worker sweeps sees a short run of 503s first.
+
 ## The request path, end to end
 
 With `proxy.payments` present, an `ai_crawl_control` 402 is settled
@@ -118,9 +129,14 @@ the seam between them:
 - `proxy.payments` decides how a payment settles: rails, credentials,
   durable state, timeouts, and the failure posture.
 
-The smallest working pairing is
-[`examples/rail-x402-base-sepolia/sb.yml`](../examples/rail-x402-base-sepolia/sb.yml),
-and every field in it is explained in the reference below.
+The smallest pairing that settles is
+[`examples/settlement-gate-local/sb.yml`](../examples/settlement-gate-local/sb.yml),
+which runs against a stub Core Lightning node and needs no payment
+provider.
+[`examples/rail-x402-base-sepolia/sb.yml`](../examples/rail-x402-base-sepolia/sb.yml)
+is the same pairing on the x402 rail; it issues the challenge and cannot
+settle it without a reachable facilitator. Every field in both is
+explained in the reference below.
 
 ### The challenge
 
@@ -217,13 +233,110 @@ SBPROXY_E2E_PAYMENTS_BIN=target/payments/release/sbproxy \
   cargo test -p sbproxy-e2e --release --test settlement_gate
 ```
 
-> Placeholder: the following response bodies are documented from the
-> renderer rather than captured from a live run, and should be replaced
-> with real output from `examples/rail-x402-base-sepolia/`: the x402 402
-> body, the Lightning and direct-Stripe 402 bodies, one
-> `WWW-Authenticate: Payment` field value, one `problem+json` refusal,
-> the 406 `no_acceptable_rail` body, and the 503
-> `settlement_unavailable` body.
+### The same sequence, by hand
+
+[`examples/settlement-gate-local/`](../examples/settlement-gate-local/)
+runs what that e2e test asserts, as a config you can curl at. It pairs a
+stub Core Lightning node on a Unix socket with an origin that counts
+every article it actually serves, so the wire shapes below are the ones
+the renderer produced against a running proxy rather than transcribed
+from it.
+
+Lightning is the rail it uses because Lightning is the only one that runs
+hermetically: CLN is a Unix socket, not an HTTP endpoint, so a stub needs
+no TLS and no reachable host. x402, Payment HTTP Authentication, direct
+Stripe, and LND each require an HTTPS endpoint, and no configuration
+relaxes that, so their bodies are not reproduced here.
+
+Each block below comes from its own fresh stack, and running them back to
+back against one stack does not reproduce them. The second one strands an
+intent and never pays it, and an unresolved intent withholds new
+challenges for that route, which is the rule two sections up. So the
+request after it answers 503 where the first block shows a 402, and that
+is the documented behavior rather than a broken example. Restart the
+fixture and the proxy between blocks to reproduce each one.
+
+The walkthrough script at the end of this section is the exception, and it
+is repeatable against one stack: it pays the invoice it strands, so its
+intent reaches a terminal state instead of sitting unresolved. `/__reset`
+on the fixture zeroes the invoice and the hit counter, not the proxy's
+intent store, so that is what makes the difference rather than the reset.
+
+The challenge. The policy prices the request, the gate commits a
+`Pending` intent before anything leaves the proxy, and the signed quote
+token rides the header the policy configured:
+
+<!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 402 Payment Required
+content-type: application/json
+crawler-payment: eyJhbGciOiJFZERTQSIsInR5cCI6InNicHJveHktcXVvdGUrandzIiwia2lkIjoic2Jwcm94eS1wYXltZW50cyJ9.eyJpc3MiOiJzYnByb3h5LXBheW1lbnRzIiwic3ViIjoiX19kZWZhdWx0X18iLCJhdWQiOiJsZWRnZXIiLCJpYXQiOjE3ODU3OTQ4NzksImV4cCI6MTc4NTc5NTE3OSwibm9uY2UiOiJyZXFfMDFrejR0cHJmdDBwZjYyYmszZHJkNzl0cG4iLCJxdW90ZV9pZCI6InF1b3RlXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwicm91dGUiOiIvYXJ0aWNsZSIsInNoYXBlIjoicGF5bWVudC1yZXF1aXJlbWVudCIsInByaWNlIjp7ImFtb3VudF9taWNyb3MiOjEwMCwiY3VycmVuY3kiOiJCVEMifSwicmFpbCI6ImxpZ2h0bmluZyIsInJlcXVpcmVtZW50X2lkIjoicmVxXzAxa3o0dHByZnQwcGY2MmJrM2RyZDc5dHBuIiwiZHJhZnRfZGlnZXN0IjoibG13ajVDYjE3bVhkLTFuSHdTX2x4bS12d3VCUk8zTVhzd3RkeEkxc0N5TSIsInJlcXVpcmVtZW50X2RpZ2VzdCI6IkczTE1BWW51LVI2aE9zUk55U2dLdGdwTE1jYTRnRWNUYm9FRG1QTHBzNkkifQ.WAHMWK0keVNhIzPFhKsKYB8IGAtK9wrMfWiSF-IcrCc3P6jYJRwQT3UF3DhcKSM89i27KvicPVKK7xZfn1WcBw
+content-length: 490
+Date: Mon, 03 Aug 2026 22:07:59 GMT
+Connection: keep-alive
+
+{"amount_micros":100,"challenge":{"bolt11":"lnbcrt100u1stubinvoiceda627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a","label":"sbproxy-invoice-sbpi_VToGEr88GCbwAYpkLNQj9ld9tG2CBOs6-yRsutLntTk","payment_hash":"da627526f303639efa30246f0a15d59c4b463f2b6d2ed318d0f413f641ffe30a"},"currency":"BTC","error":"payment_required","expires_at_ms":1785795179994,"header":"crawler-payment","rail":"lightning","requirement_id":"req_01kz4tprft0pf62bk3drd79tpn","target":"blog.local/article"}
+```
+
+The retry before the payment settles. The token authenticates and names a
+live intent, so this is not a refusal. It is the 503 case, and it is the
+one the gate exists for. It also leaves the intent in
+`NeedsReconciliation`, which is why the walkthrough below retries in a
+loop rather than asking once:
+
+<!-- CAPTURE: TOKEN=$(curl -sS -D - -o /dev/null -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' http://127.0.0.1:8080/article | tr -d '\r' | awk '/^crawler-payment:/ {print $2}'); curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H "crawler-payment: $TOKEN" http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 503 Service Unavailable
+content-type: application/json
+Retry-After: 2
+content-length: 58
+Date: Mon, 03 Aug 2026 22:08:05 GMT
+Connection: keep-alive
+
+{"error":"settlement_unavailable","retry_after_seconds":2}
+```
+
+A preference list that overlaps no configured rail. The client is told
+what it could have asked for instead of being handed a challenge it
+cannot pay:
+
+<!-- CAPTURE: curl -is -H 'Host: blog.local' -H 'User-Agent: GPTBot/1.0' -H 'Accept-Payment: x402' http://127.0.0.1:8080/article -->
+
+```text
+HTTP/1.1 406 Not Acceptable
+content-type: application/json
+content-length: 189
+Date: Mon, 03 Aug 2026 22:08:10 GMT
+Connection: keep-alive
+
+{"error":"no_acceptable_rail","message":"Accept-Payment does not overlap with the settlement rails configured for this route.","supported_rails":["lightning"],"target":"blog.local/article"}
+```
+
+The whole sequence, with the origin's own hit counter after each step,
+because that counter is what proves one settled payment served the
+content exactly once. Its third step retries in a bounded loop for the
+reason above: the second step stranded the intent, so the request that
+reaches the origin is whichever one lands after the worker has swept.
+The script asserts every status it prints and, if the loop runs out,
+fails with the durable intent status rather than reporting a 503 as
+though it were the answer:
+
+<!-- CAPTURE: bash examples/settlement-gate-local/bin/settle-once.sh -->
+
+```text
+1 challenge, unpaid crawler   status=402 origin_hits=0
+2 retry before payment        status=503 origin_hits=0
+3 retry after payment         status=200 origin_hits=1
+4 replay of the settled quote status=402 origin_hits=1
+5 reader, never challenged    status=200 origin_hits=2
+```
+
+The x402 `PaymentRequired` body, the `WWW-Authenticate: Payment` field,
+and the `application/problem+json` refusal are specified byte for byte in
+[402-challenge.md](402-challenge.md). They are not reproduced here
+because no local fixture can settle those rails.
 
 ## Which rail to reach for
 
@@ -596,25 +709,60 @@ on a provider, which is the whole point of metering through a queue rather
 than through a callback.
 
 The visible half of that is the row's status: a freshly queued row reads
-`queued`, and only the worker moves it on.
+`queued`, and only the worker moves it on. It does move it on, and quickly,
+so `queued` is what the request path leaves behind rather than what a
+reader looking at the table a moment later will find. Where the row comes
+to rest is the worker's report of the provider: `terminal` once the
+provider has answered authoritatively, with `failure_category` naming
+which answer it was.
 
 ### Seeing it work
 
-With the block above configured and a request served, the queue holds one
-row per billable unit:
+[`examples/usage-bridge-queue/`](../examples/usage-bridge-queue/) is that
+block paired with something that produces usage: one AI origin, one
+governed key carrying the customer id, and a local fixture whose token
+counts are fixed so the queued quantity is too. Mint the key and bill one
+call to it:
 
-<!-- CAPTURE: sqlite3 /var/lib/sbproxy/payments.sqlite3 'select reporter, usage_identifier, tenant_id, origin_id, status, quantity from usage_reports order by created_at_ms' -->
+<!-- CAPTURE: bash examples/usage-bridge-queue/bin/bill-one-call.sh -->
+
+```text
+minted a governed key naming customer=cus_demo_usage_bridge
+chat completion               status=200
+rows on the usage queue       1
+```
+
+The queue then holds one row per billable unit. `usage_reports` has no
+`quantity` column: the number is a field of the serialized event in
+`event_jcs`, so the row cannot disagree with what the worker actually
+sends. `json_extract` reads it back out.
+
+<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 "select reporter, usage_identifier, tenant_id, origin_id, status, failure_category, json_extract(event_jcs, '\$.quantity') as quantity from usage_reports order by created_at_ms" -->
+
+```text
+stripe_meter|sbu-019fc9ac14d77c538ca5e1a16134c1a1-297ee8d903db676df220fbad9f96916f|tenant-a|billing.local|terminal|rejected|1020
+```
 
 The full event the worker will hand the reporter, including the resource
 attribution and the customer the charge lands on:
 
-<!-- CAPTURE: sqlite3 /var/lib/sbproxy/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
+<!-- CAPTURE: sqlite3 /tmp/sbproxy-usage-bridge/payments.sqlite3 'select event_jcs from usage_reports order by created_at_ms limit 1' -->
+
+```text
+{"attributes":{"claim_id":"019fc9ac14d77c538ca5e1a16134c1a1","resource_name":"openai/gpt-4o-mini","resource_type":"ai_model","stripe_customer_id":"cus_demo_usage_bridge","unit":"total_tokens"},"event_name":"sbproxy_ai_tokens","occurred_at_ms":1785794925828,"origin_id":"billing.local","quantity":1020,"reporter":"stripe_meter","tenant_id":"tenant-a","usage_identifier":"sbu-019fc9ac14d77c538ca5e1a16134c1a1-297ee8d903db676df220fbad9f96916f"}
+```
 
 Two counters describe the bridge, both labeled by tenant because a billing
 number that merged every tenant into one series answers a question nobody
 asks:
 
-<!-- CAPTURE: curl -s http://127.0.0.1:9090/metrics | grep sbproxy_usage_bridge -->
+<!-- CAPTURE: curl -s http://127.0.0.1:8080/metrics | grep sbproxy_usage_bridge -->
+
+```text
+# HELP sbproxy_usage_bridge_enqueued_total Billable units the request path queued for a usage reporter, by tenant, reporter, resource type, and whether the row was new
+# TYPE sbproxy_usage_bridge_enqueued_total counter
+sbproxy_usage_bridge_enqueued_total{reporter="stripe_meter",resource_type="ai_model",result="queued",tenant_id="tenant-a"} 1
+```
 
 `sbproxy_usage_bridge_enqueued_total` splits on `result`. A `duplicate` is
 the idempotency contract working and is expected on a retry; a series that
@@ -626,10 +774,20 @@ served request produced a billable unit that never reached the queue, so
 the customer will be under-billed and nothing downstream notices on its
 own.
 
-Once the worker has drained a row, the gap markers and receipts for the same
-claims are on the chain and it still verifies:
+Both families are registered on first use rather than at startup, which is
+why only one of them is in the scrape above. Until a bridge has had a gap
+there is no gap series, and a scrape of a healthy bridge is byte for byte
+what a scrape of a build that never records one would look like. Pair the
+threshold with an `absent()` alert so the missing series is itself the
+alert, rather than the reason the alert never fires.
 
-<!-- CAPTURE: curl -s -u admin:secret -X POST http://127.0.0.1:9090/api/meter/verify -->
+A gap marker is an ordinary chained, signed entry, so a chain carrying one
+still verifies. That surface belongs to the meter rather than to the
+bridge: `POST /api/meter/verify` reports whether the chain still verifies
+and the first sequence number where it does not.
+[`examples/metering-verify/`](../examples/metering-verify/) is the
+runnable walkthrough of it, and [metering.md](metering.md) is the
+reference.
 
 ### Reconciling a provider invoice
 
@@ -771,22 +929,39 @@ categories in durable records are a closed set for the same reason.
 
 ## Try it locally
 
+Settlement is behind cargo features and none of them are in the default
+build, so start there. A configured rail whose feature is missing is a
+startup failure that names the feature.
+
 ```bash
-sbproxy serve -f examples/rail-x402-base-sepolia/sb.yml
+CARGO_TARGET_DIR=target/payments cargo build --release -p sbproxy \
+  --features payment-lightning-cln
+python3 examples/settlement-gate-local/fixture.py &
+target/payments/release/sbproxy serve -f examples/settlement-gate-local/sb.yml
 ```
 
-Then walk the three cases in
-[`examples/rail-x402-base-sepolia/`](../examples/rail-x402-base-sepolia/):
-a reader who is never charged, a declared crawler who gets a price, and a
-credential the proxy never issued that buys nothing. `make test` in that
-directory runs all three against a proxy you already have serving.
+For the challenge shape on its own, without a node to settle against,
+[`examples/rail-x402-base-sepolia/`](../examples/rail-x402-base-sepolia/)
+walks three cases: a reader who is never charged, a declared crawler who
+gets a price, and a credential the proxy never issued that buys nothing.
+`make test` in that directory runs all three against a proxy already
+serving. That one needs `--features payment-x402` rather than the
+Lightning feature above.
 
-The other configurations are linked rather than copied here, so there is
-one place to fix when a field moves:
+[`examples/settlement-gate-local/`](../examples/settlement-gate-local/) is
+the one configuration here that settles a payment end to end without a
+payment provider, and its README walks each step with the output above.
+The others are wire-shape references: they boot, they emit the challenge
+their rail specifies, and they cannot settle it, because every rail other
+than Lightning needs an HTTPS endpoint no fixture can be.
 
-- [`examples/rail-x402-base-sepolia/sb.yml`](../examples/rail-x402-base-sepolia/sb.yml) - x402 v2 `exact`.
-- [`examples/rail-mpp-stripe-test/sb.yml`](../examples/rail-mpp-stripe-test/sb.yml) - Payment HTTP Authentication settling on Stripe.
-- [`examples/rail-lightning/sb.yml`](../examples/rail-lightning/sb.yml) - CLN and LND as alternative backends.
+The configurations are linked rather than copied here, so there is one
+place to fix when a field moves:
+
+- [`examples/settlement-gate-local/sb.yml`](../examples/settlement-gate-local/sb.yml) - CLN against a local stub node. Settles.
+- [`examples/rail-x402-base-sepolia/sb.yml`](../examples/rail-x402-base-sepolia/sb.yml) - x402 v2 `exact`. Challenges only.
+- [`examples/rail-mpp-stripe-test/sb.yml`](../examples/rail-mpp-stripe-test/sb.yml) - Payment HTTP Authentication settling on Stripe. Needs a Stripe test key.
+- [`examples/rail-lightning/sb.yml`](../examples/rail-lightning/sb.yml) - CLN and LND as alternative backends. Needs a real node.
 - [`examples/multi-rail-accept-payment/sb.yml`](../examples/multi-rail-accept-payment/sb.yml) - several rails on one route in one currency.
 
 ## What this release does not do
