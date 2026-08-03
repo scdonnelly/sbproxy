@@ -204,7 +204,21 @@
 # that keeps either side's number silently gives back whatever the other
 # side changed. This is the seventh conflict in this file; the loud
 # multi-line guard in check-pub-item-ratchet.sh landed with it.
-285
+#
+# Raised to 288 on WOR-2245, 2026-08-03. Recomputed against the merged tree
+# rather than taking either side of the conflict: this branch carried 290 from
+# an older main and main carried 285, and neither described the merge. Eighth
+# conflict in this file.
+#
+# The delta is the module-coverage API this branch adds to
+# `sbproxy-capability/src/config_scan.rs`: `ModuleCoverageState`,
+# `ModuleCoverage`, `verify_module_dispatch_coverage`, and
+# `verify_config_readers_with_modules`. These are the surface the build guard
+# and its own integration tests call, and `config_scan`'s tests live in a
+# separate test crate, so `pub` is the only visibility that resolves. They
+# cannot be narrowed for the same reason most of the items already in this
+# number cannot.
+288
 #
 #
 # Lowered to 286 on WOR-2225, 2026-08-02, answering three more of the
