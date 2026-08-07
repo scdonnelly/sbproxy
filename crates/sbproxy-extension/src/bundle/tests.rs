@@ -385,6 +385,81 @@ fn proxy_wasm_and_ai_lookups_map_kinds_and_sort_ai_hooks() {
     }));
 }
 
+/// WOR-2289: `secret_vars`/`masked_vars` name a `config_schema`
+/// property, and a Proxy-Wasm hook is required (elsewhere in this
+/// module) to omit `config_schema` entirely, so it structurally cannot
+/// declare either list. A value shaped like a secret reference in its
+/// config is therefore passed straight through to `plugin_configuration`
+/// bytes, unexamined and unresolved; this proves the build never fails
+/// or blocks on one, the way it would if this runtime attempted
+/// resolution the way JavaScript and envelope-WASM hooks do.
+#[test]
+fn proxy_wasm_filter_config_passes_a_reference_shaped_value_through_unresolved() {
+    let temp = TempDir::new().unwrap();
+    let proxy_dir = temp.path().join("proxy-filter");
+    std::fs::create_dir(&proxy_dir).unwrap();
+    std::fs::write(
+        proxy_dir.join("bundle.yaml"),
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: proxy-filter\nversion: 1.0.0\nruntime: proxy_wasm\nabi: 0.2.1\nentry: filter.wasm\nhooks:\n  - kind: proxy_wasm\n    type: fixture_proxy_filter\n",
+    )
+    .unwrap();
+    std::fs::write(
+        proxy_dir.join("filter.wasm"),
+        include_bytes!("testdata/proxy_wasm/minimal.wasm"),
+    )
+    .unwrap();
+
+    let secret_dir = TempDir::new().unwrap();
+    let secret_path = secret_dir.path().join("token");
+    std::fs::write(&secret_path, "DISTINCTIVE_PROXY_WASM_SECRET_2d6f").unwrap();
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+    let proxy = registry.proxy_wasm_filter("fixture_proxy_filter").unwrap();
+
+    let filter = build_proxy_wasm_filter(
+        proxy,
+        serde_json::json!({ "token": format!("file:{}", secret_path.display()) }),
+    )
+    .unwrap();
+    assert_eq!(filter.type_name(), "fixture_proxy_filter");
+}
+
+/// WOR-2289: loading a candidate registers its hooks' `secret_vars`/
+/// `masked_vars` names with the process-wide log redactor
+/// (`sbproxy_observe::logging::set_bundle_secret_field_names`), and the
+/// public inventory never carries the attachment config a var's value
+/// would appear in.
+#[test]
+fn loading_a_candidate_registers_its_secret_vars_with_the_log_redactor() {
+    sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
+    let temp = TempDir::new().unwrap();
+    let schema_manifest = manifest("redactor-bundle", "policy", "redactor_policy", None).replace(
+        "    export: run\n",
+        "    export: run\n    config_schema:\n      type: object\n      properties:\n        hmac_key:\n          type: string\n    secret_vars: [hmac_key]\n",
+    );
+    write_bundle(temp.path(), "redactor", &schema_manifest, VALID_JAVASCRIPT);
+
+    let registry =
+        DynamicBundleRegistry::load(&local_config(temp.path()), temp.path(), &BTreeSet::new())
+            .unwrap();
+
+    let registered = sbproxy_observe::logging::bundle_secret_field_names();
+    assert!(
+        registered.iter().any(|name| name == "hmac_key"),
+        "{registered:?}"
+    );
+
+    let rendered = serde_json::to_string(registry.inventory()).unwrap();
+    assert!(
+        !rendered.contains("hmac_key"),
+        "public inventory must never carry attachment config: {rendered}"
+    );
+
+    sbproxy_observe::logging::set_bundle_secret_field_names(Vec::new());
+}
+
 #[test]
 fn invalid_proxy_wasm_module_rejects_the_complete_candidate() {
     let temp = TempDir::new().unwrap();

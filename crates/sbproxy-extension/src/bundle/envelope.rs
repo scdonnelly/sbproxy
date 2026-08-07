@@ -4,10 +4,12 @@ use sbproxy_plugin::{
     ActionOutcome, AiExtensionDecision, PaymentExtensionDecision, PolicyDecision,
     UNSUPPORTED_ACTION_OUTCOME_CODE,
 };
+use sbproxy_security::{hkdf_derive_purpose, HkdfPurpose};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use zeroize::Zeroizing;
 
-use sbproxy_config::BundleHookKind;
+use sbproxy_config::{is_secret_reference, BundleHookKind};
 
 pub(crate) const ENVELOPE_VERSION: &str = sbproxy_config::BUNDLE_ENVELOPE_ABI;
 
@@ -74,6 +76,173 @@ pub(crate) fn apply_schema_defaults(value: &mut Value, schema: &Value) {
             apply_schema_defaults(item, item_schema);
         }
     }
+}
+
+/// Resolve secret references in a bundle hook's declared `secret_vars`,
+/// in place.
+///
+/// A `sb.yml` attachment (`policy:`, `action:`, `transform:`) passes a
+/// bundle hook's config vars as arbitrary JSON. A bundle that needs a
+/// secret in one of those vars (an API key, a signing token) declares
+/// the var's name in its manifest's `secret_vars`
+/// (`sbproxy_config::BundleHook::secret_vars`); only a top-level
+/// property named there is a candidate for resolution. A value shaped
+/// like a reference `sbproxy_config::is_secret_reference` recognizes
+/// (`env:NAME`, `${NAME}`, `file:/path`, or a provider URI such as
+/// `vault://backend/name`) is resolved before the bundle runs; a plain
+/// literal in a `secret_vars` property (an operator who pasted the
+/// secret directly rather than referencing it) is left as-is. A var
+/// **not** listed in `secret_vars` is never inspected here, so an
+/// operator cannot get silent resolution they did not declare.
+///
+/// Resolution follows the same delegation pattern as
+/// `sbproxy_core::config_source::resolve_secret_reference`: normalize
+/// the legacy `env:NAME` spelling to `${NAME}`, then delegate to the
+/// process-wide [`sbproxy_vault::SecretResolver`] when one is installed.
+/// Outside a running server (`sbproxy validate`, `sbproxy plan`, unit
+/// tests) no resolver is installed, so `${NAME}` / `env:NAME` fall back
+/// to reading the environment variable directly and `file:` falls back
+/// to reading the file; a provider-URI reference with no resolver
+/// installed is a hard error rather than being passed through as a
+/// literal secret pointer.
+///
+/// The resolved plaintext is held in a [`Zeroizing`] buffer until it is
+/// written into `value` for the guest to consume; that write is the one
+/// unavoidable plaintext copy the feature exists to produce; every
+/// other intermediate (the owned `String` handed back by the resolver,
+/// the copy this function holds while validating the JSON shape) is
+/// zeroized on drop rather than left for the allocator to reuse
+/// unscrubbed.
+///
+/// # Errors
+///
+/// Returns a bounded detail message when a `secret_vars` property holds
+/// a recognized reference that cannot be resolved. The detail names
+/// only the reference (a pointer, never the secret it names) or the
+/// missing environment variable, file, or backend.
+pub(crate) fn resolve_declared_secrets(
+    value: &mut Value,
+    secret_vars: &[String],
+) -> Result<(), String> {
+    let Some(map) = value.as_object_mut() else {
+        return Ok(());
+    };
+    for name in secret_vars {
+        let Some(Value::String(text)) = map.get_mut(name) else {
+            continue;
+        };
+        if is_secret_reference(text) {
+            let resolved: Zeroizing<String> = Zeroizing::new(resolve_one_config_secret(text)?);
+            *text = resolved.as_str().to_owned();
+        }
+    }
+    Ok(())
+}
+
+/// Resolve one secret reference. Mirrors
+/// `sbproxy_core::config_source::resolve_secret_reference`'s pattern:
+/// normalize, delegate to the installed resolver, and fall back to a
+/// direct environment or file read when no resolver is installed.
+fn resolve_one_config_secret(reference: &str) -> Result<String, String> {
+    let trimmed = reference.trim();
+    let normalized = match trimmed.strip_prefix("env:") {
+        Some(name) => format!("${{{name}}}"),
+        None => trimmed.to_owned(),
+    };
+    if let Some(resolver) = sbproxy_vault::process_resolver() {
+        return resolver
+            .resolve(&normalized)
+            .map_err(|error| format!("{error:#}"));
+    }
+    if let Some(name) = normalized
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    {
+        return std::env::var(name).map_err(|_| format!("environment variable {name} is not set"));
+    }
+    if let Some(file_path) = normalized.strip_prefix("file:") {
+        return std::fs::read_to_string(file_path)
+            .map(|contents| contents.trim().to_owned())
+            .map_err(|error| format!("read secret file '{file_path}': {error}"));
+    }
+    Err(format!(
+        "secret reference '{reference}' cannot be resolved; no secret backend is configured \
+         (declare one under proxy.secrets.backends)"
+    ))
+}
+
+/// Fixed HKDF salt for [`bundle_var_fingerprint`]. A fixed salt plus a
+/// dedicated [`HkdfPurpose`] is what keeps the published fingerprint
+/// from being a derivation an attacker could invert or compare across
+/// purposes; see `SealKey::fingerprint_hex` in `sbproxy-security` for
+/// the pattern this mirrors.
+const BUNDLE_VAR_FINGERPRINT_SALT: &[u8] = b"sbproxy.bundle.secret_var.fingerprint.salt.v1";
+
+/// Length, in bytes, of a rendered bundle-var fingerprint.
+const BUNDLE_VAR_FINGERPRINT_LEN: usize = 4;
+
+/// Derive a short published fingerprint for a masked var's value.
+///
+/// Lets an operator tell two masked values apart (did the secret
+/// rotate? is this the key I think it is?) from a masked debug
+/// rendering without ever showing the value. HKDF-derived rather than
+/// a hash or a prefix of the material: a hash or prefix of a short
+/// secret is itself brute-forceable back to the source, which a
+/// dedicated-purpose HKDF derivation is not. See
+/// `resolved_material_is_not_a_prefix_of_its_own_fingerprint` below.
+fn bundle_var_fingerprint(material: &[u8]) -> [u8; BUNDLE_VAR_FINGERPRINT_LEN] {
+    let derived = hkdf_derive_purpose(
+        material,
+        BUNDLE_VAR_FINGERPRINT_SALT,
+        HkdfPurpose::BundleSecretVarFingerprint,
+        BUNDLE_VAR_FINGERPRINT_LEN,
+    );
+    let mut fingerprint = [0u8; BUNDLE_VAR_FINGERPRINT_LEN];
+    fingerprint.copy_from_slice(&derived);
+    fingerprint
+}
+
+/// Render one masked var's placeholder: the var name, its resolved
+/// length, and its HKDF fingerprint. Answers the debugging questions an
+/// operator actually has (is it set, did it get truncated, is this the
+/// key I think it is) without the value itself.
+fn masked_var_placeholder(name: &str, text: &str) -> String {
+    let fingerprint = bundle_var_fingerprint(text.as_bytes());
+    format!(
+        "[REDACTED:{name} len={} fp={}]",
+        text.len(),
+        hex::encode(fingerprint)
+    )
+}
+
+/// Mask every var named in `secret_vars` or `masked_vars`, leaving
+/// everything else untouched. Used to render bundle attachment config
+/// for logs, errors, or diagnostics without ever showing a resolved
+/// secret or a masked literal.
+///
+/// Called after [`resolve_declared_secrets`], so for a `secret_vars`
+/// name this masks the *resolved* plaintext already sitting in
+/// `value`, not the original reference string; for a `masked_vars`
+/// name (never resolved) it masks the literal as configured. Only
+/// string-typed vars are masked: a `secret_vars`/`masked_vars` name
+/// whose config value is not a string does not match the manifest
+/// contract those lists imply, and is left as the compiled schema
+/// validator's problem, not this function's.
+pub(crate) fn mask_declared_vars(value: &Value, masked_names: &[String]) -> Value {
+    if masked_names.is_empty() {
+        return value.clone();
+    }
+    let mut masked = value.clone();
+    let Some(map) = masked.as_object_mut() else {
+        return masked;
+    };
+    for name in masked_names {
+        if let Some(Value::String(text)) = map.get(name) {
+            let placeholder = masked_var_placeholder(name, text);
+            map.insert(name.clone(), Value::String(placeholder));
+        }
+    }
+    masked
 }
 
 pub(crate) fn request_value(
@@ -424,5 +593,186 @@ mod tests {
             br#"{"version":"sbproxy-envelope/v1","decision":"reject","message":"secret"}"#,
         )
         .is_err());
+    }
+
+    // --- WOR-2289: bundle config var secret resolution + masking ---
+
+    #[test]
+    fn resolve_declared_secrets_leaves_an_undeclared_var_untouched_even_if_reference_shaped() {
+        let mut value = json!({ "threshold": 5, "token": "env:PATH" });
+        let original = value.clone();
+
+        resolve_declared_secrets(&mut value, &[]).expect("nothing declared, nothing to resolve");
+
+        assert_eq!(value, original, "undeclared var must never be resolved");
+    }
+
+    #[test]
+    fn resolve_declared_secrets_leaves_a_plain_literal_untouched() {
+        let mut value = json!({ "api_key": "not-a-reference" });
+        let secret_vars = vec!["api_key".to_owned()];
+
+        resolve_declared_secrets(&mut value, &secret_vars).expect("literal needs no resolution");
+
+        assert_eq!(value["api_key"], "not-a-reference");
+    }
+
+    #[test]
+    fn resolve_declared_secrets_resolves_a_file_reference_for_a_declared_var() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "DISTINCTIVE_FILE_SECRET_4b1c\n").unwrap();
+        let mut value = json!({ "token": format!("file:{}", path.display()) });
+        let secret_vars = vec!["token".to_owned()];
+
+        resolve_declared_secrets(&mut value, &secret_vars).expect("file reference resolves");
+
+        assert_eq!(value["token"], "DISTINCTIVE_FILE_SECRET_4b1c");
+    }
+
+    #[test]
+    fn resolve_declared_secrets_resolves_env_and_dollar_brace_forms_without_mutating_env() {
+        // Reads an environment variable every test process already has
+        // rather than exporting a new one, so this test never calls
+        // `std::env::set_var` (banned in this crate by
+        // `scripts/check-env-mutation.sh`; sbproxy-extension has no
+        // `src/test_env.rs` guard).
+        let expected = std::env::var("PATH").expect("PATH is set in the test environment");
+        let mut value = json!({ "a": "env:PATH", "b": "${PATH}" });
+        let secret_vars = vec!["a".to_owned(), "b".to_owned()];
+
+        resolve_declared_secrets(&mut value, &secret_vars).expect("env references resolve");
+
+        assert_eq!(value["a"], expected);
+        assert_eq!(value["b"], expected);
+    }
+
+    #[test]
+    fn resolve_declared_secrets_resolves_a_provider_uri_through_the_installed_resolver() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let vault = sbproxy_vault::LocalVault::new();
+        vault
+            .set_secret("token", "DISTINCTIVE_VAULT_SECRET_9e21")
+            .expect("fixture secret");
+        let mut manager = sbproxy_vault::VaultManager::new();
+        manager.register("fixture", Box::new(vault));
+        sbproxy_vault::install_process_resolver(std::sync::Arc::new(
+            sbproxy_vault::SecretResolver::new().with_manager(std::sync::Arc::new(manager)),
+        ));
+
+        let mut value = json!({ "token": "secret://fixture/token" });
+        let secret_vars = vec!["token".to_owned()];
+        resolve_declared_secrets(&mut value, &secret_vars)
+            .expect("provider-uri reference resolves");
+
+        assert_eq!(value["token"], "DISTINCTIVE_VAULT_SECRET_9e21");
+
+        sbproxy_vault::reset_process_resolver_for_test();
+    }
+
+    #[test]
+    fn resolve_declared_secrets_fails_closed_on_an_unresolvable_provider_uri() {
+        sbproxy_vault::reset_process_resolver_for_test();
+        let mut value = json!({ "token": "vault://missing-backend/name" });
+        let secret_vars = vec!["token".to_owned()];
+
+        let error = resolve_declared_secrets(&mut value, &secret_vars).unwrap_err();
+
+        assert!(error.contains("proxy.secrets.backends"), "{error}");
+    }
+
+    #[test]
+    fn mask_declared_vars_hides_only_the_named_vars_with_length_and_fingerprint() {
+        let value = json!({ "token": "DISTINCTIVE_MASK_TARGET", "name": "visible" });
+        let masked_names = vec!["token".to_owned()];
+
+        let masked = mask_declared_vars(&value, &masked_names);
+
+        let rendered = masked["token"].as_str().expect("string placeholder");
+        assert!(rendered.starts_with("[REDACTED:token "), "{rendered}");
+        assert!(
+            rendered.contains(&format!("len={}", "DISTINCTIVE_MASK_TARGET".len())),
+            "{rendered}"
+        );
+        assert!(rendered.contains("fp="), "{rendered}");
+        assert_eq!(masked["name"], "visible");
+        assert!(!masked.to_string().contains("DISTINCTIVE_MASK_TARGET"));
+    }
+
+    #[test]
+    fn mask_declared_vars_with_no_names_returns_config_unchanged() {
+        let value = json!({ "token": "still-here" });
+
+        let masked = mask_declared_vars(&value, &[]);
+
+        assert_eq!(masked, value);
+    }
+
+    #[test]
+    fn resolve_then_mask_never_renders_the_resolved_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "DISTINCTIVE_ROUND_TRIP_SECRET_1a2b").unwrap();
+        let mut value = json!({ "token": format!("file:{}", path.display()), "label": "ok" });
+        let secret_vars = vec!["token".to_owned()];
+
+        resolve_declared_secrets(&mut value, &secret_vars).expect("file reference resolves");
+        let masked = mask_declared_vars(&value, &secret_vars);
+        let rendered = masked.to_string();
+
+        assert!(
+            !rendered.contains("DISTINCTIVE_ROUND_TRIP_SECRET_1a2b"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("REDACTED:token"), "{rendered}");
+        assert_eq!(masked["label"], "ok");
+    }
+
+    #[test]
+    fn masked_vars_are_masked_without_being_resolved() {
+        // A masked_vars entry is a sensitive literal, not a secret
+        // reference: it must never be looked up through the resolver,
+        // only masked when rendered.
+        let value = json!({ "tenant_id": "env:PATH" });
+        let masked_names = vec!["tenant_id".to_owned()];
+
+        // resolve_declared_secrets is never called with masked_vars
+        // names, so the literal "env:PATH" string survives untouched
+        // all the way to masking.
+        let masked = mask_declared_vars(&value, &masked_names);
+        assert!(masked["tenant_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("[REDACTED:tenant_id "));
+
+        // Confirm it really was never resolved: the guest-visible value
+        // (pre-mask) is still the literal string, not PATH's contents.
+        assert_eq!(value["tenant_id"], "env:PATH");
+    }
+
+    #[test]
+    fn bundle_var_fingerprint_is_not_a_prefix_of_its_own_material() {
+        // Mirrors `the_fingerprint_is_not_a_prefix_of_a_record_key` in
+        // sbproxy-security: an HKDF-derived fingerprint must not leak
+        // the leading bytes of the value it identifies, unlike a hash
+        // or literal prefix would.
+        let material = b"DISTINCTIVE_FINGERPRINT_SOURCE_MATERIAL_0f1e2d";
+        let fingerprint = bundle_var_fingerprint(material);
+
+        assert_ne!(
+            &fingerprint[..],
+            &material[..BUNDLE_VAR_FINGERPRINT_LEN],
+            "fingerprint must not be a prefix of the source material"
+        );
+    }
+
+    #[test]
+    fn bundle_var_fingerprint_is_deterministic_and_distinguishes_values() {
+        let a = bundle_var_fingerprint(b"secret-a");
+        let a_again = bundle_var_fingerprint(b"secret-a");
+        let b = bundle_var_fingerprint(b"secret-b");
+
+        assert_eq!(a, a_again);
+        assert_ne!(a, b);
     }
 }

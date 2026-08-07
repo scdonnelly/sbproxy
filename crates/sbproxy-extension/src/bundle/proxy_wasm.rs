@@ -228,6 +228,11 @@ pub(super) fn build_proxy_wasm_filter_for_kind(
             "hook kind does not match the requested Proxy-Wasm adapter",
         ));
     }
+    // WOR-2289: `secret_vars`/`masked_vars` name a `config_schema`
+    // property, and a Proxy-Wasm hook is required elsewhere in this
+    // module to omit `config_schema` entirely (it uses plugin
+    // configuration instead), so it structurally cannot declare either
+    // list. Nothing to resolve or mask here as a result.
     let plugin_configuration = serde_json::to_vec(&configuration)
         .map_err(|_| BundleLoadError::new("proxy_wasm", "plugin configuration is invalid"))?;
     let maximum = usize::try_from(hook.manifest().sandbox.max_buffer_bytes)

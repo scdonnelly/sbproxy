@@ -29,6 +29,11 @@ pub(crate) struct EnvelopeWasmProgram {
     hook_kind: &'static str,
     type_name: Arc<str>,
     config: Arc<Value>,
+    /// `secret_vars ∪ masked_vars` var names from this hook's manifest
+    /// (WOR-2289). Never printed as-is; `Debug` masks exactly these
+    /// vars so a resolved secret or a masked literal never reaches a
+    /// log or panic message.
+    masked_names: Arc<Vec<String>>,
     max_input_bytes: usize,
     max_output_bytes: usize,
     budget: std::time::Duration,
@@ -46,6 +51,10 @@ impl std::fmt::Debug for EnvelopeWasmProgram {
             .debug_struct("EnvelopeWasmProgram")
             .field("hook_kind", &self.hook_kind)
             .field("type_name", &self.type_name)
+            .field(
+                "config",
+                &envelope::mask_declared_vars(&self.config, &self.masked_names),
+            )
             .field("max_input_bytes", &self.max_input_bytes)
             .field("max_output_bytes", &self.max_output_bytes)
             .field("budget_ms", &self.budget.as_millis())
@@ -88,6 +97,7 @@ impl EnvelopeWasmProgram {
             hook_kind: "policy",
             type_name: Arc::from("test"),
             config: Arc::new(json!({})),
+            masked_names: Arc::new(Vec::new()),
             max_input_bytes: 1024 * 1024,
             max_output_bytes: 1024 * 1024,
             budget,
@@ -385,6 +395,13 @@ pub(crate) fn prepare_wasm_program(
     if let Some(schema) = hook.hook().config_schema.as_ref() {
         envelope::apply_schema_defaults(&mut config, schema);
     }
+    // WOR-2289: resolve secret references in the hook's declared
+    // `secret_vars` before it ever runs. Validation runs on the
+    // resolved value (not the reference) so a schema constraint on the
+    // value's shape (a `pattern`, for instance) checks the real secret
+    // rather than the pointer to it.
+    envelope::resolve_declared_secrets(&mut config, &hook.hook().secret_vars)
+        .map_err(|detail| BundleLoadError::new("config", detail))?;
     hook.validate_config(&config)
         .map_err(|error| BundleLoadError::new("config", error.to_string()))?;
     let runtime = hook
@@ -398,6 +415,13 @@ pub(crate) fn prepare_wasm_program(
     let max_output_bytes = usize::try_from(hook.manifest().sandbox.max_output_bytes)
         .map_err(|_| BundleLoadError::new("wasm", "output limit is unsupported"))?;
     let type_name = hook.hook().type_name.clone();
+    let masked_names: Vec<String> = hook
+        .hook()
+        .secret_vars
+        .iter()
+        .chain(&hook.hook().masked_vars)
+        .cloned()
+        .collect();
     Ok((
         type_name.clone(),
         EnvelopeWasmProgram {
@@ -405,6 +429,7 @@ pub(crate) fn prepare_wasm_program(
             hook_kind: envelope::hook_kind_label(expected_kind),
             type_name: Arc::from(type_name),
             config: Arc::new(config),
+            masked_names: Arc::new(masked_names),
             max_input_bytes,
             max_output_bytes,
             budget,
@@ -740,6 +765,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"replaced");
+    }
+
+    // WOR-2289: bundle config var secret resolution + masking. The
+    // resolution and masking logic itself is exercised exhaustively in
+    // `envelope`'s own tests (env:, ${VAR}, file:, and a provider-URI
+    // form, plus a literal-passthrough case); this test only proves the
+    // WASM build path is wired to it and never echoes a resolved value.
+    #[test]
+    fn wasm_policy_debug_never_echoes_a_resolved_bundle_secret() {
+        let secret_dir = TempDir::new().unwrap();
+        let secret_path = secret_dir.path().join("token");
+        std::fs::write(&secret_path, "DISTINCTIVE_WASM_SECRET_c92e").unwrap();
+
+        let fixture = fixture(
+            "dispatch.wasm",
+            "  - kind: policy\n    type: wasm_policy_fixture\n    config_schema:\n      type: object\n      properties:\n        token:\n          type: string\n    secret_vars: [token]\n  - kind: transform\n    type: wasm_transform_fixture\n",
+            "",
+        );
+        let hook = fixture.hook(BundleHookKind::Policy, "wasm_policy_fixture");
+        let policy = build_wasm_policy(
+            hook,
+            json!({ "token": format!("file:{}", secret_path.display()) }),
+        )
+        .unwrap();
+
+        let rendered = format!("{policy:?}");
+        assert!(
+            !rendered.contains("DISTINCTIVE_WASM_SECRET_c92e"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("REDACTED:token"), "{rendered}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
