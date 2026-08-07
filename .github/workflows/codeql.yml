@@ -1,0 +1,70 @@
+# Static analysis for the Rust workspace and the admin console.
+#
+# Its own workflow rather than a job in ci.yml for two reasons. It wants a
+# schedule of its own, since most of what CodeQL finds on a mature tree comes
+# from rule updates rather than from the diff under review. And it builds the
+# workspace with its own instrumentation, which is a different fingerprint
+# from every cargo invocation in ci.yml; folding it in would break that
+# workflow's one-package-selection-per-job invariant and pay a full rebuild
+# on the critical path.
+#
+# The Rust analysis is community-supported rather than a first-class CodeQL
+# language, so treat a clean run as weaker evidence here than it would be for
+# the TypeScript half.
+name: codeql
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, off-hours. Catches newly published rules against unchanged code,
+    # which is most of the value once a tree stops moving quickly.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Required to upload the SARIF result to the Security tab.
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust is deliberately absent. The first run of this workflow
+          # failed at `initialize CodeQL` for `language: rust`, before any
+          # of our code was looked at, so the analysis is not available to
+          # this repository today rather than merely finding nothing.
+          #
+          # Left out rather than left failing: a permanently red lane is
+          # worse than an absent one, because it trains everyone to merge
+          # past a red check. Worth retrying when CodeQL's Rust support
+          # moves on, at which point this comment is the changelog.
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
