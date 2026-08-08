@@ -114,13 +114,10 @@ now refused at config compile with an error naming the replacement.
 | `origins.*.action.targets[].zone` (load_balancer) | Target selection is not locality aware. The label is echoed in the admin targets view and nowhere else. |
 | `origins.*.agent_skills[].max_clock_skew_secs` | Reserved for signed artifact freshness headers that are not emitted yet. |
 | `origins.*.connection_pool` | Pingora's built-in upstream pool is used; these per-origin limits are not applied. |
-| `origins.*.compression.level` | Compression libraries use their runtime defaults; this parsed level is not applied. |
 | `origins.*.cors.enable` | The presence of `cors:` enables CORS; the legacy boolean value is ignored. |
 | `origins.*.credentials[].attrs.budget.reset` | Reserved reset hint; no credential reset schedule is installed. The same leaf is config-only at proxy and tenant credential scopes. |
 | `origins.*.credentials[].attrs.team` | Parsed with a warning but not copied into the virtual-key principal. The same leaf is config-only at proxy and tenant credential scopes; use live `attrs.tags` or `attrs.metadata` attribution instead. |
 | `origins.*.forward_rules[].origin.hostname`, `.workspace_id`, `.version` | Inline forward-origin metadata is accepted but not copied into the compiled child origin. |
-| `origins.*.rate_limit_headers` | Use the live rate-limit policy's `headers` block instead. |
-| `origins.*.response_modifiers[].status.text` | The status code is applied; the compatibility reason text is ignored. |
 | `origins.*.sessions.ttl_seconds` | Reserved retention hint; the in-process request ring does not expire entries from it. |
 | `origins.*.traffic_capture` | No capture consumer; use `mirror` for live fire-and-forget request mirroring. |
 | `proxy.device_parser_file` | The current pure-Rust device parser does not load this catalog override. |
@@ -202,7 +199,6 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `on_response` | - | array | `[]` | **alpha** | Response event hook plugins. |
 | `bot_detection` | - | object | - | **alpha** | Bot detection config. |
 | `threat_protection` | - | object | - | **alpha** | Dynamic threat blocklist config. |
-| `rate_limit_headers` | - | object | - | **config-only** | Use the live rate-limit policy's `headers` block. |
 | `error_pages` | - | array | - | **beta** | Custom error page entries, each matching one status or a list of statuses. |
 | `traffic_capture` | - | object | - | **config-only** | No consumer; use `mirror` for request mirroring. |
 | `connection_pool` | - | object | - | **config-only** | Retained for compatibility; Pingora's built-in pool settings apply. |
@@ -235,10 +231,12 @@ HTTP/3 is not served by this build. The block is retained for forward compatibil
 | `enabled` | `enable` | boolean | true | **stable** |
 | `algorithms` | - | array | `[]` | **stable** |
 | `min_size` | - | integer | 0 | **stable** |
-| `level` | - | integer | - | **config-only** |
+| `level` | - | integer | - | **beta** |
 
-`level` is parsed but not applied: the encoders use their library
-default levels (gzip and zstd defaults, brotli quality 4).
+`level` is applied to whichever encoder the client negotiates, clamped
+into that algorithm's native range (gzip 0-9, brotli 0-11, zstd 1-22).
+Unset keeps each library's default (gzip and zstd defaults, brotli
+quality 4).
 
 ### Session Config (`session:`, alias `session_config:`)
 
@@ -313,7 +311,8 @@ default levels (gzip and zstd defaults, brotli quality 4).
 | Field | Type | Stability |
 |---|---|---|
 | `code` | integer | **stable** |
-| `text` | string | **config-only** |
+| `text` | string | **beta** |
 
-`text` is retained for schema-v1 compatibility. The response modifier applies
-`code`; the runtime does not emit or preserve a custom reason phrase.
+`text` is emitted as the reason phrase on the HTTP/1.x status line; absent
+means the canonical phrase for `code`. HTTP/2 has no reason phrase on the
+wire, so the value is ignored there.
