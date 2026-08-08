@@ -5087,8 +5087,8 @@ origins:
 | `email` | string | | Account contact email registered with the ACME directory |
 | `directory_url` | string | Let's Encrypt production | ACME directory URL |
 | `challenge_types` | list | `[http-01]` | Allowed challenge types in priority order. Only `http-01` is driven today. |
-| `storage_backend` | string | `redb` | Where issued certs live: `redb` (local file, default), `file`, `redis`, `s3`, `gcs`, `azure`, or `memory`. See below. |
-| `storage_path` | string | `/var/lib/sbproxy/certs` | The store's location: a directory (`redb`, `file`), a `host:port` (`redis`), or a URL like `s3://bucket/prefix` (`s3`/`gcs`/`azure`) |
+| `storage_backend` | string | `redb` | Where issued certs live: `redb` (local file, default), `sqlite`, `file`, `redis`, `s3`, `gcs`, `azure`, or `memory`. Any other value is a config error. See below. |
+| `storage_path` | string | `/var/lib/sbproxy/certs` | The store's location: a directory (`redb`, `sqlite`, `file`), a `host:port` (`redis`), or a URL like `s3://bucket/prefix` (`s3`/`gcs`/`azure`) |
 | `renew_before_days` | int | 30 | Days before expiry to attempt renewal |
 
 #### Certificate store backends
@@ -5098,12 +5098,27 @@ A single node keeps its certificates in a local `redb` file (the default), so a 
 | Backend | `storage_path` | Use |
 |---|---|---|
 | `redb` | a directory | single node (default); survives restarts |
+| `sqlite` | a directory | single node; survives restarts |
 | `file` | a shared directory | a fleet on shared storage (NFS/EFS) |
 | `redis` | `host:port` | a fleet with Redis |
 | `s3`, `gcs`, `azure` | `s3://bucket/prefix`, `gs://bucket/prefix`, `az://...` | a fleet on object storage; credentials come from the environment |
 | `memory` | ignored | tests only; nothing persists |
 
+Anything outside that list is rejected. `sbproxy plan` reports it as `unknown-acme-storage-backend` and the proxy refuses to start on it, rather than falling back to an in-memory store that would re-issue every certificate on every restart.
+
 The shared backends hold the issuance lock as an atomic create with a lease. A node that crashes mid-issue does not wedge the others: the lease expires and another node takes over.
+
+#### HTTP-01 behind a load balancer
+
+The store carries the challenge as well as the certificate, and that is the part that decides whether issuance works at all.
+
+The CA validates by fetching `http://<hostname>/.well-known/acme-challenge/<token>` on port 80. Your load balancer sends that request to whichever replica it likes, which is almost never the replica holding the issuance lock. So the node driving the order publishes the token to the cert store under `acme:challenge:<token>`, and every node answers the challenge by reading from there. A replica that never touched the order still serves the right bytes.
+
+The CA decides how long that token stays answerable. RFC 8555 §7.1.4 gives every authorization an `expires` field, and the published record is stamped to expire with the authorization it satisfies, so there is no fixed TTL to configure. The server's answer is bounded at both ends. The floor is one minute, so a host whose clock runs ahead of the CA's cannot publish a token that is already dead on arrival. The ceiling is ten minutes, which covers the slowest healthy order and falls well short of the seven days Let's Encrypt reports on a pending authorization. Taking those seven days literally would leave a token answerable across the whole fleet for a week whenever a node dies mid-order, and no healthy order has any use for it. An authorization that arrives with no `expires` at all gets the ten minute ceiling.
+
+Two things follow from that. Every replica has to share one `storage_backend`: two proxies behind one load balancer on separate local stores cannot finish an HTTP-01 order no matter how the rest is configured. And `http_bind_port` has to stay reachable on port 80 for the whole fleet, not only for the node you expect to do the issuing.
+
+Kubernetes has its own version of this problem, including where the local store actually lives. See [kubernetes.md](kubernetes.md#acme-and-tls-certificates).
 
 ### Local development (Pebble)
 
