@@ -2954,6 +2954,42 @@ fn semantic_cache_surface_class(surface_label: &'static str) -> &'static str {
     }
 }
 
+/// The config-bounded origin id for a decision-event label.
+///
+/// Never the request `Host`. `origin` is budgeted at 200 across every
+/// metric using that label name, and the limiter's accepted-value set is
+/// shared, so an attacker-chosen value on a per-request path can exhaust
+/// the budget and demote every other origin-labelled family to
+/// `__other__`.
+fn route_origin_label(ctx: &crate::context::RequestContext) -> &str {
+    ctx.origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map_or("", |origin| origin.origin_id.as_str())
+}
+
+/// Rewrite the request body's `model` field, if the body is an object.
+///
+/// `body["model"] = ..` looks equivalent and is not: `serde_json`'s
+/// `IndexMut` **panics** for every `Value` that is not an object or
+/// null. The body here is whatever `serde_json::from_slice` made of the
+/// client's bytes, with no object check anywhere upstream, so a request
+/// whose body is `[]` or `"hi"` or `7` is valid JSON that panics the
+/// worker the moment anything rewrites the model. Several sites in this
+/// file already guard with `as_object_mut()`; this is that guard, named,
+/// so the next rewrite site cannot forget it.
+///
+/// A non-object body has no `model` to rewrite, so there is nothing to
+/// report: the caller's `model` binding is already authoritative and
+/// every downstream plane reads that.
+fn set_body_model(body: &mut serde_json::Value, model: &str) {
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "model".to_owned(),
+            serde_json::Value::String(model.to_owned()),
+        );
+    }
+}
+
 pub(super) async fn handle_ai_proxy(
     session: &mut Session,
     config: &AiHandlerConfig,
@@ -4988,7 +5024,7 @@ pub(super) async fn handle_ai_proxy(
                                         "AI budget: soft-landing downgrade before hard cap"
                                     );
                                     model = new_model.clone();
-                                    body["model"] = serde_json::Value::String(new_model);
+                                    set_body_model(&mut body, &new_model);
                                     // Record the soft-landing in the usage
                                     // record / ledger via the policy tag,
                                     // without clobbering an explicit tag.
@@ -5025,7 +5061,7 @@ pub(super) async fn handle_ai_proxy(
             }
             BudgetGate::Downgrade { model: new_model } => {
                 model = new_model.clone();
-                body["model"] = serde_json::Value::String(new_model);
+                set_body_model(&mut body, &new_model);
                 // Recompute scope keys against the rewritten model so
                 // post-dispatch usage records on the chosen model
                 // rather than the original.
@@ -5822,13 +5858,111 @@ pub(super) async fn handle_ai_proxy(
             }
         }
 
-        if let Some(target) = decision.route_model() {
-            if !target.is_empty() && target != model {
-                info!(from = %model, to = %target, "AI policy: route_to override");
-                model = target.to_string();
-                body["model"] = serde_json::Value::String(target.to_string());
-                ctx.ai_model = Some(target.to_string());
+        // WOR-2366: the routing decision as an event that returns a plan.
+        //
+        // CEL can only return a scalar, which is exactly why
+        // `route_to:gpt-4o-mini` became a string mini-language. Rather
+        // than growing a second token grammar, the scalar is lifted into
+        // the one-candidate plan it always was, so there is a single
+        // path from here down and the document engines extend it rather
+        // than bypassing it.
+        let route_decision = decision
+            .route_model()
+            .filter(|target| !target.is_empty())
+            .map(sbproxy_ai::route_event::RoutePlan::from_route_to)
+            .map_or(
+                sbproxy_ai::route_event::RouteDecision::Decline,
+                sbproxy_ai::route_event::RouteDecision::Plan,
+            );
+
+        // Declining is the common path and is not a failure: the
+        // configured RoutingStrategy applies unchanged. `Apply` carries
+        // the candidate, so this site never looks the primary up again
+        // and never grows a branch for a `None` it has already been told
+        // cannot happen.
+        let route_outcome = match sbproxy_ai::route_event::RouteApplication::resolve(
+            &route_decision,
+            model.as_str(),
+        ) {
+            sbproxy_ai::route_event::RouteApplication::LeaveAlone => {
+                sbproxy_observe::decision::DecisionOutcome::Decline
             }
+            sbproxy_ai::route_event::RouteApplication::Apply(candidate) => {
+                // A routing policy must not route around the operator's
+                // model allowlist. Both model gates ran well upstream of
+                // here, so without this a `blocked_models` entry is
+                // bypassed by any expression that can emit
+                // `route_to:<blocked>`, and the request also lands on the
+                // wrong budget scope and past the per-model rate limit.
+                //
+                // The virtual-key override at the top of this function
+                // avoids the problem by rewriting *before* every gate and
+                // says so. This site cannot: the policy needs the
+                // guardrail and budget context that only exists down
+                // here. So it re-checks instead, and refuses rather than
+                // silently falling back, because an operator who wrote a
+                // rule naming a blocked model has a config bug and a
+                // silent fallback would hide it.
+                let allowed = config.is_model_allowed(&candidate.model)
+                    && resolved_request_vk
+                        .as_ref()
+                        .is_none_or(|vk| vk.is_model_allowed(&candidate.model));
+                if !allowed {
+                    warn!(
+                        from = %model,
+                        to = %candidate.model,
+                        "AI policy: route plan named a model the allowlist refuses"
+                    );
+                    ctx.ai_outcome = Some("policy_route_blocked".to_string());
+                    sbproxy_observe::decision::record_decision(
+                        sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                        sbproxy_observe::decision::DecisionEngine::Cel,
+                        sbproxy_observe::decision::DecisionOutcome::Deny,
+                        route_origin_label(ctx),
+                        ctx.tenant_id.as_str(),
+                    );
+                    let msg = format!("model '{}' is not allowed", candidate.model);
+                    send_error(session, 403, &msg).await?;
+                    return Ok(());
+                }
+                info!(
+                    from = %model,
+                    to = %candidate.model,
+                    "AI policy: route plan applied"
+                );
+                set_body_model(&mut body, &candidate.model);
+                ctx.ai_model = Some(candidate.model.clone());
+                model = candidate.model.clone();
+                // The event rewrote the payload, which is `Mutate` in this
+                // vocabulary (OCSF disposition 13, Corrected) rather than
+                // `Allow` (disposition 1). A SIEM rule keyed on "a control
+                // changed the request" has to match this.
+                sbproxy_observe::decision::DecisionOutcome::Mutate
+            }
+        };
+        sbproxy_observe::decision::record_decision(
+            sbproxy_observe::decision::DecisionEvent::RouteDecide,
+            // CEL is what drives this today. A document engine answering
+            // the same event reports its own label from its own call
+            // site rather than being folded in here.
+            sbproxy_observe::decision::DecisionEngine::Cel,
+            route_outcome,
+            route_origin_label(ctx),
+            ctx.tenant_id.as_str(),
+        );
+        if decision.fail_open {
+            // The expression did not evaluate; these actions came from
+            // `on_error`. Without this the request is indistinguishable
+            // from a policy that ran and had no opinion, so an operator
+            // whose expression dereferences a field that is null for a
+            // subset of traffic would see the ordinary decline count rise
+            // and this counter read flat zero.
+            sbproxy_observe::decision::record_decision_fail_open(
+                sbproxy_observe::decision::DecisionEvent::RouteDecide,
+                sbproxy_observe::decision::DecisionEngine::Cel,
+                route_origin_label(ctx),
+                ctx.tenant_id.as_str(),
+            );
         }
 
         if let Some(tag) = decision.sink_tag() {
