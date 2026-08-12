@@ -17,6 +17,8 @@
 //! ## Knobs
 //!
 //! * `requests_per_minute`: token bucket refill rate, per `agent_id`.
+//!   Shared across replicas when an L2 store is attached; see
+//!   "Cluster-shared enforcement" below.
 //! * `tokens_per_hour`: rolling hourly LLM-token budget per
 //!   `agent_id`. Enforcement is two-phase because a response's token
 //!   count is only known after the response completes: admission
@@ -37,11 +39,34 @@
 //!   Defaults to `skip` (no enforcement); operators that explicitly
 //!   want shared-bucket fallback set `shared`.
 //!
+//! ## Cluster-shared enforcement
+//!
+//! Ten replicas holding ten local buckets enforce every configured cap
+//! ten times over, so `requests_per_minute` has the same L2 tier
+//! [`crate::policy::rate_limit::RateLimitPolicy`] already carries. Attach a
+//! shared store with [`AgentBudgetPolicy::with_store`] or
+//! [`AgentBudgetPolicy::with_async_store`] and the per-minute cap is
+//! decided by a fixed-window counter every replica increments, so the
+//! fleet enforces the operator's number once. Attach nothing and the
+//! policy keeps its purely local view, which is the right answer for a
+//! single node and is what every deployment gets until an operator
+//! configures the store.
+//!
 //! ## Out of scope
 //!
-//! * Cluster-shared budgets. Each proxy enforces its own local view,
-//!   matching `requests_per_minute`, which has no shared-store path
-//!   either.
+//! * Cluster-shared `tokens_per_hour`. The hourly counter is now a
+//!   sliding window rather than a fixed one (WOR-2331), so it no longer
+//!   resets in lock-step and no longer admits ~2x the cap across a
+//!   boundary. Sharing it across replicas is still future work: the
+//!   sliding estimate needs both windows in the shared store, not one
+//!   counter, and that is a second keyspace rather than a knob. Per
+//!   replica the cap is now enforced honestly, which it was not before.
+//! * Cluster-shared `burst`. In-flight permits are per-process **by
+//!   construction**, not by omission: the permit releases when a request
+//!   on this node completes, and no other node can observe that. A
+//!   shared count would have to guess when to release, and a guess that
+//!   runs low leaks slots until restart. Treat `burst` as a per-replica
+//!   concurrency guard and size the fleet cap accordingly.
 //! * Token estimates for responses that never report usage. A
 //!   response with no parseable `usage` block, and any surface that
 //!   cannot report one, consumes zero rather than an invented count.
@@ -53,6 +78,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use sbproxy_platform::storage::{incr_with_ttl_async, AsyncKVStore, KVStore};
 use serde::Deserialize;
 
 /// What to do when an `agent_id` blows past its budget.
@@ -191,7 +217,7 @@ impl AgentBudgetExceedReason {
 
 /// Per-`agent_id` token bucket for the `requests_per_minute` knob.
 ///
-/// Mirrors the math used by [`super::rate_limit::RateLimitPolicy`] so
+/// Mirrors the math used by [`crate::policy::rate_limit::RateLimitPolicy`] so
 /// the two policies have the same admission semantics modulo the
 /// keying strategy.
 #[derive(Debug, Clone)]
@@ -227,13 +253,58 @@ impl RequestBucket {
 
 /// Per-`agent_id` rolling token-usage counter for `tokens_per_hour`.
 ///
-/// Uses a fixed-window counter (one wall-clock hour) rather than a
-/// smooth bucket. LLM token accounting is bursty and operators
-/// reason about hourly caps. The window resets on first observation
-/// inside a new hour.
+/// A **sliding-window counter**: two adjacent fixed windows, with the
+/// previous one weighted by how much of the current window has elapsed.
+/// The estimate is
+///
+/// ```text
+/// previous * (1 - elapsed_in_current / window) + current
+/// ```
+///
+/// ## Why not the fixed window this replaces (WOR-2331)
+///
+/// A fixed window resets the whole count at a boundary, so a caller who
+/// spends the full budget just before the reset and again just after
+/// gets close to **2x the configured cap** across it. For a 60 second
+/// window that is a brief, self-correcting overshoot. For an hourly
+/// token budget it means an agent can consume double its allowance
+/// around the boundary, while the operator sees every individual window
+/// enforced exactly as configured and a bill that disagrees.
+///
+/// The longer the window, the worse it gets: the overshoot is a fixed
+/// fraction of the cap but recovery scales with the window. An hour is
+/// long enough that this had to be fixed rather than documented.
+///
+/// ## The accepted error
+///
+/// The weighting assumes the previous window's spend was spread evenly
+/// across it. That is an approximation, and it is the reason to prefer
+/// this over an exact sliding log: exactness costs a per-key sorted set
+/// of every event in the window, and this costs two integers.
+///
+/// The error is bounded and one-directional in the way that matters. If
+/// the previous window's spend was actually concentrated at its end, the
+/// estimate is lower than the true trailing-hour total, so the limiter
+/// admits slightly more than the cap. If it was concentrated at the
+/// start, the estimate runs high and the limiter admits slightly less.
+/// In both cases the excursion is bounded by the previous window's
+/// count and decays linearly to zero across the current window; it never
+/// compounds across windows the way the fixed window's boundary reset
+/// does.
+///
+/// `tokens_per_hour` is billing-adjacent, so that trade is stated here
+/// deliberately rather than inherited from whatever the implementation
+/// happened to do. Over-enforcement refuses traffic a customer paid for;
+/// under-enforcement gives away inference. A bounded, decaying,
+/// explainable error on both sides is the right shape for that, and a
+/// 2x boundary blowout is not.
 #[derive(Debug, Clone)]
 struct TokenBucket {
-    consumed: u64,
+    /// Spend recorded so far in the current window.
+    current: u64,
+    /// Spend recorded in the window immediately before this one. Decays
+    /// out of the estimate as the current window advances.
+    previous: u64,
     limit: u64,
     window_start: Instant,
     window: Duration,
@@ -242,30 +313,59 @@ struct TokenBucket {
 impl TokenBucket {
     fn new(limit: u64, now: Instant) -> Self {
         Self {
-            consumed: 0,
+            current: 0,
+            previous: 0,
             limit,
             window_start: now,
             window: Duration::from_secs(3600),
         }
     }
 
-    /// Returns `true` while the agent is within budget for this hour.
+    /// Returns `true` while the agent is within budget for the trailing
+    /// window.
     fn within_budget(&mut self, now: Instant) -> bool {
         self.maybe_roll(now);
-        self.consumed < self.limit
+        self.estimate(now) < self.limit
     }
 
-    /// Add `n` tokens to the rolling count, rolling the window first
-    /// if it has expired.
+    /// Add `n` tokens to the current window, rolling first if the window
+    /// has advanced.
     fn add(&mut self, n: u64, now: Instant) {
         self.maybe_roll(now);
-        self.consumed = self.consumed.saturating_add(n);
+        self.current = self.current.saturating_add(n);
     }
 
+    /// Weighted estimate of spend over the trailing window.
+    fn estimate(&self, now: Instant) -> u64 {
+        let window = self.window.as_secs_f64();
+        if window <= 0.0 {
+            return self.current;
+        }
+        let elapsed = now.duration_since(self.window_start).as_secs_f64();
+        // Clamped because `maybe_roll` runs first in every caller, so
+        // elapsed is already inside the window; the clamp keeps
+        // `estimate` correct if it is ever called on its own.
+        let weight = (1.0 - (elapsed / window)).clamp(0.0, 1.0);
+        let carried = (self.previous as f64 * weight).round() as u64;
+        carried.saturating_add(self.current)
+    }
+
+    /// Advance the window pair to cover `now`.
+    ///
+    /// One window elapsed shifts current into previous. Two or more
+    /// elapsed means nothing in either is still inside the trailing
+    /// window, so both clear; without that case a long-idle key would
+    /// resurrect a stale count as soon as it was touched again.
     fn maybe_roll(&mut self, now: Instant) {
-        if now.duration_since(self.window_start) >= self.window {
+        let elapsed = now.duration_since(self.window_start);
+        if elapsed >= self.window.saturating_mul(2) {
+            self.previous = 0;
+            self.current = 0;
             self.window_start = now;
-            self.consumed = 0;
+        } else if elapsed >= self.window {
+            self.previous = self.current;
+            self.current = 0;
+            self.window_start += self.window;
         }
     }
 }
@@ -344,10 +444,37 @@ pub struct AgentBudgetPolicy {
     request_buckets: Mutex<lru::LruCache<String, RequestBucket>>,
     token_buckets: Mutex<lru::LruCache<String, TokenBucket>>,
     in_flight: Arc<DashMap<String, AtomicU32>>,
+
+    // --- Optional L2 (cluster-shared) state ---
+    //
+    // These are not part of `RawConfig` and so cannot be named in a
+    // config block, which is the same effect `#[serde(skip)]` has on
+    // `RateLimitPolicy`'s equivalents. This struct deserializes through
+    // `RawConfig` rather than deriving `Deserialize` itself, so the
+    // attribute has nowhere to sit here.
+    /// Shared counter backend (sync). Kept for callers that have not yet
+    /// migrated to `async_store`; reached through `spawn_blocking`
+    /// because the sync backends block on network I/O.
+    store: Option<Arc<dyn KVStore>>,
+    /// Shared counter backend (async-native). Preferred over `store` on
+    /// the request-hot path: no `spawn_blocking` tax per request.
+    async_store: Option<Arc<dyn AsyncKVStore>>,
+    /// Pre-computed counter-key prefix, so the hot path allocates no
+    /// more than it must. Format: `"sbproxy:ab:<origin-id>:"`.
+    key_prefix: String,
 }
 
 const SHARED_ANONYMOUS_KEY: &str = "__anonymous__";
 const DEFAULT_MAX_AGENTS: usize = 10_000;
+
+/// Fixed-window length, in seconds, for the shared `requests_per_minute`
+/// counter.
+///
+/// `RateLimitPolicy` derives this from its rate unit because it has two
+/// of them (1 s for `requests_per_second`, 60 s for
+/// `requests_per_minute`). This policy has one, so the window is the
+/// constant 60 that policy's `requests_per_minute` arm resolves to.
+const REQUEST_WINDOW_SECS: u64 = 60;
 
 #[derive(Deserialize)]
 struct RawConfig {
@@ -392,7 +519,44 @@ impl AgentBudgetPolicy {
             request_buckets: Mutex::new(lru::LruCache::new(cap)),
             token_buckets: Mutex::new(lru::LruCache::new(cap)),
             in_flight: Arc::new(DashMap::new()),
+            store: None,
+            async_store: None,
+            key_prefix: String::new(),
         })
+    }
+
+    /// Attach a shared L2 store so this policy enforces its
+    /// `requests_per_minute` cap once across the fleet instead of once
+    /// per replica. The `origin_id` is baked into every counter key so
+    /// two origins never share an agent's budget.
+    ///
+    /// When `store` is `None` the policy keeps its in-process bucket.
+    pub fn with_store(mut self, store: Option<Arc<dyn KVStore>>, origin_id: &str) -> Self {
+        self.store = store;
+        self.key_prefix = counter_key_prefix(origin_id);
+        self
+    }
+
+    /// Attach an **async** shared L2 store. Takes precedence over the
+    /// sync `store` on the request-hot path: [`Self::try_admit_async`]
+    /// awaits the async backend directly instead of bridging through
+    /// `spawn_blocking`.
+    ///
+    /// `origin_id` is baked into the counter-key prefix the same way
+    /// [`Self::with_store`] does it. This setter fills the prefix only
+    /// when `with_store` has not already set it, so the two chain in
+    /// either order and an upgrade that adds the async handle cannot
+    /// move live counters into a fresh keyspace.
+    pub fn with_async_store(
+        mut self,
+        store: Option<Arc<dyn AsyncKVStore>>,
+        origin_id: &str,
+    ) -> Self {
+        self.async_store = store;
+        if self.key_prefix.is_empty() {
+            self.key_prefix = counter_key_prefix(origin_id);
+        }
+        self
     }
 
     /// Resolve the bucket key from a caller-supplied `agent_id`.
@@ -460,6 +624,175 @@ impl AgentBudgetPolicy {
         } else {
             (AgentBudgetDecision::Allow, self.empty_guard())
         }
+    }
+
+    /// Whether admission for this policy has to consult state that lives
+    /// outside this process.
+    ///
+    /// True only when a shared store is attached *and* there is a
+    /// per-minute cap for the shared tier to cover. `tokens_per_hour` and
+    /// `burst` stay local either way, so a policy configuring only those
+    /// has nothing to gain from the async path and keeps its synchronous
+    /// one.
+    ///
+    /// Deliberately mirrors the early return in
+    /// [`Self::try_admit_async`], so the request path and the admission
+    /// call cannot disagree about whether a shared tier is live. That
+    /// disagreement is the whole of WOR-2332.
+    pub fn has_shared_tier(&self) -> bool {
+        self.requests_per_minute.is_some() && (self.async_store.is_some() || self.store.is_some())
+    }
+
+    /// Async variant of [`AgentBudgetPolicy::try_admit`], and the entry
+    /// point a clustered deployment has to call.
+    ///
+    /// With a shared L2 store attached, the `requests_per_minute`
+    /// sub-budget is decided by a fixed-window counter in the store
+    /// (atomic INCR plus expiry) rather than by this node's token
+    /// bucket, so every replica spends from one allowance. This is a
+    /// different algorithm from the local bucket: it does not refill
+    /// smoothly, it steps at the window boundary, which is the same
+    /// trade [`crate::policy::rate_limit::RateLimitPolicy`] makes on its own L2
+    /// path.
+    ///
+    /// With nothing attached, or with no `requests_per_minute` to
+    /// share, this is exactly [`AgentBudgetPolicy::try_admit`]. A
+    /// single-node deployment therefore behaves as it always has.
+    ///
+    /// `tokens_per_hour` and `burst` stay local in both cases; see the
+    /// module's "Out of scope" notes for why.
+    pub async fn try_admit_async(
+        &self,
+        agent_id: Option<&str>,
+    ) -> (AgentBudgetDecision, AgentBudgetGuard) {
+        // Nothing shared to consult: no store, or no request-rate
+        // sub-budget for the shared tier to cover. Both cases are the
+        // local path verbatim rather than a re-implementation of it, so
+        // they cannot drift.
+        if self.requests_per_minute.is_none()
+            || (self.async_store.is_none() && self.store.is_none())
+        {
+            return self.try_admit(agent_id);
+        }
+
+        let now = Instant::now();
+        let Some(key) = self.resolve_key(agent_id) else {
+            return (AgentBudgetDecision::SkippedAnonymous, self.empty_guard());
+        };
+
+        if let Some(reason) = self.check_token_headroom(&key, now) {
+            return self.apply_on_exceed(reason, &key, false);
+        }
+
+        // Burst is taken before the shared counter, the reverse of the
+        // local path's order. The local path consumes a request token
+        // first and refunds it when burst denies, so a request that
+        // never reached an upstream does not drain the request budget;
+        // a fixed-window INCR has no compensating decrement, so the only
+        // way to hold that same invariant here is to learn about burst
+        // contention before spending a window slot. What differs is
+        // which reason a request that trips both sub-budgets reports,
+        // not whether it is admitted.
+        let guard = if let Some(max) = self.burst {
+            match self.acquire_in_flight(&key, max) {
+                Some(guard) => guard,
+                None => return self.apply_on_exceed(AgentBudgetExceedReason::Burst, &key, true),
+            }
+        } else {
+            self.empty_guard()
+        };
+
+        if let Some(rpm) = self.requests_per_minute {
+            if !self.shared_window_admits(&key, rpm).await {
+                // Returning here drops `guard`, which releases the
+                // in-flight permit taken above: a request the shared
+                // counter refuses must not go on holding a burst slot.
+                return self.apply_on_exceed(
+                    AgentBudgetExceedReason::RequestsPerMinute,
+                    &key,
+                    true,
+                );
+            }
+        }
+
+        (AgentBudgetDecision::Allow, guard)
+    }
+
+    /// Increment this agent's shared fixed-window counter and report
+    /// whether the post-increment count is still inside the cap.
+    ///
+    /// **Failure posture: fail open.** A store that errors, or a
+    /// blocking bridge that fails to join, admits the request.
+    /// `RateLimitPolicy::allow_with_info_async` makes the same call for
+    /// the same reason, that a Redis hiccup must not become a
+    /// cluster-wide outage, and matching it is the point: a budget that
+    /// failed closed on the same blip a rate limiter next to it failed
+    /// open on would be behavior no operator could predict. There is no
+    /// fallback to the local bucket either, again matching that policy;
+    /// a store outage suspends the request-rate budget rather than
+    /// quietly swapping in a differently sized one.
+    async fn shared_window_admits(&self, key: &str, rpm: f64) -> bool {
+        let limit = window_limit(rpm);
+        // Bucket on the wall clock rather than on a process-local
+        // `Instant` so every replica derives the same window without
+        // coordinating, and so a replica that started ten minutes later
+        // does not carry its own boundary.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let counter_key = self.window_key(key, now_secs).into_bytes();
+        // One second of slack so the key outlives the window it counts
+        // even when the increment lands on that window's last moment.
+        let ttl = REQUEST_WINDOW_SECS + 1;
+
+        let incr_result: anyhow::Result<i64> = if let Some(async_store) = self.async_store.as_ref()
+        {
+            // Async path: native await, no spawn_blocking tax.
+            async_store.incr_with_ttl(&counter_key, ttl).await
+        } else if let Some(store) = self.store.as_ref() {
+            // Sync fallback for a deployment that has not migrated to
+            // the async handle. The blocking backends issue network I/O,
+            // so the platform helper hands the call to a blocking
+            // thread; a join failure arrives here as an `Err` and takes
+            // the same fail-open branch as any other store failure.
+            incr_with_ttl_async(Arc::clone(store), counter_key, ttl).await
+        } else {
+            // Unreachable: `try_admit_async` returns before calling this
+            // when neither handle is attached. Admitting keeps the dead
+            // arm on the same side as a store error rather than
+            // inventing a denial nobody configured.
+            return true;
+        };
+
+        match incr_result {
+            Ok(count) => (count as u64) <= limit,
+            Err(e) => {
+                tracing::warn!(error = %e, "agent_budget l2 INCR failed, failing open");
+                true
+            }
+        }
+    }
+
+    /// Build the shared request-counter key for `key` at wall-clock
+    /// second `now_secs`.
+    ///
+    /// Format: `sbproxy:ab:<origin-id>:rpm:<agent-key>:<window-start>`,
+    /// where the window start is the epoch second floored to
+    /// [`REQUEST_WINDOW_SECS`]. Flooring is what makes the tier work
+    /// without coordination: two replicas handling requests in the same
+    /// minute derive the same string, and the counter for a closed
+    /// window is simply abandoned to its expiry rather than reset by
+    /// anyone.
+    ///
+    /// The `rpm` segment names which sub-budget the counter belongs to.
+    /// Nothing reads it today, and it is here so that a later
+    /// cluster-shared `tokens_per_hour` can take a segment of its own
+    /// rather than force live per-minute counters into a fresh
+    /// keyspace to make room.
+    fn window_key(&self, key: &str, now_secs: u64) -> String {
+        let window_start = now_secs - (now_secs % REQUEST_WINDOW_SECS);
+        format!("{}rpm:{}:{}", self.key_prefix, key, window_start)
     }
 
     /// Record that `n` upstream tokens were consumed by `agent_id`.
@@ -612,8 +945,31 @@ impl std::fmt::Debug for AgentBudgetPolicy {
             .field("on_anonymous", &self.on_anonymous)
             .field("max_agents", &self.max_agents)
             .field("tracked_agents", &self.in_flight.len())
+            .field("store_attached", &self.store.is_some())
+            .field("async_store_attached", &self.async_store.is_some())
+            .field("key_prefix", &self.key_prefix)
             .finish()
     }
+}
+
+/// Counter-key prefix for one origin's shared budgets.
+///
+/// `ab` rather than `rl`: `rate_limit` owns the `sbproxy:rl:` keyspace,
+/// and an origin that runs both policies against one Redis must not
+/// have them counting into each other's keys.
+fn counter_key_prefix(origin_id: &str) -> String {
+    format!("sbproxy:ab:{origin_id}:")
+}
+
+/// Per-window request cap for the shared fixed-window path.
+///
+/// Deliberately the count the local bucket admits from full rather than
+/// a rounded-up reading of the rate: tokens start at `rpm.max(1.0)` and
+/// every admission needs a whole one, so a fractional rate admits its
+/// floor and a rate of zero still admits one. Attaching a store has to
+/// move where the cap is counted, not what the cap is.
+fn window_limit(rpm: f64) -> u64 {
+    rpm.max(1.0).floor() as u64
 }
 
 fn record_decision(agent_id: &str, outcome: &str) {
@@ -642,6 +998,7 @@ fn record_decision(agent_id: &str, outcome: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn policy(value: serde_json::Value) -> AgentBudgetPolicy {
         AgentBudgetPolicy::from_config(value).expect("config compiles")
@@ -885,11 +1242,91 @@ mod tests {
                 reason: AgentBudgetExceedReason::TokensPerHour
             }
         ));
-        // One hour later the fixed window resets and the agent gets a
-        // fresh budget.
-        let later = start + Duration::from_secs(3601);
-        let (d, _g) = p.try_admit_at(Some("agent"), later);
+        // WOR-2331: one second past the boundary the agent is still
+        // denied. This is the assertion the fixed window failed: it
+        // dropped the whole count at the boundary and admitted a second
+        // full budget, so a caller who spent the cap just before and
+        // just after got close to 2x the configured hourly allowance
+        // while every individual window looked correctly enforced.
+        //
+        // The trailing hour genuinely still contains those 100 tokens,
+        // so the limiter has to say so.
+        let just_after = start + Duration::from_secs(3601);
+        let (d, _g) = p.try_admit_at(Some("agent"), just_after);
+        assert!(
+            matches!(
+                d,
+                AgentBudgetDecision::Deny {
+                    reason: AgentBudgetExceedReason::TokensPerHour
+                }
+            ),
+            "spend must not reset at the window boundary"
+        );
+
+        // Halfway through the next window roughly half the carried spend
+        // has decayed out, so the agent is inside the cap again.
+        let halfway = start + Duration::from_secs(3600 + 1800);
+        let (d, _g) = p.try_admit_at(Some("agent"), halfway);
+        assert_eq!(
+            d,
+            AgentBudgetDecision::Allow,
+            "carried spend must decay across the window, not vanish at its edge"
+        );
+
+        // A full window past the last spend, nothing is carried at all.
+        let fully_past = start + Duration::from_secs(7300);
+        let (d, _g) = p.try_admit_at(Some("agent"), fully_past);
         assert_eq!(d, AgentBudgetDecision::Allow);
+    }
+
+    #[test]
+    fn the_boundary_cannot_be_used_to_spend_twice_the_cap() {
+        // The defect stated as the operator would experience it: spend
+        // the whole hourly cap at the end of one window and try to spend
+        // it again at the start of the next. Under a fixed window both
+        // succeed and the hour straddling the boundary bills ~2x.
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 100,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+
+        p.consume_tokens(Some("agent"), 100);
+        // Cross the boundary by a hair.
+        let just_after = start + Duration::from_secs(3605);
+        let (d, _g) = p.try_admit_at(Some("agent"), just_after);
+        assert!(
+            !d.admits(),
+            "the second full budget is what the fixed window handed out"
+        );
+    }
+
+    #[test]
+    fn spend_decays_rather_than_stepping() {
+        // Pins the shape of the approximation, not just its endpoints:
+        // the carried count comes out linearly across the window instead
+        // of dropping to zero in one step. Written against a cap the
+        // spend sits exactly on, so the admit flips precisely when
+        // enough has decayed.
+        let p = policy(serde_json::json!({
+            "tokens_per_hour": 60,
+            "on_exceed": "deny"
+        }));
+        let start = Instant::now();
+        p.consume_tokens(Some("agent"), 60);
+
+        // A quarter into the next window, 75% of the spend is still
+        // carried: 45 of 60, under the cap.
+        let quarter = start + Duration::from_secs(3600 + 900);
+        assert_eq!(
+            p.try_admit_at(Some("agent"), quarter).0,
+            AgentBudgetDecision::Allow
+        );
+
+        // But immediately after the boundary essentially all of it is
+        // still carried.
+        let sliver = start + Duration::from_secs(3600 + 1);
+        assert!(!p.try_admit_at(Some("agent"), sliver).0.admits());
     }
 
     #[test]
@@ -1008,5 +1445,304 @@ mod tests {
             AgentBudgetPolicy::from_config(serde_json::json!({"requests_per_minute": -1.0}))
                 .is_err()
         );
+    }
+
+    // --- WOR-2315: cluster-shared requests_per_minute ---
+
+    /// Store double that counts per key the way Redis `INCR` does, over
+    /// both the sync and the async trait, so one fake covers every
+    /// attach shape the policy supports.
+    ///
+    /// Counting per key rather than globally is what gives the
+    /// two-replica test its teeth: instances that derived different keys
+    /// would each get a full budget and the test would fail, which is
+    /// precisely the defect being fixed. `fail` turns every increment
+    /// into an error, which is what a Redis blip looks like from here.
+    struct CountingStore {
+        counts: Mutex<HashMap<String, i64>>,
+        calls: AtomicU32,
+        fail: bool,
+    }
+
+    impl CountingStore {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                counts: Mutex::new(HashMap::new()),
+                calls: AtomicU32::new(0),
+                fail: false,
+            })
+        }
+
+        fn failing() -> Arc<Self> {
+            Arc::new(Self {
+                counts: Mutex::new(HashMap::new()),
+                calls: AtomicU32::new(0),
+                fail: true,
+            })
+        }
+
+        /// Every distinct counter key the store has seen, sorted.
+        fn keys(&self) -> Vec<String> {
+            let mut keys: Vec<String> = self.counts.lock().keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+
+        /// How many increments reached the store, error or not.
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::Acquire)
+        }
+
+        fn bump(&self, key: &[u8]) -> anyhow::Result<i64> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail {
+                anyhow::bail!("store unreachable");
+            }
+            let mut counts = self.counts.lock();
+            let entry = counts
+                .entry(String::from_utf8_lossy(key).into_owned())
+                .or_insert(0);
+            *entry += 1;
+            Ok(*entry)
+        }
+    }
+
+    impl KVStore for CountingStore {
+        fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn scan_prefix(&self, _prefix: &[u8]) -> anyhow::Result<Vec<(bytes::Bytes, bytes::Bytes)>> {
+            Ok(Vec::new())
+        }
+        fn incr_with_ttl(&self, key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            self.bump(key)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AsyncKVStore for CountingStore {
+        async fn get(&self, _key: &[u8]) -> anyhow::Result<Option<bytes::Bytes>> {
+            Ok(None)
+        }
+        async fn put(&self, _key: &[u8], _value: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn put_with_ttl(
+            &self,
+            _key: &[u8],
+            _value: &[u8],
+            _ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn incr_with_ttl(&self, key: &[u8], _ttl_secs: u64) -> anyhow::Result<i64> {
+            self.bump(key)
+        }
+        async fn delete(&self, _key: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_async_path_is_the_local_path() {
+        // The single-node deployment, which must not notice this change
+        // at all: same cap, same reason, same anonymous handling the
+        // sync entry point has always had.
+        let p = policy(serde_json::json!({
+            "requests_per_minute": 2,
+            "on_exceed": "deny"
+        }));
+        let (d1, _g1) = p.try_admit_async(Some("cursor")).await;
+        let (d2, _g2) = p.try_admit_async(Some("cursor")).await;
+        let (d3, _g3) = p.try_admit_async(Some("cursor")).await;
+        assert_eq!(d1, AgentBudgetDecision::Allow);
+        assert_eq!(d2, AgentBudgetDecision::Allow);
+        assert!(matches!(
+            d3,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::RequestsPerMinute
+            }
+        ));
+        let (anon, _g4) = p.try_admit_async(None).await;
+        assert_eq!(anon, AgentBudgetDecision::SkippedAnonymous);
+    }
+
+    #[tokio::test]
+    async fn two_replicas_sharing_a_store_enforce_one_combined_cap() {
+        // The defect this change fixes. Before it, each instance held
+        // its own bucket of 2, so the pair admitted 4 against a
+        // configured cap of 2, and a ten-pod deployment multiplied every
+        // operator's number by ten.
+        let store = CountingStore::new();
+        let attach = |p: AgentBudgetPolicy| {
+            p.with_async_store(
+                Some(Arc::clone(&store) as Arc<dyn AsyncKVStore>),
+                "origin-a",
+            )
+        };
+        let replica_a = attach(policy(serde_json::json!({
+            "requests_per_minute": 2,
+            "on_exceed": "deny"
+        })));
+        let replica_b = attach(policy(serde_json::json!({
+            "requests_per_minute": 2,
+            "on_exceed": "deny"
+        })));
+
+        let (d1, _g1) = replica_a.try_admit_async(Some("claude-code-cli")).await;
+        let (d2, _g2) = replica_b.try_admit_async(Some("claude-code-cli")).await;
+        let (d3, _g3) = replica_a.try_admit_async(Some("claude-code-cli")).await;
+        let (d4, _g4) = replica_b.try_admit_async(Some("claude-code-cli")).await;
+        assert_eq!(d1, AgentBudgetDecision::Allow);
+        assert_eq!(d2, AgentBudgetDecision::Allow);
+        assert!(
+            matches!(
+                d3,
+                AgentBudgetDecision::Deny {
+                    reason: AgentBudgetExceedReason::RequestsPerMinute
+                }
+            ),
+            "the third request in the window must be refused whichever replica takes it"
+        );
+        assert!(matches!(d4, AgentBudgetDecision::Deny { .. }));
+
+        // One key, not one per replica. The fake counts per key, so a
+        // pair that derived different keys would each have had a full
+        // budget and the assertions above could not have held.
+        assert_eq!(
+            store.keys().len(),
+            1,
+            "replicas must share one counter, saw {:?}",
+            store.keys()
+        );
+
+        // A different agent still has a budget of its own.
+        let (other, _g5) = replica_a.try_admit_async(Some("cursor")).await;
+        assert_eq!(other, AgentBudgetDecision::Allow);
+    }
+
+    #[test]
+    fn the_window_key_rolls_over_on_the_epoch_boundary() {
+        // A `None` handle still names the origin, which is all the key
+        // derivation needs.
+        let p = policy(serde_json::json!({ "requests_per_minute": 60 }))
+            .with_async_store(None, "origin-a");
+        // 1_700_000_040 is a minute boundary and 1_700_000_099 is the
+        // last second before the next one.
+        let first = p.window_key("claude-code-cli", 1_700_000_040);
+        let last = p.window_key("claude-code-cli", 1_700_000_099);
+        let rolled = p.window_key("claude-code-cli", 1_700_000_100);
+        assert_eq!(first, "sbproxy:ab:origin-a:rpm:claude-code-cli:1700000040");
+        assert_eq!(
+            last, first,
+            "every second inside one minute counts into one key"
+        );
+        assert_eq!(rolled, "sbproxy:ab:origin-a:rpm:claude-code-cli:1700000100");
+    }
+
+    #[tokio::test]
+    async fn a_store_error_admits_the_request_the_way_rate_limit_does() {
+        // Fail open, the posture `RateLimitPolicy::allow_with_info_async`
+        // takes on the same failure. A budget that failed closed while
+        // the rate limiter beside it failed open would be behavior an
+        // operator cannot predict, and it would turn a Redis blip into a
+        // cluster-wide outage rather than a degraded budget.
+        let store = CountingStore::failing();
+        let p = policy(serde_json::json!({
+            "requests_per_minute": 1,
+            "on_exceed": "deny"
+        }))
+        .with_async_store(
+            Some(Arc::clone(&store) as Arc<dyn AsyncKVStore>),
+            "origin-a",
+        );
+
+        for i in 0..5 {
+            let (d, _g) = p.try_admit_async(Some("agent")).await;
+            assert_eq!(
+                d,
+                AgentBudgetDecision::Allow,
+                "request {i} must be admitted while the store is down"
+            );
+        }
+        // Every one of them reached the store, so admission is not
+        // quietly falling back to the local bucket, which under this cap
+        // of 1 would have refused the second request.
+        assert_eq!(store.calls(), 5);
+    }
+
+    #[tokio::test]
+    async fn the_sync_store_enforces_the_same_shared_window() {
+        // `with_store` is the pre-async handle the pipeline attaches
+        // alongside the async one. It reaches the same keyspace through
+        // `spawn_blocking`, so a deployment carrying only the sync
+        // handle is clustered too.
+        let store = CountingStore::new();
+        let p = policy(serde_json::json!({
+            "requests_per_minute": 1,
+            "on_exceed": "deny"
+        }))
+        .with_store(Some(Arc::clone(&store) as Arc<dyn KVStore>), "origin-a");
+
+        let (d1, _g1) = p.try_admit_async(Some("agent")).await;
+        let (d2, _g2) = p.try_admit_async(Some("agent")).await;
+        assert_eq!(d1, AgentBudgetDecision::Allow);
+        assert!(matches!(
+            d2,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::RequestsPerMinute
+            }
+        ));
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        assert_eq!(store.keys(), vec![p.window_key("agent", now_secs)]);
+    }
+
+    #[tokio::test]
+    async fn a_burst_denial_does_not_spend_a_shared_window_slot() {
+        // The clustered mirror of
+        // `denied_burst_does_not_drain_request_budget`. The local path
+        // consumes a request token and refunds it when burst denies; a
+        // fixed-window increment cannot be refunded, so the shared path
+        // consults burst first and spends a window slot only for a
+        // request that got past it.
+        let store = CountingStore::new();
+        let p = policy(serde_json::json!({
+            "requests_per_minute": 10,
+            "burst": 1,
+            "on_exceed": "deny"
+        }))
+        .with_async_store(
+            Some(Arc::clone(&store) as Arc<dyn AsyncKVStore>),
+            "origin-a",
+        );
+
+        let (d1, g1) = p.try_admit_async(Some("agent")).await;
+        let (d2, _g2) = p.try_admit_async(Some("agent")).await;
+        assert_eq!(d1, AgentBudgetDecision::Allow);
+        assert!(matches!(
+            d2,
+            AgentBudgetDecision::Deny {
+                reason: AgentBudgetExceedReason::Burst
+            }
+        ));
+        assert_eq!(
+            store.calls(),
+            1,
+            "the burst-denied request must not have touched the shared counter"
+        );
+
+        // The admitted request's permit still releases on drop.
+        drop(g1);
+        assert_eq!(p.in_flight_count("agent"), 0);
     }
 }
