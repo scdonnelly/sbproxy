@@ -49,68 +49,237 @@ use wasmtime::{
     StoreLimitsBuilder, Trap,
 };
 use wasmtime_wasi::p1::WasiP1Ctx;
-use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe, SinkOutputStream};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError};
 
 /// Per-invocation cap on captured WASM stderr, in bytes.
 const STDERR_CAPTURE_LIMIT: usize = 1024 * 1024;
 
-/// `Write` adapter that buffers WASM-emitted stderr, emits each
-/// completed line via `tracing::debug!`, and drops bytes past
-/// `STDERR_CAPTURE_LIMIT` so a runaway module cannot exhaust host
-/// memory or flood the host log pipeline.
-#[derive(Default)]
-struct StderrCapture {
-    line_buf: Vec<u8>,
-    written: usize,
+/// Identity a captured guest diagnostic line is attributed to.
+///
+/// One `WasmRuntime` is shared by every hook in a bundle, so the
+/// identity travels with the call rather than with the runtime.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WasmGuestIdentity<'a> {
+    /// Bundle the module was loaded from.
+    pub(crate) bundle: &'a str,
+    /// Hook kind label (`policy`, `transform`, `action`, ...).
+    pub(crate) hook_kind: &'a str,
+    /// Operator-facing `type:` string the hook is attached as.
+    pub(crate) type_name: &'a str,
+}
+
+/// Bounded, non-trapping stderr sink for the envelope bundle path.
+///
+/// WOR-2364 §1: the envelope path used to hand the guest a
+/// `SinkOutputStream`, so a WASM policy that refused a request could
+/// not tell the operator why and every guest failure looked identical
+/// from outside. OPA's WASM ABI makes a diagnostic channel a *required*
+/// host import for exactly this reason.
+///
+/// `MemoryOutputPipe` is the obvious off-the-shelf choice and is the
+/// wrong one: it returns `StreamError::Trap` past its capacity, so a
+/// chatty guest would be killed by its own logging. This caps, marks
+/// the truncation, and drops the overflow rather than failing the call.
+///
+/// It serves **both** module ABIs. `wasi_common`'s `WritePipe` wants a
+/// `std::io::Write` and the WASIp2 path wants an `OutputStream`;
+/// interior mutability satisfies both, so the legacy `type: wasm`
+/// transform and the config-loaded bundle get the same cap, the same
+/// truncation marker, and the same failed-means-warn rule instead of
+/// two near-identical captors that drifted apart.
+#[derive(Debug, Clone)]
+struct BoundedStderrPipe {
+    buffer: Arc<Mutex<BoundedStderrBuffer>>,
+}
+
+#[derive(Debug, Default)]
+struct BoundedStderrBuffer {
+    bytes: Vec<u8>,
     truncated: bool,
 }
 
-impl StderrCapture {
-    fn flush_lines(&mut self) {
-        while let Some(idx) = self.line_buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.line_buf.drain(..=idx).collect();
-            let line = &line[..line.len() - 1];
-            let line = String::from_utf8_lossy(line);
-            tracing::debug!(target: "sbproxy::wasm::stderr", "{}", line);
+impl BoundedStderrPipe {
+    fn new() -> Self {
+        Self {
+            buffer: Arc::new(Mutex::new(BoundedStderrBuffer::default())),
         }
     }
 
-    fn finish(&mut self) {
-        if !self.line_buf.is_empty() {
-            let line = std::mem::take(&mut self.line_buf);
-            let line = String::from_utf8_lossy(&line);
-            tracing::debug!(target: "sbproxy::wasm::stderr", "{}", line);
+    /// Append what fits under the cap and mark the rest as dropped.
+    /// Never fails: overflow is discarded rather than reported, so the
+    /// guest is never punished for writing diagnostics.
+    fn append(&self, bytes: &[u8]) {
+        let mut guard = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remaining = STDERR_CAPTURE_LIMIT.saturating_sub(guard.bytes.len());
+        if remaining < bytes.len() {
+            guard.truncated = true;
         }
-        if self.truncated {
-            tracing::debug!(
-                target: "sbproxy::wasm::stderr",
-                "WASM stderr truncated: module wrote past the {} byte per-call cap",
-                STDERR_CAPTURE_LIMIT
-            );
+        let take = remaining.min(bytes.len());
+        guard.bytes.extend_from_slice(&bytes[..take]);
+    }
+
+    /// Emit every captured line under the hook's identity and return
+    /// how many lines were emitted.
+    ///
+    /// `failed` selects the level, and it is the whole reason this is
+    /// useful in production. The workspace enables
+    /// `tracing/release_max_level_info`, which compile-strips `debug!`
+    /// out of release builds, so a capture that only ever emitted at
+    /// debug would be a no-op in the binary operators actually run:
+    /// they would set `--log-level debug`, get nothing, and be exactly
+    /// where they started. A guest that failed is precisely when its
+    /// diagnostics are worth a line, so those go out at `warn` and
+    /// survive; a healthy guest's chatter stays at `debug`, where it
+    /// costs nothing in release.
+    fn drain_to_log(&self, identity: WasmGuestIdentity<'_>, failed: bool) -> usize {
+        let mut guard = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let truncated = guard.truncated;
+        let bytes = std::mem::take(&mut guard.bytes);
+        guard.truncated = false;
+        drop(guard);
+
+        let mut lines = 0;
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            lines += 1;
+            let line = String::from_utf8_lossy(line);
+            if failed {
+                tracing::warn!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "{line}",
+                );
+            } else {
+                tracing::debug!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "{line}",
+                );
+            }
         }
+        if truncated {
+            // Same level as the lines themselves. A warn stream that
+            // ends mid-thought with the "and there was more" marker
+            // compiled out gives the operator no reason to suspect a
+            // cap.
+            if failed {
+                tracing::warn!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "WASM stderr truncated: guest wrote past the {} byte per-call cap",
+                    STDERR_CAPTURE_LIMIT,
+                );
+            } else {
+                tracing::debug!(
+                    target: "sbproxy::wasm::stderr",
+                    bundle = identity.bundle,
+                    hook_kind = identity.hook_kind,
+                    type_name = identity.type_name,
+                    "WASM stderr truncated: guest wrote past the {} byte per-call cap",
+                    STDERR_CAPTURE_LIMIT,
+                );
+            }
+        }
+        lines
     }
 }
 
-impl Write for StderrCapture {
+impl Write for BoundedStderrPipe {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let reported = buf.len();
-        let remaining = STDERR_CAPTURE_LIMIT.saturating_sub(self.written);
-        if remaining == 0 {
-            self.truncated = true;
-            return Ok(reported);
-        }
-        let take = remaining.min(buf.len());
-        self.line_buf.extend_from_slice(&buf[..take]);
-        self.written += take;
-        if take < buf.len() {
-            self.truncated = true;
-        }
-        self.flush_lines();
-        Ok(reported)
+        self.append(buf);
+        // Report the full length. The bytes past the cap are dropped on
+        // purpose, and a short write would make the guest retry them.
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl OutputStream for BoundedStderrPipe {
+    fn write(&mut self, bytes: bytes::Bytes) -> Result<(), StreamError> {
+        // Always `Ok`: dropping the overflow is the point. Returning an
+        // error here would trap the guest for logging too much, which
+        // is how `MemoryOutputPipe` behaves and why it is not used.
+        self.append(&bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), StreamError> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> Result<usize, StreamError> {
+        // Never report closed. A full buffer still accepts and discards
+        // writes, so the guest never sees back pressure from a channel
+        // that exists only for the host's benefit.
+        Ok(usize::MAX)
+    }
+}
+
+#[async_trait::async_trait]
+impl Pollable for BoundedStderrPipe {
+    async fn ready(&mut self) {}
+}
+
+impl tokio::io::AsyncWrite for BoundedStderrPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        self.append(buf);
+        // Report the full length as written. The bytes past the cap are
+        // deliberately dropped, and a short write would make the guest
+        // retry them forever.
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl wasmtime_wasi::cli::IsTerminal for BoundedStderrPipe {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl wasmtime_wasi::cli::StdoutStream for BoundedStderrPipe {
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
     }
 }
 
@@ -334,6 +503,10 @@ pub struct WasmRuntime {
     bundle_instance_pre: Option<InstancePre<EnvelopeHostState>>,
     bundle_limits: Option<WasmBundleLimits>,
     last_retained_stdout_bytes: AtomicUsize,
+    /// Lines of guest stderr emitted by the most recent envelope call.
+    /// Read by tests so the diagnostic channel can be asserted without
+    /// installing a tracing subscriber.
+    last_guest_stderr_lines: AtomicUsize,
 }
 
 impl std::fmt::Debug for WasmRuntime {
@@ -398,6 +571,7 @@ impl WasmRuntime {
             module,
             bundle_instance_pre: None,
             bundle_limits: None,
+            last_guest_stderr_lines: AtomicUsize::new(0),
             last_retained_stdout_bytes: AtomicUsize::new(0),
         })
     }
@@ -433,6 +607,7 @@ impl WasmRuntime {
             bundle_instance_pre: Some(instance_pre),
             bundle_limits: Some(limits),
             last_retained_stdout_bytes: AtomicUsize::new(0),
+            last_guest_stderr_lines: AtomicUsize::new(0),
         })
     }
 
@@ -487,11 +662,14 @@ impl WasmRuntime {
         let stdin = ReadPipe::from(input.to_vec());
         let stdout = WritePipe::new_in_memory();
 
-        // Per-invocation stderr capture (M3): module-emitted stderr is
-        // routed to `tracing::debug!` and bounded to STDERR_CAPTURE_LIMIT
-        // bytes so a misbehaving module cannot DoS the host or forge log
-        // entries on the host's stderr stream.
-        let stderr: WritePipe<StderrCapture> = WritePipe::new(StderrCapture::default());
+        // Per-invocation stderr capture, bounded to
+        // STDERR_CAPTURE_LIMIT bytes so a misbehaving module cannot DoS
+        // the host or forge log entries on the host's stderr stream.
+        // Same type the envelope bundle path uses, so both ABIs get the
+        // same cap, the same truncation marker, and the same
+        // failed-means-warn rule.
+        let stderr_capture = BoundedStderrPipe::new();
+        let stderr: WritePipe<BoundedStderrPipe> = WritePipe::new(stderr_capture.clone());
 
         let wasi = WasiCtxBuilder::new()
             .stdin(Box::new(stdin))
@@ -539,19 +717,23 @@ impl WasmRuntime {
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| anyhow::anyhow!("module is missing the WASI `_start` export: {e:?}"))?;
 
-        start
-            .call(&mut store, ())
-            .map_err(|e| anyhow::anyhow!("WASM execution failed: {e:?}"))?;
+        let call_result = start.call(&mut store, ());
 
         // Drop the store so the WritePipe handle's reference count
         // drops to one and we can take its inner buffer.
         drop(store);
 
-        // Drain any trailing partial line and emit a truncation marker
-        // if the module exceeded the per-call cap.
-        if let Ok(mut capture) = stderr.try_into_inner() {
-            capture.finish();
-        }
+        // Drain before propagating. This used to sit after a `?` on the
+        // call above, so a module that trapped, which is exactly the
+        // module whose stderr explains the trap, lost its diagnostics
+        // entirely: no trailing line, no truncation marker, nothing.
+        let identity = WasmGuestIdentity {
+            bundle: "",
+            hook_kind: "transform",
+            type_name: "wasm",
+        };
+        stderr_capture.drain_to_log(identity, call_result.is_err());
+        call_result.map_err(|e| anyhow::anyhow!("WASM execution failed: {e:?}"))?;
 
         let buf = stdout
             .try_into_inner()
@@ -572,22 +754,32 @@ impl WasmRuntime {
                     .ok_or(WasmCallFailure::HostFailure)?,
             )
             .ok_or(WasmCallFailure::HostFailure)?;
-        self.execute_bounded_until(input, Arc::new(WasmExecutionControl::new(deadline)))
+        self.execute_bounded_until(
+            input,
+            Arc::new(WasmExecutionControl::new(deadline)),
+            WasmGuestIdentity {
+                bundle: "test",
+                hook_kind: "test",
+                type_name: "test",
+            },
+        )
     }
 
     pub(crate) fn execute_bounded_until(
         &self,
         input: &[u8],
         execution: Arc<WasmExecutionControl>,
+        identity: WasmGuestIdentity<'_>,
     ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
         self.bundle_limits.ok_or(WasmCallFailure::HostFailure)?;
-        self.execute_bounded_inner(input, execution)
+        self.execute_bounded_inner(input, execution, identity)
     }
 
     fn execute_bounded_inner(
         &self,
         input: &[u8],
         execution: Arc<WasmExecutionControl>,
+        identity: WasmGuestIdentity<'_>,
     ) -> std::result::Result<Vec<u8>, WasmCallFailure> {
         if let Some(reason) = execution.stop_reason() {
             return Err(reason);
@@ -605,11 +797,15 @@ impl WasmRuntime {
             .checked_add(1)
             .ok_or(WasmCallFailure::HostFailure)?;
         let stdout = MemoryOutputPipe::new(capacity);
+        // WOR-2364 §1: the bundle path is the extensibility story we
+        // tell operators, and it was the one dropping guest
+        // diagnostics while the internal module path kept them.
+        let stderr = BoundedStderrPipe::new();
         let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
         wasi_builder
             .stdin(MemoryInputPipe::new(input.to_vec()))
             .stdout(stdout.clone())
-            .stderr(SinkOutputStream);
+            .stderr(stderr.clone());
         let wasi = wasi_builder.build_p1();
         let limits_tracker = TrackingLimits {
             inner: envelope_store_limits(limits),
@@ -645,13 +841,36 @@ impl WasmRuntime {
         let memory_denied = store.data().limits.memory_denied;
         let table_denied = store.data().limits.table_denied;
         drop(store);
+        // Resolve stdout before draining stderr, so the output-cap trip
+        // is known while deciding the diagnostic level. A guest that
+        // overran its output cap and exited cleanly is a failure the
+        // caller sees as `output_limit`, and its stderr is the only
+        // thing that explains what it was trying to emit.
         let output = stdout
             .try_into_inner()
             .ok_or(WasmCallFailure::HostFailure)?
             .freeze();
         self.last_retained_stdout_bytes
             .store(output.len(), Ordering::Relaxed);
-        if output.len() > limits.max_output_bytes {
+        let output_too_large = output.len() > limits.max_output_bytes;
+
+        // Drain before any of the limit checks below return early: a
+        // guest that tripped a cap is exactly the one whose stderr
+        // explains why, and a trap on the refusal path is the case
+        // WOR-2364 opened this on.
+        //
+        // A clean `proc_exit(0)` surfaces as an `Err` carrying `I32Exit`
+        // and is the normal way a WASI command returns, so it is not a
+        // failure and its chatter stays at debug.
+        let failed = memory_denied
+            || table_denied
+            || output_too_large
+            || call_result
+                .as_ref()
+                .is_err_and(|error| !is_successful_exit(error));
+        self.last_guest_stderr_lines
+            .store(stderr.drain_to_log(identity, failed), Ordering::Relaxed);
+        if output_too_large {
             return Err(WasmCallFailure::OutputLimit);
         }
         if memory_denied {
@@ -674,6 +893,11 @@ impl WasmRuntime {
     #[cfg(test)]
     pub(crate) fn last_retained_stdout_bytes(&self) -> usize {
         self.last_retained_stdout_bytes.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_guest_stderr_lines(&self) -> usize {
+        self.last_guest_stderr_lines.load(Ordering::Relaxed)
     }
 }
 
@@ -1233,50 +1457,6 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);
-    }
-
-    #[test]
-    fn stderr_capture_truncates_at_limit() {
-        // M3 regression: a runaway module writing 10 MiB to stderr must
-        // be capped at STDERR_CAPTURE_LIMIT bytes so the host's memory
-        // and log pipeline are unaffected. We exercise the captor
-        // directly because the WAT echo fixture does not write to
-        // stderr; the captor is what bounds host impact regardless of
-        // the module producing it.
-        let mut capture = StderrCapture::default();
-        let chunk = vec![b'x'; 64 * 1024];
-        let written_chunks = (10 * 1024 * 1024) / chunk.len();
-        for _ in 0..written_chunks {
-            // Returned `n` must always equal the input length so the
-            // module believes its writes succeeded; otherwise WASI
-            // surfaces a write error and the trap escapes to the host.
-            let n = capture.write(&chunk).unwrap();
-            assert_eq!(n, chunk.len());
-        }
-        assert!(
-            capture.truncated,
-            "10 MiB write must trip the truncation flag"
-        );
-        assert!(
-            capture.written <= STDERR_CAPTURE_LIMIT,
-            "captured bytes {} exceeded cap {}",
-            capture.written,
-            STDERR_CAPTURE_LIMIT
-        );
-        capture.finish();
-    }
-
-    #[test]
-    fn stderr_capture_emits_lines() {
-        let mut capture = StderrCapture::default();
-        capture
-            .write_all(b"first line\nsecond line\npartial")
-            .unwrap();
-        // Two complete lines have been flushed; the trailing fragment
-        // is buffered until finish() is called.
-        assert!(!capture.truncated);
-        assert_eq!(capture.line_buf, b"partial");
-        capture.finish();
     }
 
     // --- Agent-class input builder tests ---

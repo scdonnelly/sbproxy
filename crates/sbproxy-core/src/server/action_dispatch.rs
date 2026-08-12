@@ -1015,8 +1015,9 @@ pub(super) async fn handle_action(
                     let workspace_id = pipeline.config.origins[origin_idx].workspace_id.to_string();
                     let verdict_ctx = PolicyVerdictCtx {
                         request_id: ctx.request_id.to_string(),
-                        tenant_id: workspace_id.clone(),
                         workspace_id,
+                        origin: pipeline.config.origins[origin_idx].origin_id.to_string(),
+                        tenant: ctx.tenant_id.to_string(),
                     };
                     if let Some((status, message, policy_type)) = check_buffered_dynamic_policies(
                         enforcers,

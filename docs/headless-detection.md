@@ -1,5 +1,5 @@
 # Headless detection
-*Last modified: 2026-06-18*
+*Last modified: 2026-08-12*
 
 Header-only heuristics that flag headless and stealth-browser clients even when their TLS / JA4 fingerprint matches a real browser. Pairs with the rule-based agent detection (`request.agent.score`) and the JA4 scorer.
 
@@ -108,8 +108,8 @@ back:
 ```yaml
 transforms:
   - type: cel
-    response_headers:
-      x-ja4: request.tls.ja4
+    headers:
+      - { op: set, name: x-ja4, value_expr: "request.tls.ja4" }
 ```
 
 Then send one request from the client you want to catalogue and record
