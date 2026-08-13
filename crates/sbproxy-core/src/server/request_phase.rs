@@ -3943,6 +3943,7 @@ pub(super) async fn request_filter(
                         ctx.hostname.as_str(),
                         session.req_header(),
                         cache_cfg,
+                        origin.cache_config_fingerprint.as_str(),
                     );
                     let invalidate_origin = origin.origin_id.to_string();
                     tokio::spawn(async move {
@@ -3986,6 +3987,7 @@ pub(super) async fn request_filter(
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    origin.cache_config_fingerprint.as_str(),
                     key_plan.as_ref(),
                 );
                 // `skip_lookup` goes upstream for *this* request while
@@ -4023,6 +4025,34 @@ pub(super) async fn request_filter(
                     .map_err(|e| {
                         Error::because(ErrorType::InternalError, "cache lookup join failed", e)
                     })?
+                };
+
+                // WOR-2407: refuse an entry another config stored.
+                // The key already carries this origin's fingerprint, so
+                // under an exact-keyed backend this cannot fire. It can
+                // on the two that match a digest of the key rather than
+                // the key: memcached hashes to fit its 250-byte limit,
+                // and the file store names entries by the SHA-256 of
+                // the key. Counted apart from an ordinary miss so a
+                // rolling change reads as a rollout on the dashboard
+                // rather than as a cache that went cold unexplained.
+                let hit = match hit {
+                    Ok(Some(entry))
+                        if !entry.serves_config(origin.cache_config_fingerprint.as_str()) =>
+                    {
+                        sbproxy_observe::metrics::record_cache(
+                            origin.origin_id.as_ref(),
+                            "config_miss",
+                        );
+                        tracing::debug!(
+                            origin = %origin.origin_id,
+                            stored = %entry.config_fp,
+                            current = %origin.cache_config_fingerprint,
+                            "cache entry belongs to another config revision; treating as a miss"
+                        );
+                        Ok(None)
+                    }
+                    other => other,
                 };
 
                 match hit {
