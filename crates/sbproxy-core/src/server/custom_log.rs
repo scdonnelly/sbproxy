@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use pingora_proxy::Session;
-use sbproxy_extension::cel::CompiledCel;
+use sbproxy_extension::cel::{CelSurface, CompiledCel};
 
 use crate::context::RequestContext;
 
@@ -106,6 +106,7 @@ fn compile_scope(
             continue;
         }
         let compiled = CompiledCel::compile(
+            CelSurface::CustomLogField,
             format!("{scope}: custom log field `{}`", field.name),
             source,
         )?;
