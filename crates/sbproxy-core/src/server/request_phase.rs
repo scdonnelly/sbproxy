@@ -103,6 +103,19 @@ fn request_requires_graphql_replay(
             })
         })
         .map(|rule| &rule.action);
+    // An unevaluable matcher makes the preview ambiguous, and the safe
+    // reading is that validation may be pending. Assuming the base
+    // action here would let the idempotency pre-check serve a cached
+    // response before the current GraphQL action has validated it,
+    // which is the replay this flag exists to prevent.
+    if forwarded_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return true;
+    }
     let effective_action = forwarded_action.or_else(|| pipeline.actions.get(origin_idx));
 
     matches!(
@@ -137,6 +150,18 @@ fn request_uses_ai_owned_replay_paths(
             })
         })
         .map(|rule| &rule.action);
+    // Same reasoning as the GraphQL preview above: when the rule set
+    // holds a matcher this path cannot evaluate, claim the AI-owned
+    // reading rather than the base action's, so the idempotency
+    // middleware does not serve cached bytes ahead of the guardrails.
+    if forwarded_action.is_none()
+        && pipeline
+            .forward_rules
+            .get(origin_idx)
+            .is_some_and(|rules| crate::pipeline::forward_rules_need_full_matching(rules))
+    {
+        return true;
+    }
     action_uses_ai_owned_replay_paths(forwarded_action.or_else(|| pipeline.actions.get(origin_idx)))
 }
 
@@ -4444,6 +4469,24 @@ pub(super) async fn request_filter(
         // forward rules to match against.
         let request_path = session.req_header().uri.path().to_string();
         let request_query = session.req_header().uri.query().map(|q| q.to_string());
+        // Built once for the whole rule set, and only when some entry
+        // actually declares a `when`. Routing runs on every request, so
+        // an origin with no predicate must not pay to assemble a CEL
+        // context it will never read.
+        let cel_ctx = fwd_rules
+            .iter()
+            .flat_map(|rule| rule.matchers.iter())
+            .any(|entry| entry.when.is_some())
+            .then(|| {
+                sbproxy_extension::cel::context::build_request_context(
+                    session.req_header().method.as_str(),
+                    &request_path,
+                    &session.req_header().headers,
+                    request_query.as_deref(),
+                    ctx.client_ip.map(|ip| ip.to_string()).as_deref(),
+                    &ctx.hostname,
+                )
+            });
         for (rule_idx, fwd_rule) in fwd_rules.iter().enumerate() {
             // Each `MatcherEntry` ANDs method/path/header/query/body;
             // entries in the list are ORed. `match_request_with_body`
@@ -4458,6 +4501,7 @@ pub(super) async fn request_filter(
                     request_query.as_deref(),
                     request_headers,
                     matched_body.as_deref(),
+                    cel_ctx.as_ref(),
                 )
             });
             if let Some(params) = captured {
