@@ -1105,11 +1105,74 @@ fn build_response_cache_key(
     req: &pingora_http::RequestHeader,
     cfg: &sbproxy_config::ResponseCacheConfig,
 ) -> String {
+    build_response_cache_key_with_plan(workspace, hostname, req, cfg, None)
+}
+
+/// As [`build_response_cache_key`], with an optional `cache.key` plan
+/// folded in.
+///
+/// The plan reaches **only** the vary fingerprint, the last segment of
+/// `<workspace>:<hostname>:<method>:<path>:<query>:<vary>`. Every
+/// preceding segment is stamped by the host from values the request
+/// resolved to, whatever the event returns.
+///
+/// That is the whole poisoning defense, and it is structural rather than
+/// advisory: a key policy that omits a dimension it should have included
+/// serves one tenant's response to another, so there is deliberately no
+/// document a policy can return that reaches the workspace prefix. It
+/// can narrow a key by adding dimensions; it cannot widen one.
+pub(crate) fn build_response_cache_key_with_plan(
+    workspace: &str,
+    hostname: &str,
+    req: &pingora_http::RequestHeader,
+    cfg: &sbproxy_config::ResponseCacheConfig,
+    plan: Option<&sbproxy_cache::cache_event::CacheKeyPlan>,
+) -> String {
     let method = req.method.as_str();
     let path = req.uri.path();
     let query = req.uri.query();
     let mode = query_mode_from_config(&cfg.query_normalize);
-    let vary = collect_vary_headers(req, &cfg.vary);
+    let mut vary = collect_vary_headers(req, &cfg.vary);
+    if let Some(plan) = plan {
+        // Added to the configured `vary:`, never replacing it: an
+        // operator's static dimensions stay in the key whatever the
+        // event says.
+        // Appended in sorted order rather than sorting the merged list.
+        //
+        // `fold_into_vary` already sorts its own output, and
+        // `vary_fingerprint` hashes pairs in order, so this gives the
+        // property that matters, a declining policy and an absent one
+        // produce the same key, without re-ordering the operator's
+        // static `vary:` entries. Sorting the merged list would change
+        // the key of every existing multi-entry `vary:` config on
+        // deploy: a cold cache, an origin load spike, and with a Redis
+        // or file store the old entries holding space until their TTLs
+        // expire, none of which anything would have warned about.
+        vary.extend(plan.fold_into_vary(
+            |name| match name {
+                "query" => query.unwrap_or_default().to_owned(),
+                // Unreachable from a decoded plan: `decode_cache_key`
+                // refuses every unprefixed name outside
+                // `CACHE_VARY_HOST_DIMENSIONS`, and this arm covers the
+                // same set.
+                //
+                // It resolves to the name itself rather than to the
+                // empty string on purpose. An empty value is the
+                // silently-partitions-nothing failure this whole design
+                // refuses names to prevent, so if the two lists ever
+                // drift, the dimension still varies the key by its own
+                // name instead of quietly collapsing every caller into
+                // one entry. A useless key beats a shared one.
+                other => other.to_owned(),
+            },
+            |header| {
+                req.headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            },
+        ));
+    }
     sbproxy_cache::compute_cache_key(workspace, hostname, method, path, query, &mode, &vary)
 }
 

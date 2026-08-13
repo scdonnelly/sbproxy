@@ -524,6 +524,116 @@ async fn drain_body_for_signature_verification(
 
 /// Handle an incoming request before proxying. See the trait method
 /// `<SbProxy as ProxyHttp>::request_filter` for the phase contract.
+/// Run the origin's `cache.key` event, if it has one.
+///
+/// Returns the plan, plus whether the cache must be bypassed entirely.
+///
+/// **A fault bypasses the cache.** The obvious fallback, dropping the
+/// plan and keying on the static `vary:` alone, is a cross-tenant leak:
+/// dropping dimensions makes the key *coarser*, not narrower, and the
+/// same key is used for the write-back. So a script that faults on one
+/// request stores that response under the undimensioned key, and the
+/// next caller whose script also faults is served it as a hit. Failing
+/// open on a key decision has to mean failing closed on the cache.
+///
+/// `None` with no bypass means the event is absent and the static
+/// `vary:` decides, which is what a deployment without the event does.
+fn evaluate_cache_key(
+    ctx: &crate::context::RequestContext,
+    req: &pingora_http::RequestHeader,
+    cache_cfg: &sbproxy_config::ResponseCacheConfig,
+) -> (Option<sbproxy_cache::cache_event::CacheKeyPlan>, bool) {
+    use sbproxy_cache::cache_event::{decode_cache_key, CacheDecision};
+    use sbproxy_observe::decision::{
+        record_decision, record_decision_duration, DecisionEvent, DecisionOutcome,
+    };
+
+    let Some(script) = cache_cfg.key_event.as_ref() else {
+        return (None, false);
+    };
+    let pipeline = ctx.pipeline.clone();
+    let origin = ctx
+        .origin_idx
+        .and_then(|idx| pipeline.config.origins.get(idx))
+        .map_or("", |origin| origin.origin_id.as_str());
+    let engine = crate::decision_script::engine_label(script);
+    let started = std::time::Instant::now();
+
+    let context = serde_json::json!({
+        "request": {
+            "method": req.method.as_str(),
+            "path": req.uri.path(),
+            "query": req.uri.query().unwrap_or(""),
+            "host": ctx.hostname.as_str(),
+        },
+        "tenant": ctx.tenant_id.as_str(),
+        "origin": origin,
+    });
+
+    let plan = match crate::decision_script::evaluate(script, &context) {
+        Err(fault) => {
+            // No fail-open counter here, deliberately. Since a fault
+            // bypasses the cache entirely, this event fails *closed*:
+            // the request proceeded without a cache, not with one it
+            // never earned. Counting it as a fail-open would report the
+            // opposite of what happened. The fault is the outcome.
+            record_decision(
+                DecisionEvent::CacheKey,
+                engine,
+                fault.outcome(),
+                origin,
+                &ctx.tenant_id,
+            );
+            (None, true)
+        }
+        Ok(document) => match decode_cache_key(&document) {
+            Ok(CacheDecision::Decline) => {
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Decline,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                (None, false)
+            }
+            Ok(CacheDecision::Plan(plan)) => {
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Allow,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                (Some(plan), false)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "sbproxy::decision",
+                    event = "cache.key",
+                    error = %error,
+                    "cache.key returned a document that could not be decoded"
+                );
+                record_decision(
+                    DecisionEvent::CacheKey,
+                    engine,
+                    DecisionOutcome::Error,
+                    origin,
+                    &ctx.tenant_id,
+                );
+                (None, true)
+            }
+        },
+    };
+    record_decision_duration(
+        DecisionEvent::CacheKey,
+        engine,
+        origin,
+        started.elapsed().as_secs_f64(),
+    );
+    plan
+}
+
 pub(super) async fn request_filter(
     session: &mut Session,
     ctx: &mut RequestContext,
@@ -3840,12 +3950,31 @@ pub(super) async fn request_filter(
 
             if method_ok {
                 ctx.record_admin_cache_status(crate::context::AdminCacheStatus::Miss);
-                let key = build_response_cache_key(
+                // WOR-2367: `cache.key`. Runs before the lookup because a
+                // key has to exist before anything can be looked up under
+                // it, which is why this is a separate event from
+                // `cache.admit` rather than one cache policy.
+                let (key_plan, key_event_bypass) =
+                    evaluate_cache_key(ctx, session.req_header(), cache_cfg);
+                let key = crate::server::build_response_cache_key_with_plan(
                     "",
                     ctx.hostname.as_str(),
                     session.req_header(),
                     cache_cfg,
+                    key_plan.as_ref(),
                 );
+                // `skip_lookup` goes upstream for *this* request while
+                // leaving the response eligible for storage, which is a
+                // different thing from refusing to cache and is why the
+                // two are separate fields.
+                //
+                // Expressed as a flag rather than an early return on
+                // purpose: `request_filter` still has to run mirroring,
+                // `on_request` callbacks, forward rules, and
+                // `handle_action` below, and returning here would
+                // silently skip every one of them.
+                let skip_lookup =
+                    key_event_bypass || key_plan.as_ref().is_some_and(|plan| plan.skip_lookup);
 
                 // Cache lookups are synchronous against the trait, but the
                 // Redis backend does blocking TCP I/O under the hood. Use
@@ -3853,15 +3982,23 @@ pub(super) async fn request_filter(
                 // We always pull the entry "including expired" so the SWR
                 // window can be evaluated even when TTL is exceeded; the
                 // freshness check happens on this side.
-                let lookup_store = cache_store.clone();
-                let lookup_key = key.clone();
-                let hit = tokio::task::spawn_blocking(move || {
-                    lookup_store.get_including_expired(&lookup_key)
-                })
-                .await
-                .map_err(|e| {
-                    Error::because(ErrorType::InternalError, "cache lookup join failed", e)
-                })?;
+                let hit = if skip_lookup {
+                    // The key is still computed and still stamped on the
+                    // context, so the response written back lands where a
+                    // later request will find it. Only the read is
+                    // skipped.
+                    Ok(None)
+                } else {
+                    let lookup_store = cache_store.clone();
+                    let lookup_key = key.clone();
+                    tokio::task::spawn_blocking(move || {
+                        lookup_store.get_including_expired(&lookup_key)
+                    })
+                    .await
+                    .map_err(|e| {
+                        Error::because(ErrorType::InternalError, "cache lookup join failed", e)
+                    })?
+                };
 
                 match hit {
                     Ok(Some(entry)) => {
@@ -4030,7 +4167,18 @@ pub(super) async fn request_filter(
                         // to the client with `x-sbproxy-cache:
                         // HIT-RESERVE` and promoted into the hot
                         // tier so subsequent reads stay hot.
-                        if let Some(reserve) = pipeline.cache_reserve.clone() {
+                        // The reserve is a cache read like any other, so
+                        // it takes the same gate. Without this a
+                        // `skip_lookup` policy asking for live data is
+                        // served a cold-tier body with
+                        // `x-sbproxy-cache: HIT-RESERVE` and never
+                        // reaches upstream.
+                        let reserve = if skip_lookup {
+                            None
+                        } else {
+                            pipeline.cache_reserve.clone()
+                        };
+                        if let Some(reserve) = reserve {
                             let lookup_key = key.clone();
                             let lookup_origin = origin.origin_id.to_string();
                             match reserve.get(&lookup_key).await {
@@ -4182,7 +4330,17 @@ pub(super) async fn request_filter(
                         // Miss: remember the key so the response phase
                         // can populate the cache when the upstream reply
                         // comes back.
-                        ctx.cache_key = Some(key);
+                        //
+                        // Except after a `cache.key` fault. The key we
+                        // hold is missing the dimensions the policy
+                        // wanted, so writing under it would publish this
+                        // response to every other caller whose script
+                        // also faults. A fault means no read *and* no
+                        // write, which is the only fallback that cannot
+                        // leak.
+                        if !key_event_bypass {
+                            ctx.cache_key = Some(key);
+                        }
                     }
                     Err(e) => {
                         warn!(error = %e, "cache lookup error, bypassing cache");
