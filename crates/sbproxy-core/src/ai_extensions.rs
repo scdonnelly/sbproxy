@@ -2,10 +2,10 @@
 
 use sbproxy_ai::format::{ContentPartDelta, FinishReason, HubChunk};
 use sbproxy_ai::guardrails::stream::CompletedToolCall;
-use sbproxy_extension::bundle::{AiExtensionChain, AiExtensionSession};
+use sbproxy_extension::bundle::{AiChainVerdict, AiExtensionChain, AiExtensionSession};
 use sbproxy_plugin::{
-    AiExtensionDecision, AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage,
-    AiExtensionRole, AiExtensionStreamChunk, AiExtensionToolCall, ExtensionHookKind,
+    AiExtensionEvent, AiExtensionEventPayload, AiExtensionMessage, AiExtensionRole,
+    AiExtensionStreamChunk, AiExtensionToolCall, ExtensionHookKind,
     AI_EXTENSION_EVENT_SCHEMA_VERSION,
 };
 
@@ -35,6 +35,19 @@ impl AiExtensionBlock {
             status: 413,
             code: "ai_extension_event_too_large".to_owned(),
             message: "The normalized AI event exceeded its safety limit".to_owned(),
+        }
+    }
+
+    /// A hook rewrote content the host cannot faithfully write back
+    /// into the provider-shaped body (for example, a single
+    /// replacement text against a multi-choice completion). Shipping
+    /// the original behind a hook that believes it rewrote it is the
+    /// one outcome this refusal exists to prevent.
+    pub(crate) fn mutation_unrepresentable() -> Self {
+        Self {
+            status: 502,
+            code: "ai_extension_mutation_unrepresentable".to_owned(),
+            message: "An AI extension rewrote content this response shape cannot carry".to_owned(),
         }
     }
 }
@@ -124,13 +137,16 @@ impl AiRequestExtensions {
         self.kinds.enforcing_tool
     }
 
+    /// Returns the canonical message list a hook rewrote, or `None`
+    /// when the input passed through unmodified. The caller owns
+    /// writing a mutated list back into the provider-shaped body.
     pub(crate) async fn guard_input(
         &mut self,
         stage: &str,
         body: &serde_json::Value,
-    ) -> Result<(), AiExtensionBlock> {
+    ) -> Result<Option<Vec<AiExtensionMessage>>, AiExtensionBlock> {
         if !self.kinds.input {
-            return Ok(());
+            return Ok(None);
         }
         let messages = match canonical_input_messages(body) {
             Ok(messages) => messages,
@@ -139,32 +155,56 @@ impl AiRequestExtensions {
             }
             Err(()) => {
                 tracing::warn!("AI observation event exceeded its normalized input limit");
-                return Ok(());
+                return Ok(None);
             }
         };
-        self.dispatch(AiExtensionEventPayload::GuardrailInput {
-            stage: bounded_id(stage),
-            messages,
-        })
-        .await
+        match self
+            .dispatch(AiExtensionEventPayload::GuardrailInput {
+                stage: bounded_id(stage),
+                messages,
+            })
+            .await?
+        {
+            Some(AiExtensionEventPayload::GuardrailInput { messages, .. }) => Ok(Some(messages)),
+            // Mutation preserves the payload kind by construction
+            // (`apply_mutation` replaces content within its own
+            // variant), so this arm is unreachable; failing closed
+            // beats shipping input a hook believes it rewrote.
+            Some(_) => Err(AiExtensionBlock::runtime_failure()),
+            None => Ok(None),
+        }
     }
 
-    pub(crate) async fn guard_output(&mut self, body: &[u8]) -> Result<(), AiExtensionBlock> {
+    /// Returns the canonical output text a hook rewrote, or `None`
+    /// when the output passed through unmodified. The caller owns
+    /// splicing a mutated text back into the provider-shaped body and
+    /// refusing when that splice is not representable.
+    pub(crate) async fn guard_output(
+        &mut self,
+        body: &[u8],
+    ) -> Result<Option<String>, AiExtensionBlock> {
         if !self.kinds.output {
-            return Ok(());
+            return Ok(None);
         }
         let Some(content) = canonical_output_text(body) else {
-            return Ok(());
+            return Ok(None);
         };
         if content.len() > MAX_EVENT_TEXT_BYTES {
             if self.kinds.enforcing_output {
                 return Err(AiExtensionBlock::event_too_large());
             }
             tracing::warn!("AI output observation exceeded its normalized event limit");
-            return Ok(());
+            return Ok(None);
         }
-        self.dispatch(AiExtensionEventPayload::GuardrailOutput { content })
-            .await
+        match self
+            .dispatch(AiExtensionEventPayload::GuardrailOutput { content })
+            .await?
+        {
+            Some(AiExtensionEventPayload::GuardrailOutput { content }) => Ok(Some(content)),
+            // See `guard_input`: kind-preserving by construction.
+            Some(_) => Err(AiExtensionBlock::runtime_failure()),
+            None => Ok(None),
+        }
     }
 
     /// Record and enforce normalized hub chunks before their wire frames ship.
@@ -221,8 +261,10 @@ impl AiRequestExtensions {
             };
             if self.kinds.stream {
                 if let Some(chunk) = event {
-                    self.dispatch(AiExtensionEventPayload::Stream { chunk })
+                    let mutated = self
+                        .dispatch(AiExtensionEventPayload::Stream { chunk })
                         .await?;
+                    self.expect_unmutated(mutated)?;
                 }
             }
         }
@@ -249,15 +291,17 @@ impl AiRequestExtensions {
                 tracing::warn!("AI tool-call observation exceeded its event limit");
                 continue;
             }
-            self.dispatch(AiExtensionEventPayload::ToolCall {
-                call: AiExtensionToolCall {
-                    index: call.index,
-                    id: call.id.as_deref().map(bounded_id),
-                    name: bounded_id(&call.name),
-                    arguments_json: call.args_json.clone(),
-                },
-            })
-            .await?;
+            let mutated = self
+                .dispatch(AiExtensionEventPayload::ToolCall {
+                    call: AiExtensionToolCall {
+                        index: call.index,
+                        id: call.id.as_deref().map(bounded_id),
+                        name: bounded_id(&call.name),
+                        arguments_json: call.args_json.clone(),
+                    },
+                })
+                .await?;
+            self.expect_unmutated(mutated)?;
         }
         Ok(())
     }
@@ -311,6 +355,7 @@ impl AiRequestExtensions {
                 completion_tokens: self.stats.completion_tokens,
             })
             .await
+            .map(|_| ())
         } else {
             Ok(())
         };
@@ -321,21 +366,33 @@ impl AiRequestExtensions {
         decision.and(finish)
     }
 
-    async fn dispatch(&mut self, payload: AiExtensionEventPayload) -> Result<(), AiExtensionBlock> {
+    /// Dispatch one event; `Ok(Some(payload))` is the payload after a
+    /// hook rewrote it, `Ok(None)` an unmodified release.
+    ///
+    /// Identity stays immune to mutation by construction: the host
+    /// builds the event here, hooks can only rewrite its payload
+    /// content, and the returned value is the payload alone, so a
+    /// guest that echoes back `sequence` or `request_id` changes
+    /// nothing.
+    async fn dispatch(
+        &mut self,
+        payload: AiExtensionEventPayload,
+    ) -> Result<Option<AiExtensionEventPayload>, AiExtensionBlock> {
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(AiExtensionBlock::runtime_failure)?;
-        let event = AiExtensionEvent {
+        let mut event = AiExtensionEvent {
             schema_version: AI_EXTENSION_EVENT_SCHEMA_VERSION,
             sequence: self.sequence,
             request_id: self.request_id.clone(),
             model: self.model.clone(),
             payload,
         };
-        match self.session.dispatch(&event).await {
-            Ok(AiExtensionDecision::Release | AiExtensionDecision::Flag { .. }) => Ok(()),
-            Ok(AiExtensionDecision::Block {
+        match self.session.dispatch(&mut event).await {
+            Ok(AiChainVerdict::Release) => Ok(None),
+            Ok(AiChainVerdict::Mutated) => Ok(Some(event.payload)),
+            Ok(AiChainVerdict::Block {
                 status,
                 code,
                 message,
@@ -349,6 +406,28 @@ impl AiRequestExtensions {
                 Err(AiExtensionBlock::runtime_failure())
             }
         }
+    }
+
+    /// Refuse a mutation on a seam with no write-back.
+    ///
+    /// Config validation refuses `mutates: true` on stream and
+    /// tool-call hooks precisely because their wire frames have no
+    /// write-back yet, so this cannot fire today. If that invariant
+    /// ever breaks, the failure mode to prevent is shipping original
+    /// bytes behind a hook that believes it rewrote them, so the seam
+    /// fails closed rather than logging and continuing.
+    #[allow(clippy::unused_self)] // reads as a seam method at call sites
+    fn expect_unmutated(
+        &self,
+        mutated: Option<AiExtensionEventPayload>,
+    ) -> Result<(), AiExtensionBlock> {
+        if mutated.is_some() {
+            tracing::error!(
+                "AI extension mutation reached a host seam with no write-back; refusing"
+            );
+            return Err(AiExtensionBlock::runtime_failure());
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +539,139 @@ fn canonical_message(value: &serde_json::Value) -> Result<AiExtensionMessage, ()
             .and_then(serde_json::Value::as_str)
             .map(bounded_id),
     })
+}
+
+/// Splice a hook-rewritten canonical message list back into the
+/// provider-shaped request body.
+///
+/// The canonical view is lossy: [`AiExtensionMessage`] carries no
+/// `tool_calls`, drops non-text content parts, and folds provider role
+/// spellings (`developer`, `function`) into their canonical roles.
+/// Reconstructing the body from it would therefore destroy fields the
+/// hook never touched. The original body stays authoritative instead,
+/// and only the content of messages the hook actually changed is
+/// spliced in, by position:
+///
+/// - message identity must be unchanged: same count, same roles, same
+///   `name` and `tool_call_id` per position; a rewrite that adds,
+///   removes, reorders, or relabels messages refuses;
+/// - a message whose content is unchanged is left byte-for-byte alone,
+///   `tool_calls`, image parts, and provider role spellings included;
+/// - a changed message's text lands in the one slot its canonical
+///   content came from (a string `content`, the single text part of a
+///   parts array, or a bare `text` field); a changed message with
+///   several text parts has no single slot for the joined replacement
+///   and refuses.
+///
+/// `Some(block)` is the refusal; shipping the original behind a hook
+/// that believes it rewrote the input is the outcome it prevents.
+pub(crate) fn write_mutated_input_messages(
+    body: &mut serde_json::Value,
+    mutated: &[AiExtensionMessage],
+) -> Option<AiExtensionBlock> {
+    let refuse = || Some(AiExtensionBlock::mutation_unrepresentable());
+    let Ok(original) = canonical_input_messages(body) else {
+        return refuse();
+    };
+    if original.len() != mutated.len() {
+        return refuse();
+    }
+    if original
+        .iter()
+        .zip(mutated)
+        .any(|(o, m)| o.role != m.role || o.name != m.name || o.tool_call_id != m.tool_call_id)
+    {
+        return refuse();
+    }
+    let changed: Vec<(usize, &str)> = original
+        .iter()
+        .zip(mutated)
+        .enumerate()
+        .filter(|(_, (o, m))| o.content != m.content)
+        .map(|(index, (_, m))| (index, m.content.as_str()))
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    // Locate the array or single-string field the canonical view was
+    // built from, in exactly `canonical_input_messages`' shape order.
+    if let Some(messages) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        return splice_changed_entries(messages, &changed);
+    }
+    if let Some(input) = body.get_mut("input") {
+        if let Some(entries) = input.as_array_mut() {
+            return splice_changed_entries(entries, &changed);
+        }
+        if input.is_string() {
+            // A single user message by construction (identity matched
+            // above against the canonical single-message view).
+            *input = serde_json::Value::String(changed[0].1.to_owned());
+            return None;
+        }
+    }
+    for field in ["prompt", "query"] {
+        if body.get(field).is_some_and(serde_json::Value::is_string) {
+            body[field] = serde_json::Value::String(changed[0].1.to_owned());
+            return None;
+        }
+    }
+    refuse()
+}
+
+fn splice_changed_entries(
+    entries: &mut [serde_json::Value],
+    changed: &[(usize, &str)],
+) -> Option<AiExtensionBlock> {
+    for (index, content) in changed {
+        let representable = entries
+            .get_mut(*index)
+            .is_some_and(|entry| splice_entry_content(entry, content));
+        if !representable {
+            return Some(AiExtensionBlock::mutation_unrepresentable());
+        }
+    }
+    None
+}
+
+/// Write replacement text into the one slot this entry's canonical
+/// content was read from, mirroring `canonical_message`: `content` as
+/// a string, `content` as a parts array (text parts joined), then a
+/// bare `text` field. Only entries the hook changed reach here, so a
+/// multi-text-part refusal never blocks a message that was left alone.
+fn splice_entry_content(entry: &mut serde_json::Value, content: &str) -> bool {
+    if let Some(slot) = entry.get_mut("content") {
+        match slot {
+            serde_json::Value::String(text) => {
+                *text = content.to_owned();
+                return true;
+            }
+            serde_json::Value::Array(parts) => {
+                let mut text_parts = parts
+                    .iter_mut()
+                    .filter(|part| part.get("text").is_some_and(serde_json::Value::is_string));
+                if let Some(first) = text_parts.next() {
+                    if text_parts.next().is_some() {
+                        // Several text parts were joined on extraction;
+                        // the joined replacement has no single home.
+                        return false;
+                    }
+                    first["text"] = serde_json::Value::String(content.to_owned());
+                    return true;
+                }
+                // No text part: extraction fell through to the bare
+                // `text` field below.
+            }
+            _ => {}
+        }
+    }
+    if entry.get("text").is_some_and(serde_json::Value::is_string) {
+        entry["text"] = serde_json::Value::String(content.to_owned());
+        return true;
+    }
+    false
 }
 
 fn content_text(value: &serde_json::Value) -> Option<String> {
@@ -610,6 +822,294 @@ mod tests {
         let block = request.close().await.unwrap_err();
         assert_eq!(block.status, 409);
         assert_eq!(block.code, "fixture_close");
+    }
+}
+
+#[cfg(test)]
+mod input_splice_tests {
+    use super::write_mutated_input_messages;
+    use sbproxy_plugin::{AiExtensionMessage, AiExtensionRole};
+
+    fn message(role: AiExtensionRole, content: &str) -> AiExtensionMessage {
+        AiExtensionMessage {
+            role,
+            content: content.to_owned(),
+            name: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// The reviewer-found blocker case: a multi-turn tool-calling
+    /// conversation with a developer-role message and an image part.
+    /// Redacting one user message must not disturb any of it.
+    #[test]
+    fn splice_preserves_fields_the_canonical_view_cannot_carry() {
+        let mut body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "developer", "content": "be safe"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call-1", "type": "function",
+                     "function": {"name": "search", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "my card is 4111"},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/x.png"}}
+                ]}
+            ],
+            "temperature": 0.2,
+        });
+        let expected_untouched = body.clone();
+        let mutated = [
+            message(AiExtensionRole::System, "be safe"),
+            message(AiExtensionRole::Assistant, ""),
+            AiExtensionMessage {
+                role: AiExtensionRole::Tool,
+                content: "result".to_owned(),
+                name: None,
+                tool_call_id: Some("call-1".to_owned()),
+            },
+            message(AiExtensionRole::User, "my card is [REDACTED]"),
+        ];
+        assert!(write_mutated_input_messages(&mut body, &mutated).is_none());
+        // Only the changed user message's text slot moved.
+        assert_eq!(
+            body["messages"][3]["content"][0]["text"],
+            "my card is [REDACTED]"
+        );
+        // The image part survived next to it.
+        assert_eq!(
+            body["messages"][3]["content"][1],
+            expected_untouched["messages"][3]["content"][1]
+        );
+        // Untouched messages are byte-identical: the developer role
+        // spelling, the assistant's tool_calls, the tool linkage.
+        assert_eq!(body["messages"][0], expected_untouched["messages"][0]);
+        assert_eq!(body["messages"][1], expected_untouched["messages"][1]);
+        assert_eq!(body["messages"][2], expected_untouched["messages"][2]);
+        assert_eq!(body["temperature"], expected_untouched["temperature"]);
+    }
+
+    #[test]
+    fn identity_changes_refuse() {
+        let base = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "raw"}],
+        });
+        // Added message.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[
+                message(AiExtensionRole::System, "injected"),
+                message(AiExtensionRole::User, "raw"),
+            ],
+        )
+        .is_some());
+        // Removed message.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(&mut body, &[]).is_some());
+        // Relabeled role.
+        let mut body = base.clone();
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::System, "raw")]
+        )
+        .is_some());
+        // Every refusal left the body untouched.
+        assert_eq!(body, base);
+    }
+
+    #[test]
+    fn changed_multi_text_part_message_refuses_but_unchanged_one_passes() {
+        // Two text parts joined on extraction have no single slot for
+        // the joined replacement.
+        let mut body = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"}
+            ]}],
+        });
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::User, "clean")]
+        )
+        .is_some());
+        // The same shape passes when the hook left it alone and changed
+        // a different message (the joined canonical view of the two
+        // text parts, with a newline between them).
+        let mut body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "a"},
+                    {"type": "text", "text": "b"}
+                ]},
+                {"role": "user", "content": "raw"}
+            ],
+        });
+        let mutated = [
+            message(AiExtensionRole::User, "a\nb"),
+            message(AiExtensionRole::User, "clean"),
+        ];
+        assert!(write_mutated_input_messages(&mut body, &mutated).is_none());
+        assert_eq!(body["messages"][1]["content"], "clean");
+        assert_eq!(body["messages"][0]["content"][1]["text"], "b");
+    }
+
+    #[test]
+    fn single_string_shapes_splice_content_and_refuse_more() {
+        for field in ["input", "prompt", "query"] {
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            assert!(write_mutated_input_messages(
+                &mut body,
+                &[message(AiExtensionRole::User, "clean")]
+            )
+            .is_none());
+            assert_eq!(body[field], "clean");
+
+            let mut body = serde_json::json!({"model": "m", field: "raw"});
+            let block = write_mutated_input_messages(
+                &mut body,
+                &[
+                    message(AiExtensionRole::User, "clean"),
+                    message(AiExtensionRole::User, "second"),
+                ],
+            )
+            .expect("two messages cannot land in one string field");
+            assert_eq!(block.code, "ai_extension_mutation_unrepresentable");
+            assert_eq!(body[field], "raw");
+        }
+    }
+
+    #[test]
+    fn no_op_and_unknown_shapes() {
+        // An identical list is a no-op, whatever the shape.
+        let mut body = serde_json::json!({"model": "m", "embedding_input": ["a"]});
+        let before = body.clone();
+        assert!(write_mutated_input_messages(&mut body, &[]).is_none());
+        assert_eq!(body, before);
+        // A rewrite against a shape with no message list refuses.
+        assert!(write_mutated_input_messages(
+            &mut body,
+            &[message(AiExtensionRole::User, "clean")]
+        )
+        .is_some());
+    }
+}
+
+#[cfg(test)]
+mod mutation_seam_tests {
+    use sbproxy_config::ExtensionBundlesConfig;
+    use sbproxy_extension::bundle::{AiExtensionChain, DynamicBundleRegistry};
+    use sbproxy_plugin::AiExtensionRole;
+    use std::collections::BTreeSet;
+    use tempfile::TempDir;
+
+    use super::AiRequestExtensions;
+
+    fn chain(manifest: &str, javascript: &str) -> (TempDir, AiExtensionChain) {
+        let directory = TempDir::new().unwrap();
+        let bundle = directory.path().join("fixture");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("bundle.yaml"), manifest).unwrap();
+        std::fs::write(bundle.join("entry.js"), javascript).unwrap();
+        let registry = DynamicBundleRegistry::load(
+            &ExtensionBundlesConfig {
+                bundles_dir: Some(directory.path().display().to_string()),
+                sources: Vec::new(),
+            },
+            directory.path(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let chain = AiExtensionChain::from_registry(registry.as_ref()).unwrap();
+        (directory, chain)
+    }
+
+    #[tokio::test]
+    async fn guard_output_returns_the_rewritten_text_to_its_caller() {
+        // The seam by name: a mutating hook's text must come back out
+        // of `guard_output`, because the pipeline caller is the one
+        // that splices it into the provider-shaped body. A mutation
+        // that stops inside the chain is indistinguishable from
+        // inspect-only.
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: output-redactor
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_output
+    type: redact_output
+    export: redact
+    execution:
+      mutates: true
+",
+            // base64("clean text")
+            r#"export function redact(input) { if (input.event.content !== "raw text") throw new Error("saw " + input.event.content); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"redacted",body_base64:"Y2xlYW4gdGV4dA=="}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":"raw text"}}]}"#;
+        let mutated = request.guard_output(body).await.unwrap();
+        assert_eq!(mutated.as_deref(), Some("clean text"));
+    }
+
+    #[tokio::test]
+    async fn guard_output_without_a_mutation_returns_none() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: output-inspector
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_output
+    type: inspect_output
+    export: inspect
+",
+            r#"export function inspect() { return {version:"sbproxy-envelope/v1",decision:"release"}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":"raw text"}}]}"#;
+        assert_eq!(request.guard_output(body).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn guard_input_returns_the_rewritten_messages_to_its_caller() {
+        let (_directory, chain) = chain(
+            "apiVersion: sbproxy.dev/v1alpha1
+kind: Bundle
+name: input-redactor
+version: 1.0.0
+runtime: javascript
+entry: entry.js
+hooks:
+  - kind: ai_guardrail_input
+    type: redact_input
+    export: redact
+    execution:
+      mutates: true
+",
+            // base64 of [{"role":"user","content":"clean question"}]
+            r#"export function redact(input) { if (input.event.messages[0].content !== "raw question") throw new Error("saw " + input.event.messages[0].content); return {version:"sbproxy-envelope/v1",decision:"mutate",code:"redacted",body_base64:"W3sicm9sZSI6InVzZXIiLCJjb250ZW50IjoiY2xlYW4gcXVlc3Rpb24ifV0="}; }"#,
+        );
+        let mut request = AiRequestExtensions::start(&chain, "request-1", "model-1").unwrap();
+        let body = serde_json::json!({
+            "model": "model-1",
+            "messages": [{"role": "user", "content": "raw question"}],
+        });
+        let mutated = request
+            .guard_input("original", &body)
+            .await
+            .unwrap()
+            .expect("the hook rewrote the messages");
+        assert_eq!(mutated.len(), 1);
+        assert_eq!(mutated[0].role, AiExtensionRole::User);
+        assert_eq!(mutated[0].content, "clean question");
     }
 }
 

@@ -479,6 +479,69 @@ pub enum AiExtensionEventPayload {
     },
 }
 
+impl AiExtensionEventPayload {
+    /// Whether a hook may return [`AiExtensionDecision::Mutate`] for
+    /// this payload.
+    ///
+    /// Only the content-bearing payloads: input messages, buffered
+    /// output, a tool call, and a stream chunk. `Close` and `Failure`
+    /// carry aggregate facts about work already done, and mutating a
+    /// fact is not a decision.
+    #[must_use]
+    pub const fn accepts_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::GuardrailInput { .. }
+                | Self::GuardrailOutput { .. }
+                | Self::ToolCall { .. }
+                | Self::Stream { .. }
+        )
+    }
+
+    /// Replace this payload's content with a hook-supplied body.
+    ///
+    /// The body's shape is per kind, because the payloads are not one
+    /// field: `Output` content is plain UTF-8 text, while `Input`,
+    /// `ToolCall`, and `Stream` are the JSON of their content types, so
+    /// a mutation is validated against the same schema the original
+    /// satisfied. Everything outside the content, the stage label, the
+    /// event identity, the sequence, is host-owned and untouched: a
+    /// hook cannot rewrite what the host said about the event by
+    /// returning a payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason label when this payload does not accept
+    /// mutation or the body does not parse as the required shape. The
+    /// caller maps that through the hook's failure posture like any
+    /// other engine fault.
+    pub fn apply_mutation(&mut self, body: &[u8]) -> Result<(), &'static str> {
+        match self {
+            Self::GuardrailInput { messages, .. } => {
+                *messages = serde_json::from_slice::<Vec<AiExtensionMessage>>(body)
+                    .map_err(|_| "mutate_body_not_message_list")?;
+                Ok(())
+            }
+            Self::GuardrailOutput { content } => {
+                *content =
+                    String::from_utf8(body.to_vec()).map_err(|_| "mutate_body_not_utf8_text")?;
+                Ok(())
+            }
+            Self::ToolCall { call } => {
+                *call = serde_json::from_slice::<AiExtensionToolCall>(body)
+                    .map_err(|_| "mutate_body_not_tool_call")?;
+                Ok(())
+            }
+            Self::Stream { chunk } => {
+                *chunk = serde_json::from_slice::<AiExtensionStreamChunk>(body)
+                    .map_err(|_| "mutate_body_not_stream_chunk")?;
+                Ok(())
+            }
+            _ => Err("event_not_mutable"),
+        }
+    }
+}
+
 /// Why an upstream AI call failed, as a closed set.
 ///
 /// Mirrors `sbproxy_ai::failure_cause::FailureCause` one to one. It is
@@ -541,8 +604,16 @@ impl AiExtensionEvent {
 }
 
 /// Verdict returned by an awaited AI extension hook.
+///
+/// `#[non_exhaustive]` as of the mutation release: out-of-tree matchers
+/// need a wildcard arm, and the honest reading of that arm is
+/// [`AiExtensionDecision::Release`], because a hook that does not
+/// understand a verdict must not invent a refusal or apply a payload it
+/// cannot see. Adding the attribute and the first new variant in one
+/// release means downstream code breaks once rather than twice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AiExtensionDecision {
     /// Release the operation or stream bytes.
     Release,
@@ -561,6 +632,27 @@ pub enum AiExtensionDecision {
         code: String,
         /// Bounded diagnostic message.
         message: String,
+    },
+    /// Release the operation with a modified payload.
+    ///
+    /// The payload contract is defined for the four content-bearing
+    /// hooks (guardrail input and output, tool calls, and stream
+    /// events), but a host only honors it where it can write the
+    /// rewrite back into what actually ships: today that is guardrail
+    /// input and output, and declaring `mutates` on a tool-call or
+    /// stream hook refuses at config load. The host revalidates the
+    /// replacement against the same limits the original passed, and the
+    /// hook after this one in the chain sees the modified payload, so a
+    /// redactor followed by a classifier classifies what will actually
+    /// be sent.
+    Mutate {
+        /// The replacement payload for the event's content field,
+        /// base64-encoded on the wire and size-capped by the hook's
+        /// `max_buffer_bytes` before it is ever decoded into a value.
+        body: Vec<u8>,
+        /// Stable bounded reason code naming why the payload changed,
+        /// so the mutation is attributable on the decision family.
+        code: String,
     },
 }
 
