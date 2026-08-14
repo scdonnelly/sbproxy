@@ -77,6 +77,7 @@ fn local_config(path: &Path) -> ExtensionBundlesConfig {
     ExtensionBundlesConfig {
         bundles_dir: Some(path.display().to_string()),
         sources: Vec::new(),
+        grants: Default::default(),
     }
 }
 
@@ -247,6 +248,7 @@ fn sources_process_bundles_dir_first_then_declarations_in_order() {
         VALID_JAVASCRIPT,
     );
     let config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: Some("short".to_owned()),
         sources: vec![
             BundleSourceConfig::Directory {
@@ -836,6 +838,7 @@ fn git_source_uses_verified_materializer_and_safe_provenance() {
         "resolved-private-token",
     );
     let config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: None,
         sources: vec![BundleSourceConfig::Git {
             repo: "https://secret@example.test/repo.git".to_owned(),
@@ -902,6 +905,7 @@ fn git_rejects_missing_digest_mutable_revision_and_unresolved_credential() {
         calls: Arc::new(Mutex::new(Vec::new())),
     }));
     let mut config = ExtensionBundlesConfig {
+        grants: Default::default(),
         bundles_dir: None,
         sources: vec![BundleSourceConfig::Git {
             repo: "https://token@example.test/repo.git".to_owned(),
@@ -1207,4 +1211,173 @@ fn bundle_v1_digest_is_stable_across_two_computations() {
     // is the whole basis for pinning it in bundle.yaml.
     load_ok(temp.path());
     load_ok(temp.path());
+}
+
+// --- net:outbound (WOR-2424) ---
+
+fn outbound_manifest(name: &str, destination: &str) -> String {
+    // A generous budget: an outbound hook does real network work, so
+    // the default 50 ms is not the right ceiling for one, and the docs
+    // tell authors to raise it. 900 ms stays under the 1000 ms cap and
+    // keeps the wired listener test off the timeout edge under load.
+    format!(
+        "apiVersion: sbproxy.dev/v1alpha1\nkind: Bundle\nname: {name}\nversion: 1.0.0\nruntime: javascript\nentry: entry.js\nsandbox:\n  budget_ms: 900\nhooks:\n  - kind: policy\n    type: outbound_probe\n    export: run\n    permissions:\n      - \"net:outbound={destination}\"\n"
+    )
+}
+
+#[test]
+fn a_declared_destination_without_a_grant_refuses_the_candidate() {
+    let base = tempfile::TempDir::new().unwrap();
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", "https://api.example.test"),
+        br#"export function run() { return {version:"sbproxy-envelope/v1",decision:"allow"}; }"#,
+    );
+    let config = local_config(base.path());
+    let error = DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new()).unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("has not granted"),
+        "the refusal must say what is missing: {text}"
+    );
+    assert!(
+        text.contains("https://api.example.test:443"),
+        "the refusal must name the ungranted destination: {text}"
+    );
+    assert!(
+        text.contains("grants nothing"),
+        "the refusal must name the granted set: {text}"
+    );
+}
+
+#[test]
+fn a_granted_destination_loads_and_an_extra_grant_is_harmless() {
+    let base = tempfile::TempDir::new().unwrap();
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", "https://api.example.test"),
+        br#"export function run() { return {version:"sbproxy-envelope/v1",decision:"allow"}; }"#,
+    );
+    let mut config = local_config(base.path());
+    config.grants.insert(
+        "prober".to_owned(),
+        vec![
+            "net:outbound=https://api.example.test".to_owned(),
+            "net:outbound=https://unused.example.test".to_owned(),
+        ],
+    );
+    DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new())
+        .expect("a fully granted declaration must load");
+}
+
+#[test]
+fn a_cross_product_of_two_grants_is_refused() {
+    // A hook granted host A on port P and host B on port Q must not be
+    // able to reach host A on port Q: the grant is per exact tuple, not
+    // the cross product of the component sets.
+    let destinations = vec![
+        sbproxy_config::parse_permission_entry("net:outbound=http://10.0.0.5:9090").unwrap(),
+        sbproxy_config::parse_permission_entry("net:outbound=https://public.example.test").unwrap(),
+    ];
+    let outbound = crate::bundle::outbound::BundleOutbound::new("prober", &destinations, 4096);
+    // The exact granted tuples pass the destination gate; the cross
+    // product (10.0.0.5 over 443, public host over 9090) does not.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+    let refused = outbound.fetch(
+        &serde_json::json!({"url": "https://10.0.0.5:443/"}).to_string(),
+        deadline,
+    );
+    assert!(
+        refused.contains("egress_denied"),
+        "the cross-product tuple must refuse: {refused}"
+    );
+    let refused_other = outbound.fetch(
+        &serde_json::json!({"url": "http://public.example.test:9090/"}).to_string(),
+        deadline,
+    );
+    assert!(
+        refused_other.contains("egress_denied"),
+        "the other cross-product tuple must refuse: {refused_other}"
+    );
+}
+
+#[test]
+fn a_granted_fetch_reaches_a_listener_and_an_undeclared_one_refuses() {
+    // A one-shot local HTTP listener stands in for the destination.
+    // Loopback grants are literal-address grants, which is exactly the
+    // operator-typed internal-service case the allowlist admits.
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 4096];
+        let _ = stream.read(&mut buffer);
+        let body = b"granted-destination-body";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+    });
+
+    let base = tempfile::TempDir::new().unwrap();
+    let source = format!(
+        r#"export function run() {{
+  const granted = JSON.parse(sbproxy_fetch(JSON.stringify({{url: "http://127.0.0.1:{port}/probe"}})));
+  const refused = JSON.parse(sbproxy_fetch(JSON.stringify({{url: "https://never-granted.example.test/"}})));
+  return {{version:"sbproxy-envelope/v1",decision:"deny",status:451,message:(granted.body_base64 || "none") + "|" + (refused.error || "none")}};
+}}"#
+    );
+    write_bundle(
+        base.path(),
+        "prober",
+        &outbound_manifest("prober", &format!("http://127.0.0.1:{port}")),
+        source.as_bytes(),
+    );
+    let mut config = local_config(base.path());
+    config.grants.insert(
+        "prober".to_owned(),
+        vec![format!("net:outbound=http://127.0.0.1:{port}")],
+    );
+    let registry = DynamicBundleRegistry::load(&config, base.path(), &BTreeSet::new())
+        .expect("granted bundle loads");
+
+    let policy = registry
+        .policy("outbound_probe")
+        .expect("policy hook present");
+    let adapter = crate::bundle::javascript::build_javascript_policy(policy, serde_json::json!({}))
+        .expect("adapter builds");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri("http://origin.test/")
+        .body(bytes::Bytes::new())
+        .unwrap();
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use sbproxy_plugin::PolicyEnforcer as _;
+            let mut context: Box<dyn std::any::Any> = Box::new(());
+            adapter.enforce(&request, context.as_mut()).await
+        })
+        .expect("hook evaluates");
+    served.join().unwrap();
+
+    let message = format!("{outcome:?}");
+    // base64("granted-destination-body")
+    use base64::Engine as _;
+    let expected = base64::engine::general_purpose::STANDARD.encode(b"granted-destination-body");
+    assert!(
+        message.contains(&expected),
+        "the granted fetch's body must reach the guest: {message}"
+    );
+    assert!(
+        message.contains("egress_denied"),
+        "the undeclared fetch must refuse with a bounded reason: {message}"
+    );
 }
