@@ -128,6 +128,42 @@ pub enum DecisionEvent {
     PaymentLifecycle,
 }
 
+/// Whether a decision event's records reach the audit bus.
+///
+/// [`DecisionEvent::coverage`] is the only producer. The three states
+/// exist because "wired or not" could not describe `waf` and
+/// `rate_limit`, whose decisions do reach the bus, just under a
+/// different event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventCoverage {
+    /// Publishes its own decision-audit records.
+    Emitted,
+    /// Runs in the policy chain, so its decisions publish as `policy`
+    /// records carrying a `policy_id` that names which module decided.
+    /// Selecting on that field is the supported query; a separate
+    /// emitter would double-record.
+    SupersededByPolicy,
+    /// The decision is recorded, on a durable store rather than this
+    /// bus, and deliberately not published here.
+    ///
+    /// This feed is lossy by contract: the queue holds 10 000 records,
+    /// overflow drops and counts, and the request continues. That is the
+    /// right trade for a security decision, where the drop counter is a
+    /// paging signal and a missed record is recoverable context.
+    ///
+    /// It is the wrong trade for money. A payment record that can be
+    /// dropped under load is not an audit trail, and the settlement
+    /// store already exists so that no fund movement is ever forgotten:
+    /// an attempt that may have dispatched can only move to
+    /// `NeedsReconciliation`, never silently to a terminal state.
+    /// Publishing the same event onto a lossy queue beside it would
+    /// offer a second, weaker answer to a question that already has an
+    /// authoritative one.
+    DurableElsewhere,
+    /// No emitter yet. Enabling it publishes nothing.
+    Unwired,
+}
+
 impl DecisionEvent {
     /// Stable label. Used as a Prometheus label value, an audit record
     /// field, and the key operators scope audit emission by.
@@ -202,30 +238,72 @@ impl DecisionEvent {
     /// whose arm was not flipped, which is the direction a scanner
     /// guard would need to cover.
     pub const fn has_emitter(self) -> bool {
+        matches!(self.coverage(), EventCoverage::Emitted)
+    }
+
+    /// Whether this event's decisions reach the audit bus, and under
+    /// which event they arrive.
+    ///
+    /// Three states rather than two, because "no emitter" was wrong for
+    /// `waf` and `rate_limit` and wrong in a way that would have made
+    /// the surface worse if acted on. Both are **policy modules**:
+    /// `waf` compiles to a `Policy::Waf` enforcer, and the rate-limit
+    /// family to `Policy::RateLimit` and friends. They run in the
+    /// policy chain, so `emit_policy_verdict` already publishes each
+    /// decision with `policy_id` naming which one fired. Writing a
+    /// `record_decision(Waf, ..)` call site would emit a *second*
+    /// record for one decision, which is the two-shapes incoherence
+    /// WOR-2448 exists to remove.
+    ///
+    /// The labels stay, and deliberately. `validate_decision_audit`
+    /// fails config load on an `events:` key naming no known event, so
+    /// deleting these variants would turn a working `events: {waf:
+    /// true}` into a startup failure on upgrade. A superseded label
+    /// parses, warns, and points at where its records actually are.
+    ///
+    /// **Hand-maintained, and it will drift if you let it.** Wiring a
+    /// new emitter means flipping its arm here in the same change.
+    /// `every_wired_event_is_listed_here` pins the set so a removed
+    /// emitter is caught; nothing yet catches an *added* emitter whose
+    /// arm was not flipped.
+    pub const fn coverage(self) -> EventCoverage {
         match self {
             // cache.admit: proxy_http.rs, the response-side plan arm.
             // cache.key: request_phase.rs, the request-side plan arm.
             // route.decide: ai_dispatch.rs, the accepted-plan arm.
             // auth: server.rs `record_auth_decision`, the single seam
             // every one of the fourteen auth call sites goes through.
-            // That funnel is what makes this `true` honest: wiring some
-            // sites and not others would silence the startup warning
-            // while the feed still missed decisions (WOR-2446).
-            Self::CacheAdmit | Self::CacheKey | Self::RouteDecide | Self::Auth => true,
-            Self::Policy
-            | Self::RateLimit
-            | Self::Waf
+            // ai.guardrail.*: ai_dispatch.rs, the input and output
+            // guardrail funnels.
+            // mcp.tool: action_dispatch.rs `emit_mcp_tool_attribution`.
+            // ai.tool_call: ai_dispatch.rs `handle_verdicts`, one record
+            // per judged streamed tool call. Bounded by tool calls
+            // rather than chunks, which is what separates it from
+            // ai.stream.event.
+            // Each is a funnel rather than a scattering of call sites,
+            // which is what makes these arms honest: wiring some sites
+            // and not others would silence the startup warning while
+            // the feed still missed decisions (WOR-2446).
+            Self::CacheAdmit
+            | Self::CacheKey
+            | Self::RouteDecide
+            | Self::Auth
             | Self::AiGuardrailInput
             | Self::AiGuardrailOutput
-            | Self::AiToolCall
+            | Self::McpTool => EventCoverage::Emitted,
+            // Published as `policy` records already; see the doc above.
+            Self::Waf | Self::RateLimit => EventCoverage::SupersededByPolicy,
+            // Money is recorded by the durable settlement store, not
+            // here. See `EventCoverage::DurableElsewhere`.
+            Self::PaymentLifecycle => EventCoverage::DurableElsewhere,
+            Self::AiToolCall => EventCoverage::Emitted,
+            Self::Policy
             | Self::AiStreamEvent
             | Self::AiClose
             | Self::AiFailure
             | Self::Transform
             | Self::Action
-            | Self::LogCustomField
-            | Self::McpTool
-            | Self::PaymentLifecycle => false,
+            | Self::LogCustomField => EventCoverage::Unwired,
         }
     }
 
@@ -815,6 +893,34 @@ pub struct DecisionDetails {
     /// refusal" as a term query and correlate it with the metric that
     /// alerted.
     ///
+    /// The MCP tool a dispatch decision concerns.
+    ///
+    /// The name the agent asked for, as advertised by the gateway, so
+    /// it matches what `tools/list` returned and what
+    /// `sbproxy_mcp_tool_dispatch_total` is labelled by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The federated server the tool resolved to.
+    ///
+    /// Carried beside the tool because a name can be served by
+    /// different upstreams across a config change, and "which server
+    /// answered" is the question an incident asks first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_server: Option<String>,
+    /// Which guardrail decided, by its configured name.
+    ///
+    /// The selector for "every block by the jailbreak guardrail". Empty
+    /// on an allow, because no single guardrail owns the decision when
+    /// they all passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardrail: Option<String>,
+    /// How many detectors flagged without reaching the block threshold.
+    ///
+    /// The signal that a request was close to the line. A rule watching
+    /// this climb across a tenant sees pressure that no individual
+    /// allow record shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flagged_count: Option<usize>,
     /// Deliberately the method and not the subject. A resolved principal
     /// is the one field on this path that is attacker-influenced and
     /// frequently personal, and `DecisionDetails` is the half of the
@@ -866,6 +972,52 @@ impl DecisionDetails {
     pub fn auth(auth_type: &str) -> Self {
         Self {
             auth_type: (!auth_type.is_empty()).then(|| auth_type.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for an MCP tool dispatch.
+    ///
+    /// `result` is the dispatch label, not the record's outcome. They
+    /// differ on purpose: `tool_error` and `tool_not_found` both map to
+    /// a non-allow outcome, and only this field says whether the
+    /// upstream failed or the gateway never found the tool.
+    pub fn mcp_tool(tool: &str, server: &str, result: &str) -> Self {
+        Self {
+            tool: (!tool.is_empty()).then(|| tool.to_owned()),
+            tool_server: (!server.is_empty()).then(|| server.to_owned()),
+            verdict: (!result.is_empty()).then(|| result.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for one judged streamed tool call.
+    ///
+    /// `verdict` is the guard's own word (`clean`, `blocked`,
+    /// `flagged`) rather than the record outcome, because flag mode
+    /// leaves the stream untouched while still recording a judgement an
+    /// analyst wants to count. Collapsing it into the outcome would
+    /// make "the guard disagreed but we shipped it anyway" unreadable.
+    pub fn ai_tool_call(tool: &str, verdict: &str) -> Self {
+        Self {
+            tool: (!tool.is_empty()).then(|| tool.to_owned()),
+            verdict: (!verdict.is_empty()).then(|| verdict.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Detail for an AI guardrail decision.
+    ///
+    /// `guardrail` names the one that blocked, and is absent on an
+    /// allow because no single guardrail owns a decision they all
+    /// passed. `flagged_count` carries the near-miss signal either way,
+    /// which is what makes an allow record worth storing at all.
+    pub fn guardrail(guardrail: Option<&str>, flagged_count: usize) -> Self {
+        Self {
+            guardrail: guardrail
+                .filter(|name| !name.is_empty())
+                .map(ToOwned::to_owned),
+            flagged_count: Some(flagged_count),
             ..Self::default()
         }
     }
@@ -1265,9 +1417,77 @@ mod tests {
             .collect();
         assert_eq!(
             wired,
-            vec!["auth", "cache.key", "cache.admit", "route.decide"],
+            vec![
+                "auth",
+                "cache.key",
+                "cache.admit",
+                "route.decide",
+                "ai.guardrail.input",
+                "ai.guardrail.output",
+                "ai.tool_call",
+                "mcp.tool"
+            ],
             "the wired set changed; update has_emitter and the docs that state coverage"
         );
+    }
+
+    #[test]
+    fn the_policy_backed_events_are_superseded_rather_than_unwired() {
+        // `waf` and `rate_limit` compile to policy modules, so their
+        // decisions already publish as `policy` records carrying a
+        // `policy_id`. Classifying them as unwired invited an emitter
+        // that would have double-recorded one decision, which is the
+        // incoherence WOR-2448 exists to remove.
+        for event in [DecisionEvent::Waf, DecisionEvent::RateLimit] {
+            assert_eq!(
+                event.coverage(),
+                EventCoverage::SupersededByPolicy,
+                "{event} runs in the policy chain; a separate emitter would emit a second \
+                 record for one decision"
+            );
+            assert!(
+                !event.has_emitter(),
+                "{event} must not report an emitter of its own: it publishes under `policy`"
+            );
+        }
+    }
+
+    #[test]
+    fn money_is_not_routed_onto_a_lossy_feed() {
+        // `payment.lifecycle` is not an unwired event waiting for an
+        // emitter. This queue drops records under load by design, which
+        // is a sound trade for a security decision and the wrong one for
+        // a financial record. The settlement store already answers this
+        // authoritatively, so a second lossy copy would be a weaker
+        // answer to a question that already has one.
+        assert_eq!(
+            DecisionEvent::PaymentLifecycle.coverage(),
+            EventCoverage::DurableElsewhere,
+            "a payment record that can be dropped under load is not an audit trail"
+        );
+        assert!(
+            !DecisionEvent::PaymentLifecycle.has_emitter(),
+            "it must not claim an emitter on this feed"
+        );
+        // Still parses, so an operator who configured it does not fail
+        // their load on upgrade; the boot warning tells them where the
+        // records actually are.
+        assert!(DecisionEvent::from_label("payment.lifecycle").is_some());
+    }
+
+    #[test]
+    fn a_superseded_label_still_parses() {
+        // Retiring these by deleting the variants would fail config
+        // load for anyone who wrote `events: {waf: true}`, because an
+        // unknown label is refused. The label has to survive its
+        // emitter never existing.
+        for label in ["waf", "rate_limit"] {
+            assert!(
+                DecisionEvent::from_label(label).is_some(),
+                "`{label}` must keep parsing; deleting it turns a working config into a \
+                 startup failure on upgrade"
+            );
+        }
     }
 
     #[test]

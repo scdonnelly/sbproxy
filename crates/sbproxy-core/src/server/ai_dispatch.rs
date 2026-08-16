@@ -2851,7 +2851,120 @@ fn blocked_input_decision(
 /// (span error, block metrics, envelope, status) so the original stage's
 /// wire behavior stays identical, and re-runs the evaluator with
 /// [`InputGuardrailStage::RagAugmented`] after RAG context injection.
+// Eight arguments because the recording wrapper adds `ctx` to a
+// pipeline that already needed seven. Bundling them into a struct would
+// move the same values behind a name that says nothing, and the
+// alternative, recording at each of the three call sites instead, is the
+// scattering this wrapper exists to prevent.
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_ai_input_guardrails(
+    ctx: &RequestContext,
+    config: &AiHandlerConfig,
+    guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
+    surface: &sbproxy_ai::handler::AiSurface,
+    model: &str,
+    body: &mut serde_json::Value,
+    principal: &sbproxy_plugin::Principal,
+    stage: InputGuardrailStage,
+) -> InputGuardrailDecision {
+    let decision = evaluate_ai_input_guardrails_inner(
+        config,
+        guardrail_pipeline,
+        surface,
+        model,
+        body,
+        principal,
+        stage,
+    )
+    .await;
+    // WOR-2446: recorded here rather than at the three call sites,
+    // because a fourth caller would otherwise get the guardrail without
+    // the record and nothing would say so. The evaluator itself stays
+    // free of observability so its many internal return paths cannot
+    // each decide what to emit.
+    let (outcome, guardrail, flagged) = match &decision {
+        InputGuardrailDecision::Allow { flagged_count, .. } => (
+            sbproxy_observe::decision::DecisionOutcome::Allow,
+            None,
+            *flagged_count,
+        ),
+        InputGuardrailDecision::Block { name, .. } => (
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            Some(name.as_str()),
+            0,
+        ),
+    };
+    record_guardrail_decision(
+        ctx,
+        sbproxy_observe::decision::DecisionEvent::AiGuardrailInput,
+        outcome,
+        guardrail,
+        flagged,
+        stage.label(),
+    );
+    decision
+}
+
+/// Record one AI guardrail decision on the family and the audit feed.
+///
+/// Shared by the input and output funnels so the two families cannot
+/// disagree about how a guardrail decision is shaped. `stage` is the
+/// evaluation point (`initial`, `rag_augmented`, `output`), carried in
+/// the reason rather than as a field: it distinguishes two records for
+/// one request, which is a thing a human reads, while the field set is
+/// what a rule selects on.
+fn record_guardrail_decision(
+    ctx: &RequestContext,
+    event: sbproxy_observe::decision::DecisionEvent,
+    outcome: sbproxy_observe::decision::DecisionOutcome,
+    guardrail: Option<&str>,
+    flagged_count: usize,
+    stage: &str,
+) {
+    use sbproxy_observe::decision::DecisionEngine;
+
+    let origin_id = ctx
+        .origin_idx
+        .and_then(|idx| ctx.pipeline.config.origins.get(idx))
+        .map(|origin| origin.origin_id.to_string());
+    let origin_for_family = origin_id.as_deref().unwrap_or("__unmatched__");
+    sbproxy_observe::decision::record_decision(
+        event,
+        DecisionEngine::BuiltIn,
+        outcome,
+        origin_for_family,
+        &ctx.tenant_id,
+    );
+
+    let Some(origin_id) = origin_id else {
+        return;
+    };
+    if !crate::server::proxy_http::audit_publishes(
+        &ctx.pipeline,
+        event,
+        Some(&ctx.tenant_id),
+        Some(&origin_id),
+    ) {
+        return;
+    }
+    let reason = match guardrail {
+        Some(name) => format!("{stage} guardrail {name} blocked the request"),
+        None => format!("{stage} guardrails allowed the request ({flagged_count} flagged)"),
+    };
+    crate::policy_bus::emit_decision_audit_detailed(
+        event,
+        DecisionEngine::BuiltIn,
+        outcome,
+        &ctx.request_id,
+        &origin_id,
+        &origin_id,
+        &ctx.tenant_id,
+        &reason,
+        sbproxy_observe::decision::DecisionDetails::guardrail(guardrail, flagged_count),
+    );
+}
+
+async fn evaluate_ai_input_guardrails_inner(
     config: &AiHandlerConfig,
     guardrail_pipeline: Option<&std::sync::Arc<sbproxy_ai::guardrails::GuardrailPipeline>>,
     surface: &sbproxy_ai::handler::AiSurface,
@@ -4391,6 +4504,7 @@ pub(super) async fn handle_ai_proxy(
             };
             let mut synthetic_body = serde_json::json!({ "prompt": prompt_text });
             match evaluate_ai_input_guardrails(
+                ctx,
                 config,
                 multipart_pipeline.as_ref(),
                 &surface,
@@ -4453,6 +4567,7 @@ pub(super) async fn handle_ai_proxy(
             {
                 AiIdempotencyEngagement::Replayed { response } => {
                     if let Some(block) = ai_output_guardrail_block(
+                        ctx,
                         response.status,
                         None,
                         multipart_external,
@@ -5663,6 +5778,7 @@ pub(super) async fn handle_ai_proxy(
     // guardrail stage below; without it the original stage's value is final.
     #[cfg_attr(not(feature = "rag"), allow(unused_mut))]
     let mut guardrail_flagged_count = match evaluate_ai_input_guardrails(
+        ctx,
         config,
         guardrail_pipeline.as_ref(),
         &surface,
@@ -5842,6 +5958,7 @@ pub(super) async fn handle_ai_proxy(
                         // before AI policy, budgets, caches, routing, or any
                         // provider dispatch can see it.
                         match evaluate_ai_input_guardrails(
+                            ctx,
                             config,
                             guardrail_pipeline.as_ref(),
                             &surface,
@@ -6519,6 +6636,7 @@ pub(super) async fn handle_ai_proxy(
     {
         AiIdempotencyEngagement::Replayed { response } => {
             if let Some(block) = ai_output_guardrail_block(
+                ctx,
                 response.status,
                 guardrail_pipeline.as_deref(),
                 output_external,
@@ -6867,6 +6985,7 @@ pub(super) async fn handle_ai_proxy(
                             // not a copy of the response.
                             let mut body = hit.response.body.clone();
                             if let Some(block) = ai_output_guardrail_block(
+                                ctx,
                                 hit.response.status,
                                 guardrail_pipeline.as_deref(),
                                 output_external,
@@ -8682,6 +8801,15 @@ pub(super) async fn handle_ai_proxy(
                 ai_span.clone(),
                 trace_content,
                 stream_reversible_pairs,
+                // WOR-2446: keys for `ai.tool_call` records, cloned for
+                // the same reason the reversible pairs above are.
+                origin_idx.map(|idx| {
+                    (
+                        ctx.request_id.to_string(),
+                        pipeline.config.origins[idx].origin_id.to_string(),
+                        ctx.tenant_id.to_string(),
+                    )
+                }),
                 // WOR-1141: streaming output guardrails (only when the
                 // origin declares output guardrails).
                 config
@@ -9243,6 +9371,39 @@ async fn external_output_guardrail_block(
 }
 
 async fn ai_output_guardrail_block(
+    ctx: &RequestContext,
+    status: u16,
+    builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
+    external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
+    body: &[u8],
+    model: &str,
+) -> Option<sbproxy_ai::guardrails::GuardrailBlock> {
+    let block = ai_output_guardrail_block_inner(status, builtin, external, body, model).await;
+    // A non-2xx response is not a guardrail decision: the inner
+    // function returns before inspecting anything, so recording here
+    // would manufacture an allow for a response no guardrail read.
+    if !(200..300).contains(&status) {
+        return block;
+    }
+    let (outcome, name) = match &block {
+        Some(block) => (
+            sbproxy_observe::decision::DecisionOutcome::Deny,
+            Some(block.name.as_str()),
+        ),
+        None => (sbproxy_observe::decision::DecisionOutcome::Allow, None),
+    };
+    record_guardrail_decision(
+        ctx,
+        sbproxy_observe::decision::DecisionEvent::AiGuardrailOutput,
+        outcome,
+        name,
+        0,
+        "output",
+    );
+    block
+}
+
+async fn ai_output_guardrail_block_inner(
     status: u16,
     builtin: Option<&sbproxy_ai::guardrails::GuardrailPipeline>,
     external: &[sbproxy_ai::external_guardrail::ExternalGuardrailConfig],
@@ -10589,6 +10750,79 @@ pub(super) fn build_stream_translator(
     (translator, emitter)
 }
 
+/// What a streamed decision needs to be correlatable, owned.
+///
+/// The streaming relay runs long after `handle_ai_proxy` stopped
+/// holding `RequestContext`, so the correlation keys are captured by
+/// value at relay construction rather than borrowed. That is the same
+/// reason `stream_reversible_pairs` is cloned into the relay: the
+/// dispatcher still needs `ctx` after the call returns.
+///
+/// `None` at the emit site means the stream had no matched origin, so
+/// there is no per-origin audit scope that could have asked for a
+/// record.
+pub(super) struct StreamDecisionIdentity<'a> {
+    /// Correlates to the access log and the rest of this request's
+    /// decisions.
+    pub request_id: &'a str,
+    /// The origin's configured identity, never the request `Host`.
+    pub origin_id: &'a str,
+    /// Tenant the decision is attributed to.
+    pub tenant: &'a str,
+    /// Compiled pipeline, for resolving the audit scope.
+    pub pipeline: &'a CompiledPipeline,
+}
+
+/// Record one judged streamed tool call (WOR-2446).
+///
+/// Fires per tool call rather than per chunk, which is what makes it a
+/// control rather than an ingest bill: a stream emitting thousands of
+/// deltas judges a handful of calls. That is the line `ai.stream.event`
+/// sits on the wrong side of.
+fn record_ai_tool_call_decision(
+    audit: Option<&StreamDecisionIdentity<'_>>,
+    tool: &str,
+    outcome: sbproxy_observe::decision::DecisionOutcome,
+    verdict: &str,
+    reason: Option<&str>,
+) {
+    use sbproxy_observe::decision::{DecisionEngine, DecisionEvent};
+
+    let Some(audit) = audit else {
+        return;
+    };
+    sbproxy_observe::decision::record_decision(
+        DecisionEvent::AiToolCall,
+        DecisionEngine::BuiltIn,
+        outcome,
+        audit.origin_id,
+        audit.tenant,
+    );
+    if !crate::server::proxy_http::audit_publishes(
+        audit.pipeline,
+        DecisionEvent::AiToolCall,
+        Some(audit.tenant),
+        Some(audit.origin_id),
+    ) {
+        return;
+    }
+    let detail = match reason {
+        Some(reason) => format!("agent alignment judged tool {tool} {verdict}: {reason}"),
+        None => format!("agent alignment judged tool {tool} {verdict}"),
+    };
+    crate::policy_bus::emit_decision_audit_detailed(
+        DecisionEvent::AiToolCall,
+        DecisionEngine::BuiltIn,
+        outcome,
+        audit.request_id,
+        audit.origin_id,
+        audit.origin_id,
+        audit.tenant,
+        &detail,
+        sbproxy_observe::decision::DecisionDetails::ai_tool_call(tool, verdict),
+    );
+}
+
 /// WOR-1810: run one batch of decoded hub events through the guardrail
 /// session (`finish` additionally completes every pending tool call,
 /// for message stop / stream close). Returns the first block verdict
@@ -10601,6 +10835,7 @@ fn process_guard_events(
     held: &mut std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>>,
     holding: bool,
     finish: bool,
+    audit: Option<&StreamDecisionIdentity<'_>>,
 ) -> (
     Option<sbproxy_ai::guardrails::GuardrailBlock>,
     Vec<sbproxy_ai::format::HubChunk>,
@@ -10613,22 +10848,48 @@ fn process_guard_events(
     let mut released: Vec<HubChunk> = Vec::new();
     let mut completed: Vec<(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)> = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_verdicts(
         verdicts: Vec<ToolCallVerdict>,
         event_index: usize,
         held: &mut std::collections::BTreeMap<usize, Vec<HubChunk>>,
         released: &mut Vec<HubChunk>,
         completed: &mut Vec<(usize, sbproxy_ai::guardrails::stream::CompletedToolCall)>,
+        audit: Option<&StreamDecisionIdentity<'_>>,
     ) -> Option<GuardrailBlock> {
         for v in verdicts {
             match v {
                 ToolCallVerdict::Clean(call) => {
+                    record_ai_tool_call_decision(
+                        audit,
+                        &call.name,
+                        sbproxy_observe::decision::DecisionOutcome::Allow,
+                        "clean",
+                        None,
+                    );
                     completed.push((event_index, call.clone()));
                     if let Some(frames) = held.remove(&call.index) {
                         released.extend(frames);
                     }
                 }
                 ToolCallVerdict::Violation { call, reason, mode } => {
+                    record_ai_tool_call_decision(
+                        audit,
+                        &call.name,
+                        match mode {
+                            AgentAlignmentMode::Block => {
+                                sbproxy_observe::decision::DecisionOutcome::Deny
+                            }
+                            AgentAlignmentMode::Flag => {
+                                sbproxy_observe::decision::DecisionOutcome::Flag
+                            }
+                        },
+                        match mode {
+                            AgentAlignmentMode::Block => "blocked",
+                            AgentAlignmentMode::Flag => "flagged",
+                        },
+                        Some(&reason),
+                    );
                     completed.push((event_index, call.clone()));
                     sbproxy_ai::ai_metrics::record_stream_guardrail_violation("agent_alignment");
                     match mode {
@@ -10671,17 +10932,27 @@ fn process_guard_events(
                     held.entry(*index).or_default().push(ev.clone());
                 }
                 let verdicts = sessn.on_tool_call_delta(*index, delta);
-                if let Some(b) =
-                    handle_verdicts(verdicts, event_index, held, &mut released, &mut completed)
-                {
+                if let Some(b) = handle_verdicts(
+                    verdicts,
+                    event_index,
+                    held,
+                    &mut released,
+                    &mut completed,
+                    audit,
+                ) {
                     return (Some(b), released, completed);
                 }
             }
             HubChunk::MessageStop { .. } => {
                 let verdicts = sessn.finish_tool_calls();
-                if let Some(b) =
-                    handle_verdicts(verdicts, event_index, held, &mut released, &mut completed)
-                {
+                if let Some(b) = handle_verdicts(
+                    verdicts,
+                    event_index,
+                    held,
+                    &mut released,
+                    &mut completed,
+                    audit,
+                ) {
                     return (Some(b), released, completed);
                 }
             }
@@ -10691,9 +10962,14 @@ fn process_guard_events(
 
     if finish {
         let verdicts = sessn.finish_tool_calls();
-        if let Some(b) =
-            handle_verdicts(verdicts, events.len(), held, &mut released, &mut completed)
-        {
+        if let Some(b) = handle_verdicts(
+            verdicts,
+            events.len(),
+            held,
+            &mut released,
+            &mut completed,
+            audit,
+        ) {
             return (Some(b), released, completed);
         }
     }
@@ -11354,6 +11630,13 @@ pub(super) async fn relay_ai_stream(
     // streaming restorer short-circuits per-chunk via
     // `StreamingReversibleRestore::is_noop`.
     reversible_pairs: Vec<(String, String, String)>,
+    // WOR-2446: correlation keys for the `ai.tool_call` records the
+    // agent-alignment guard emits. Owned rather than borrowed from
+    // `RequestContext`, because the relay outlives the dispatcher's hold
+    // on it; the same reason `reversible_pairs` above is a clone. `None`
+    // when no origin matched, since there is then no per-origin audit
+    // scope that could have asked for a record.
+    stream_audit_keys: Option<(String, String, String)>,
     // WOR-1141 / WOR-1810: OUTPUT guardrails. `None` when the origin
     // declares no output guardrails. A per-stream session runs every
     // guardrail against decoded content deltas (cumulative window for
@@ -11592,6 +11875,17 @@ pub(super) async fn relay_ai_stream(
     // Held-back streamed tool-call frames (Block mode), keyed by the
     // call's stream index; released on a Clean verdict, dropped when a
     // violation terminates the stream.
+    // Borrow the owned keys back into the shape the emitter takes. Built
+    // once here rather than per verdict, since a stream can judge many
+    // tool calls and none of this changes across them.
+    let stream_audit = stream_audit_keys
+        .as_ref()
+        .map(|(request_id, origin_id, tenant)| StreamDecisionIdentity {
+            request_id,
+            origin_id,
+            tenant,
+            pipeline,
+        });
     let mut held_tool_chunks: std::collections::BTreeMap<usize, Vec<sbproxy_ai::format::HubChunk>> =
         std::collections::BTreeMap::new();
     let mut bridge_ctx = sbproxy_ai::format::BridgeContext {
@@ -11762,6 +12056,7 @@ pub(super) async fn relay_ai_stream(
                             &mut held_tool_chunks,
                             holds_tool_frames,
                             false,
+                            stream_audit.as_ref(),
                         );
                         released_tool_chunks = released;
                         completed_tool_calls = completed;
@@ -12018,6 +12313,7 @@ pub(super) async fn relay_ai_stream(
                         &mut held_tool_chunks,
                         holds_tool_frames,
                         true,
+                        stream_audit.as_ref(),
                     );
                     close_block = b;
                     close_released = r;
