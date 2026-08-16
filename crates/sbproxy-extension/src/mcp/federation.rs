@@ -1997,11 +1997,7 @@ impl McpFederation {
         let mut renamed_from: HashMap<String, String> = HashMap::new();
         for (name, tool) in registry {
             let Some(lock) = lockfile.tools.get(name) else {
-                let live_contract = serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "inputSchema": tool.input_schema,
-                });
+                let live_contract = super::compat::contract_of(tool);
                 // The digest covers the name, so an identical rename does
                 // not collide here. Compare against the baseline's own
                 // contract with the name projected out.
@@ -2056,11 +2052,7 @@ impl McpFederation {
                 }
                 continue;
             };
-            let live_contract = serde_json::json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": tool.input_schema,
-            });
+            let live_contract = super::compat::contract_of(tool);
             let live_digest = super::compat::contract_digest(&live_contract);
             if live_digest == lock.contract_digest {
                 continue;
