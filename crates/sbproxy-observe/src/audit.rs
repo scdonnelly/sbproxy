@@ -79,6 +79,13 @@ pub struct ConfigAuditEntry {
     /// Config revision after the change, when known (WOR-2094).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_revision: Option<String>,
+    /// Why the reload was refused, when this entry records a rejection
+    /// rather than an applied change (WOR-2486). `None` on an accepted
+    /// reload. The actual contract this field keeps, and does not, is
+    /// on [`Self::with_rejection_reason`]; read it before pointing a
+    /// sink at this field that assumes more than that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 impl ConfigAuditEntry {
@@ -108,6 +115,24 @@ impl ConfigAuditEntry {
         };
         // WOR-2094: normalized copy for the admin console's runtime
         // sample; the collector remains the durable consumer.
+        //
+        // WOR-2486: a rejection's detail leads with the reason rather
+        // than the same "revision X -> Y" shape an accepted reload
+        // gets. Without this, a rejected reload with no revision change
+        // and no origin delta rendered as "revision rev-5 -> ?; +0 -0
+        // ~0 origins" in the ring, which reads exactly like an
+        // accepted no-op reload rather than a refusal.
+        let detail = match self.rejection_reason.as_deref() {
+            Some(reason) => format!("rejected: {reason}"),
+            None => format!(
+                "revision {} -> {}; +{} -{} ~{} origins",
+                self.prior_revision.as_deref().unwrap_or("?"),
+                self.next_revision.as_deref().unwrap_or("?"),
+                self.origins_added.len(),
+                self.origins_removed.len(),
+                self.origins_modified.len(),
+            ),
+        };
         crate::audit_ring::push_audit_event(crate::audit_ring::AuditRingEvent::new(
             "config",
             self.source.clone(),
@@ -115,14 +140,7 @@ impl ConfigAuditEntry {
             self.tenant_id.clone(),
             None,
             None,
-            Some(format!(
-                "revision {} -> {}; +{} -{} ~{} origins",
-                self.prior_revision.as_deref().unwrap_or("?"),
-                self.next_revision.as_deref().unwrap_or("?"),
-                self.origins_added.len(),
-                self.origins_removed.len(),
-                self.origins_modified.len(),
-            )),
+            Some(detail),
         ));
         // WOR-2470: the durable, tamper-evident half, on the same terms
         // as the security channel: ordered after the ring and the
@@ -426,7 +444,7 @@ impl SecurityAuditEntry {
     /// `events:` egress.
     ///
     /// `event_type` here is an open string; the egress filter is a closed
-    /// enum of eleven. The split follows what a SIEM rule would route on:
+    /// enum of twelve. The split follows what a SIEM rule would route on:
     /// the four values [`Self::auth_failure`] documents are the
     /// credential ones, and everything else that reaches this channel
     /// (framing violations plus every policy label
@@ -493,6 +511,7 @@ impl ConfigAuditEntry {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         }
     }
 
@@ -518,6 +537,37 @@ impl ConfigAuditEntry {
     ) -> Self {
         self.prior_revision = prior.map(Into::into);
         self.next_revision = next.map(Into::into);
+        self
+    }
+
+    /// Attach the reason a reload was refused (WOR-2486).
+    ///
+    /// The honest contract, not the aspirational one: `reason` is
+    /// **bounded** to 512 bytes here, the same ceiling `RedactedReason`
+    /// uses on the decision-audit side, and this record ships to the
+    /// same third-party sinks `events:` does. It is **not** scrubbed
+    /// of config content in general. A compile or validation error
+    /// routinely echoes a fragment of the document it is complaining
+    /// about, an invalid CEL expression, an unrecognized key, an
+    /// origin hostname, because naming the offending fragment is how a
+    /// validation error explains itself; nothing here tells that fragment
+    /// apart from ordinary error prose.
+    ///
+    /// The one thing callers are expected to scrub before this is
+    /// called is the config **path**: `crate::path_redact` (in
+    /// `sbproxy-core`) strips the filesystem path a reload was told to
+    /// read out of the error text first, because that path is this
+    /// node's local layout and every call site knows it in advance. A
+    /// resolved secret should not appear either, by the convention
+    /// every secret-reference resolver in this codebase already
+    /// follows (report the unresolved reference, never the value), but
+    /// that convention lives in the resolvers, not enforced here: this
+    /// function performs no content inspection of its own. If your
+    /// threat model needs a stronger guarantee than "bounded, path-
+    /// scrubbed, and secrets-by-convention", read the reason before
+    /// wiring a sink you do not already trust with your config's shape.
+    pub fn with_rejection_reason(mut self, reason: impl AsRef<str>) -> Self {
+        self.rejection_reason = Some(sbproxy_util::truncate_utf8(reason.as_ref(), 512).to_owned());
         self
     }
 }
@@ -843,6 +893,7 @@ mod tests {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         }
     }
 
@@ -913,6 +964,34 @@ mod tests {
         assert!(
             detail.contains("r-prior-cfg-test") && detail.contains("r-next-cfg-test"),
             "the revision pair is on the event: {detail}"
+        );
+    }
+
+    /// WOR-2486: a rejected reload's ring entry has to say so. Before
+    /// this fix a rejection with no revision change and no origin delta
+    /// rendered identically to an accepted no-op reload
+    /// (`"revision X -> ?; +0 -0 ~0 origins"`), which is indistinguishable
+    /// from a real accepted reload that happened to touch nothing.
+    #[test]
+    fn a_rejected_reload_names_itself_on_the_ring() {
+        ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_actor("operator-cfg-reject")
+            .with_rejection_reason("origin \"ring-reject.example\": invalid regex")
+            .emit();
+        let events =
+            crate::audit_ring::recent_audit_events(10, Some("config"), Some("file_watcher"), None);
+        let event = events
+            .iter()
+            .find(|e| e.actor.as_deref() == Some("operator-cfg-reject"))
+            .expect("rejected reload reaches the audit ring");
+        let detail = event.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.starts_with("rejected:"),
+            "a rejection must not read like an accepted no-op reload: {detail}"
+        );
+        assert!(
+            detail.contains("ring-reject.example"),
+            "the reason must be on the event: {detail}"
         );
     }
 
@@ -1028,6 +1107,7 @@ mod tests {
             actor: None,
             prior_revision: None,
             next_revision: None,
+            rejection_reason: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -1063,6 +1143,57 @@ mod tests {
         assert!(v_anon.get("tenant_id").is_none());
     }
 
+    /// WOR-2486: an accepted reload carries no `rejection_reason`; a
+    /// rejected one does, bounded and never the raw unbounded string.
+    #[test]
+    fn config_audit_entry_rejection_reason_round_trips_and_is_bounded() {
+        let accepted = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![]);
+        let json = serde_json::to_string(&accepted).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("rejection_reason").is_none(),
+            "an accepted reload must not carry a rejection_reason field"
+        );
+
+        let rejected = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_rejection_reason(
+                "origin \"api.example.com\": model_rate_limits[0]: invalid regex",
+            );
+        let json = serde_json::to_string(&rejected).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["rejection_reason"],
+            "origin \"api.example.com\": model_rate_limits[0]: invalid regex"
+        );
+
+        let long_reason = "x".repeat(1000);
+        let bounded = ConfigAuditEntry::new("file_watcher", vec![], vec![], vec![])
+            .with_rejection_reason(&long_reason);
+        assert!(
+            bounded.rejection_reason.as_ref().expect("set").len() <= 512,
+            "the reason must be bounded before it reaches a record shipped to a third-party sink"
+        );
+    }
+
+    /// A record serialized before `rejection_reason` existed must still
+    /// deserialize: `#[serde(default)]` is what makes that true, and the
+    /// sibling `Option` fields on this struct (`tenant_id`, `actor`,
+    /// `prior_revision`, `next_revision`) lack it, so a JSON payload
+    /// missing any of those fails to parse. This pins the new field to
+    /// the safer contract rather than repeating that gap.
+    #[test]
+    fn config_audit_entry_without_rejection_reason_field_still_deserializes() {
+        let json = r#"{
+            "timestamp": "2026-01-01T00:00:00Z",
+            "source": "file_watcher",
+            "origins_added": [],
+            "origins_removed": [],
+            "origins_modified": []
+        }"#;
+        let entry: ConfigAuditEntry = serde_json::from_str(json).expect("old-shape record parses");
+        assert!(entry.rejection_reason.is_none());
+    }
+
     /// WOR-1067: security audit entry carries tenant_id when set; the
     /// field is omitted when None to keep existing SIEM ingest pipelines
     /// unchanged for proxy-wide events.
@@ -1087,6 +1218,45 @@ mod tests {
         let json_anon = serde_json::to_string(&entry_anon).unwrap();
         let v_anon: serde_json::Value = serde_json::from_str(&json_anon).unwrap();
         assert!(v_anon.get("tenant_id").is_none());
+    }
+
+    /// WOR-2486 fix round 1, C2: verifies the claim `sbproxy_tls::mtls`'s
+    /// CN sanitizer's doc comment relies on, rather than assuming it.
+    ///
+    /// `sbproxy_meter::ledger::UsageLedger::append_checked` writes one
+    /// `serde_json::to_string(&entry)` result per `writeln!` call to the
+    /// hash-chained file: exactly this crate's own serialization, not a
+    /// hand-rolled format. A `reason` (or any other free-text field)
+    /// carrying a raw newline must not be able to start a second NDJSON
+    /// record inside a value meant to hold one field, because every
+    /// downstream chain reader (`sbproxy audit verify`, a SIEM's NDJSON
+    /// parser) treats one physical line as one record.
+    #[test]
+    fn security_audit_entry_reason_cannot_split_the_chained_ndjson_line() {
+        let entry = SecurityAuditEntry::auth_failure(
+            "auth_mtls_rejected",
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example",
+            495,
+            None,
+            None,
+            None,
+            None,
+        );
+        // The exact call `UsageLedger::append_checked` makes before its
+        // own `writeln!`.
+        let line = serde_json::to_string(&entry).expect("entry serializes");
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "a raw newline in a field must not produce a second physical line: {line:?}"
+        );
+        // And the value round-trips: JSON escaping, not data loss, is
+        // what prevents the split.
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("line parses");
+        assert_eq!(
+            parsed["reason"],
+            "mtls:untrusted_issuer cn=evil.example\ncn=trusted.example"
+        );
     }
 
     // --- WOR-2318: the `events:` egress bridge ---

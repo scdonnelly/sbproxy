@@ -261,6 +261,20 @@ impl Drop for ProviderRegistryRollback {
 /// Idempotent: invoking back-to-back yields the same effect as one
 /// invocation. Safe to call from any thread; the global pipeline
 /// `ArcSwap` handles the publish.
+///
+/// The `config_audit` `source` this stamps (WOR-2486) is the single
+/// string `"file_watcher"` for both callers named above, notify-based
+/// and SIGHUP alike, not two distinct values. That is deliberate rather
+/// than an oversight: both reload the same operator-managed local file,
+/// the notify path on a filesystem event and the SIGHUP path on a
+/// signal, and a record that says "the local file was reloaded" is the
+/// fact an auditor wants either way. Splitting the two would mean
+/// threading a `source` parameter through this function's ~10 call
+/// sites (both reload triggers plus the existing reload tests in
+/// `server/tests.rs`) for a distinction the record's other fields
+/// (timestamp, origin delta, before/after revision) already let an
+/// operator correlate against their own signal-delivery or file-change
+/// history if they need to tell the two apart.
 pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcome> {
     // WOR-1101: stamp every reload outcome so operators can alert on
     // failures and watch the reload cadence from metrics, not just
@@ -270,6 +284,7 @@ pub fn reload_from_config_path(config_path: &str) -> anyhow::Result<ReloadOutcom
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
+    audit_reload_outcome("file_watcher", config_path, &result);
     result
 }
 
@@ -286,7 +301,55 @@ fn reload_from_config_text(config_path: &str, yaml: &str) -> anyhow::Result<Relo
         Ok(_) => sbproxy_observe::metrics::record_config_reload("success"),
         Err(_) => sbproxy_observe::metrics::record_config_reload("failure"),
     }
+    audit_reload_outcome("file_watcher", config_path, &result);
     result
+}
+
+/// Emit a `config_audit` record for a reload outcome on a non-admin path
+/// (WOR-2486): the file watcher, SIGHUP, the remote config-source
+/// refresh poller, the config-authority bundle apply, and the
+/// extension-bundle refresh poller.
+///
+/// The admin API records its own entry at its own call site (`admin.rs`),
+/// carrying the actor and revision pair only that HTTP layer has; this
+/// covers every other path, which had none for either outcome, and adds
+/// the admin path's missing rejection case too. `source` is the same
+/// vocabulary [`sbproxy_observe::ConfigAuditEntry::source`] already
+/// documents (`"file_watcher"`, `"api"`, ...), extended with
+/// `"config_authority"`, `"config_refresh_poller"`, and
+/// `"extension_refresh"` for the paths that had no entry at all before
+/// this.
+///
+/// `config_path` is the path this specific call was reloading, scrubbed
+/// out of the error text the same way the admin API's HTTP response
+/// already is (WOR-2486 fix round 1, I5): `{error:#}` routinely embeds
+/// the full path it failed to read or resolve, and that path is this
+/// node's local filesystem layout. `with_rejection_reason` additionally
+/// bounds the result to 512 bytes, the same ceiling the decision-audit
+/// `reason` field uses.
+///
+/// What this does **not** do: scrub arbitrary config *values*. A
+/// compile error can legitimately echo a snippet of the offending YAML
+/// (an invalid CEL expression, an unknown key) in its message, and nothing
+/// here distinguishes that from ordinary error prose. See
+/// [`sbproxy_observe::audit::ConfigAuditEntry::with_rejection_reason`]'s
+/// own doc for the contract this actually keeps.
+fn audit_reload_outcome(source: &str, config_path: &str, result: &anyhow::Result<ReloadOutcome>) {
+    match result {
+        Ok(_) => {
+            sbproxy_observe::ConfigAuditEntry::new(source, Vec::new(), Vec::new(), Vec::new())
+                .emit();
+        }
+        Err(error) => {
+            let reason = crate::path_redact::sanitise_path_in_error(
+                &format!("{error:#}"),
+                std::path::Path::new(config_path),
+            );
+            sbproxy_observe::ConfigAuditEntry::new(source, Vec::new(), Vec::new(), Vec::new())
+                .with_rejection_reason(reason)
+                .emit();
+        }
+    }
 }
 
 /// WOR-1186: build the configured session-ledger sink and register it
@@ -673,6 +736,60 @@ fn resolve_events_signing_secret(reference: Option<&str>) -> anyhow::Result<Opti
     }
 }
 
+/// Warn about `events.types` entries an operator selected that nothing
+/// publishes yet (WOR-2486, mirroring [`warn_unwired_decision_audit_events`]
+/// for the typed proxy event feed).
+///
+/// `events.types:` accepts every declared
+/// [`sbproxy_observe::EventType`] on purpose (see `validate_events` in
+/// `sbproxy-config`): refusing an unwired one would block
+/// pre-configuring a type a later release wires, and would fail a
+/// correct config over a gap in this crate's own instrumentation. That
+/// leaves the operator with no signal at the moment the mistake is
+/// made, and a silent `events:` sink reads exactly like a sink with
+/// nothing to report.
+///
+/// Called only when `events:` is present, same as
+/// [`install_event_egress`]: an absent block has no sink to warn about,
+/// and `sink: none` cannot carry a non-empty `types:` past config
+/// validation.
+fn warn_unwired_proxy_events(cfg: &sbproxy_config::types::EventsConfig) {
+    let unwired = unwired_proxy_events(cfg);
+    if !unwired.is_empty() {
+        tracing::warn!(
+            events = %unwired.join(", "),
+            "events.types selects event types that nothing publishes yet; the configured sink \
+             will not see these until their emitters ship"
+        );
+    }
+}
+
+/// The `events.types` entries this block selects that publish nothing.
+///
+/// Split out of the warning so it is testable directly, the same reason
+/// [`unwired_decision_audit_events`] is split from its warning: the
+/// warning itself only logs, and a feed that silently names the wrong
+/// types is exactly the failure this surface exists to avoid.
+pub(super) fn unwired_proxy_events(cfg: &sbproxy_config::types::EventsConfig) -> Vec<&'static str> {
+    use sbproxy_observe::EventType;
+
+    // Empty `types:` means every type, the same reading
+    // `build_event_egress` gives it.
+    let selected: Vec<EventType> = if cfg.types.is_empty() {
+        sbproxy_observe::ALL_EVENT_TYPES.to_vec()
+    } else {
+        cfg.types
+            .iter()
+            .filter_map(|name| EventType::from_name(name))
+            .collect()
+    };
+    selected
+        .iter()
+        .filter(|event_type| !event_type.has_emitter())
+        .map(|event_type| event_type.as_str())
+        .collect()
+}
+
 /// WOR-2318: start the configured event egress and register it
 /// process-wide.
 ///
@@ -983,12 +1100,20 @@ pub enum TryReloadOutcome {
 ///
 /// Returns `Err` under exactly the conditions [`reload_from_config_yaml`]
 /// does. Contention is `Ok(TryReloadOutcome::Busy)`, never an error.
+// `source` is the WOR-2486 addition: `audit_reload_outcome` needs a
+// `config_audit` source label, and the two callers of this function
+// (the config-authority bundle apply and the remote config-source
+// refresh poller) are different enough that one guessed label would be
+// wrong for one of them.
 pub(crate) fn try_reload_from_config_yaml(
     config_path: &str,
     yaml: &str,
+    source: &str,
 ) -> anyhow::Result<TryReloadOutcome> {
     let _reload_guard = match CONFIG_RELOAD_LOCK.try_lock() {
         Ok(guard) => guard,
+        // Busy is not a reload attempt: nothing was examined, so there
+        // is nothing to audit. The caller retries on its own schedule.
         Err(std::sync::TryLockError::WouldBlock) => return Ok(TryReloadOutcome::Busy),
         // A poisoned lock means some other reload panicked mid-flight.
         // The guarded data is `()`, so there is no corrupt state to
@@ -996,7 +1121,9 @@ pub(crate) fn try_reload_from_config_yaml(
         // worse than proceeding.
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
     };
-    reload_from_config_yaml_locked(config_path, yaml).map(TryReloadOutcome::Applied)
+    let result = reload_from_config_yaml_locked(config_path, yaml);
+    audit_reload_outcome(source, config_path, &result);
+    result.map(TryReloadOutcome::Applied)
 }
 
 /// What one non-blocking extension bundle refresh attempt did.
@@ -1047,7 +1174,7 @@ pub(crate) fn try_refresh_extension_bundles(
     match crate::extension_refresh::apply_if_changed(
         &current_fingerprint,
         &candidate_fingerprint,
-        || reload_compiled_config_locked(config_path, compiled, Some(candidate), None),
+        || reload_for_extension_refresh(config_path, compiled, candidate),
     )? {
         crate::extension_refresh::CandidateDecision::Applied(outcome) => {
             Ok(TryBundleRefreshOutcome::Applied(outcome))
@@ -1056,6 +1183,29 @@ pub(crate) fn try_refresh_extension_bundles(
             Ok(TryBundleRefreshOutcome::NotModified)
         }
     }
+}
+
+/// Run the shared reload transaction for a changed extension-bundle
+/// candidate, auditing both outcomes (WOR-2486 fix round 1, C1).
+///
+/// This is the sixth reload path, and the one `config_audit` missed
+/// entirely: `apply_if_changed` only calls its closure when the verified
+/// Git fingerprint actually moved, so `NotModified` (nothing to apply)
+/// and `Busy` (nothing examined) stay un-audited on the same grounds
+/// [`audit_reload_outcome`]'s other callers already use, but an attempt
+/// that reaches this function, accepted or rejected, was silent before
+/// this fix. Split into its own function so the audit call is testable
+/// without a live Git fetch: a candidate built from an empty
+/// `ExtensionBundlesConfig` reaches this function exactly like a real
+/// one would.
+fn reload_for_extension_refresh(
+    config_path: &str,
+    compiled: sbproxy_config::CompiledConfig,
+    candidate: std::sync::Arc<sbproxy_extension::bundle::DynamicBundleRegistry>,
+) -> anyhow::Result<ReloadOutcome> {
+    let result = reload_compiled_config_locked(config_path, compiled, Some(candidate), None);
+    audit_reload_outcome("extension_refresh", config_path, &result);
+    result
 }
 
 /// Hold the reload lock so a test can prove that a caller which must not
@@ -2121,7 +2271,21 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     // starts nothing and cannot fail.
     if let Some(cfg) = compiled.events.as_ref() {
         install_event_egress(cfg)?;
+        warn_unwired_proxy_events(cfg);
     }
+
+    // --- WOR-2486: bridge egress refusals onto the typed event feed ---
+    //
+    // Unconditional, unlike the two sinks above: `sbproxy-security` is a
+    // leaf crate that cannot depend on `sbproxy-observe` (see the doc on
+    // `sbproxy_security::egress::install_egress_refused_hook`), so this
+    // is the one place the bridge can be wired regardless of whether
+    // `events:` is configured. The hook itself is a relaxed load when no
+    // egress is installed, so registering it costs nothing on a
+    // deployment that never sets `events:`.
+    let _ = sbproxy_security::egress::install_egress_refused_hook(
+        sbproxy_observe::egress_bridge::bridge,
+    );
 
     // WOR-1164: install the detection singletons (agent-class resolver,
     // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer).
@@ -5819,6 +5983,135 @@ origins:
         assert_eq!(
             resolve_or_default_admin_operator_pepper(Some(&cfg), true).unwrap(),
             b"pinned-pepper".to_vec()
+        );
+    }
+
+    /// WOR-2486 fix round 1, C1: the sixth reload path. Before this fix,
+    /// an extension-bundle refresh that changed a verified Git fingerprint
+    /// ran the full reload transaction and published (or rejected) a
+    /// pipeline generation with zero trace in `config_audit`, accepted or
+    /// rejected. Red first against `reload_for_extension_refresh` directly
+    /// so the test does not depend on a live Git fetch: an empty
+    /// `ExtensionBundlesConfig` loads its (empty) candidate with no I/O.
+    #[test]
+    fn extension_bundle_refresh_reaches_config_audit_on_success_and_failure() {
+        let candidate = sbproxy_extension::bundle::DynamicBundleRegistry::load_with_context(
+            &sbproxy_config::ExtensionBundlesConfig::default(),
+            std::path::Path::new("."),
+            &std::collections::BTreeSet::new(),
+            &sbproxy_config::FetchContext::with_git_binary(),
+        )
+        .expect("an empty bundle config loads its candidate with no I/O");
+
+        let before = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("config"),
+            Some("extension_refresh"),
+            None,
+        )
+        .len();
+
+        let accepted = sbproxy_config::compile_config(
+            r#"
+origins:
+  "extension-refresh-audit-ok.test":
+    action:
+      type: static
+      body: ok
+"#,
+        )
+        .expect("accepted fixture config compiles");
+        let _ = reload_for_extension_refresh(
+            "extension-refresh-audit-test.yml",
+            accepted,
+            Arc::clone(&candidate),
+        );
+
+        // WOR-2162: the same invalid-CEL shape
+        // `reload_with_invalid_cel_expression_keeps_the_active_pipeline`
+        // (in `server/tests.rs`) uses to fail pipeline construction after
+        // `compile_config` already succeeded, so the rejection happens
+        // inside the reload transaction this function wraps rather than
+        // before it is ever called.
+        let rejected = sbproxy_config::compile_config(
+            r#"
+origins:
+  "extension-refresh-audit-reject.test":
+    action:
+      type: static
+      body: ok
+    policies:
+      - type: expression
+        expression: 'this is not valid CEL !!!'
+"#,
+        )
+        .expect("rejected fixture config still compiles at the YAML/schema layer");
+        let reject_result =
+            reload_for_extension_refresh("extension-refresh-audit-test.yml", rejected, candidate);
+        assert!(
+            reject_result.is_err(),
+            "the invalid CEL fixture must fail pipeline construction, or this test is not \
+             exercising the rejection branch it claims to"
+        );
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("config"),
+            Some("extension_refresh"),
+            None,
+        );
+        assert!(
+            events.len() >= before + 2,
+            "both the accepted and the rejected extension-bundle refresh must reach \
+             config_audit: before={before}, after={events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("rejected:")),
+            "the rejection must be distinguishable from the accepted entry: {events:?}"
+        );
+    }
+
+    /// WOR-2486 fix round 1, I5: `audit_reload_outcome`'s rejection
+    /// reason must be scrubbed through the same path redaction the
+    /// admin API's HTTP responses already get, not recorded verbatim.
+    /// Before this fix, a compile or filesystem error that echoed the
+    /// full config path (a routine `anyhow` context pattern) landed
+    /// unscrubbed in a `config_audit` record, which is durable under
+    /// `audit.sink: chain`.
+    #[test]
+    fn audit_reload_outcome_scrubs_the_config_path_from_the_rejection_reason() {
+        let config_path = "/home/deploy/configs/prod/sb-secret-layout.yml";
+        let err: anyhow::Result<ReloadOutcome> = Err(anyhow::anyhow!(
+            "failed to parse config: {config_path}: mapping values are not allowed here"
+        ));
+
+        let before = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("config"),
+            Some("path_redact_test"),
+            None,
+        )
+        .len();
+        audit_reload_outcome("path_redact_test", config_path, &err);
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("config"),
+            Some("path_redact_test"),
+            None,
+        );
+        assert!(events.len() > before, "the rejection must reach the ring");
+        let detail = events[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            !detail.contains("/home/deploy/configs/prod"),
+            "the full config path must not reach the audit record: {detail:?}"
+        );
+        assert!(
+            detail.contains("sb-secret-layout.yml"),
+            "the file name (the useful, non-sensitive half) should remain: {detail:?}"
         );
     }
 }
