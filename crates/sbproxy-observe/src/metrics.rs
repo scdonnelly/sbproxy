@@ -4323,6 +4323,235 @@ pub fn record_mcp_tool_cost(tool: &str, server: &str, cost_usd: f64) {
         .inc_by(cost_usd);
 }
 
+/// Record one MCP tool call refused because `events.fail_closed` names
+/// `mcp_governance_decision` and the evidence record could not be
+/// queued (`sbproxy_mcp_evidence_fail_closed_total{tenant}`, WOR-2384).
+///
+/// A tick here means the caller received a JSON-RPC internal error
+/// naming `evidence_unavailable` rather than the tool's actual result,
+/// even when the tool call itself succeeded: the gateway refused to
+/// serve a response it could not also evidence.
+pub fn record_mcp_evidence_fail_closed(tenant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_evidence_fail_closed_total",
+            "MCP tool calls refused because fail-closed evidence delivery failed, by tenant",
+            &["tenant"],
+        )
+        .expect("mcp evidence fail-closed counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter.with_label_values(&[tenant.as_str()]).inc();
+}
+
+/// Record one tenant that overflowed the evidence-sequence registry's
+/// [`crate::evidence_seq`] cap and fell back to the shared overflow
+/// counter (`sbproxy_evidence_seq_tenant_cap_total`, WOR-2384). No
+/// labels: the cap is process-wide, and the tenant that caused it is
+/// exactly the caller-controlled string the cap exists to bound, so it
+/// cannot appear as a label value without recreating the unbounded
+/// cardinality the cap is closing off.
+pub fn record_evidence_seq_tenant_cap() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_evidence_seq_tenant_cap_total",
+            "Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter",
+        )
+        .expect("evidence seq tenant cap counter registers")
+    });
+    counter.inc();
+}
+
+/// Record one `argument_policies[]` rule outcome that was not a plain
+/// allow, on `sbproxy_mcp_argument_policy_total{tenant, rule, verdict}`
+/// (WOR-2384, MCP05). `verdict` is `"warn"` or `"deny"`; a compliant
+/// evaluation is not recorded here, matching the sibling `mcp_rbac` /
+/// `mcp_quota` / `mcp_peer_downgrade` policy triggers, which also only
+/// ever record a triggered outcome.
+///
+/// `rule` is the operator-configured rule name. Cardinality is bounded
+/// by config, the same reasoning `sbproxy_mcp_evidence_fail_closed_total`
+/// documents for `tenant`: both label values come from what an operator
+/// wrote, not from caller-controlled request data.
+pub fn record_mcp_argument_policy(tenant: &str, rule: &str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_argument_policy_total",
+            "MCP argument-policy rule triggers, by tenant, rule name, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp argument policy counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    let rule = sanitize_label("rule", rule);
+    counter
+        .with_label_values(&[tenant.as_str(), rule.as_str(), verdict])
+        .inc();
+}
+
+/// Record one `initialize` refused because the session registry was
+/// full, either globally (`MAX_TRACKED_SESSIONS`) or for the caller's
+/// tenant (`MAX_TRACKED_SESSIONS_PER_TENANT`)
+/// (`sbproxy_mcp_session_registry_saturated_total`, WOR-2384; meaning
+/// changed by the F1/F2 fix round from "shared the fallback overflow
+/// session" to this fail-closed refusal once that fallback session
+/// was removed). No labels: the tenant that caused it is exactly the
+/// caller-controlled string the cap exists to bound, so it cannot
+/// appear as a label value without recreating the unbounded
+/// cardinality the cap is closing off -- same reasoning
+/// `record_evidence_seq_tenant_cap` documents for its own cap. Which
+/// of the two caps tripped is on the `sbproxy::mcp::sessions`
+/// `tracing::warn!` line only; the caller-visible refusal, the
+/// `security_audit` entry, and this counter all stay one closed
+/// reason (`mcp_session_registry_saturated`) regardless, since the
+/// caller-visible behavior is identical either way.
+pub fn record_mcp_session_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_session_registry_saturated_total",
+            "MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp session registry saturated counter registers")
+    });
+    counter.inc();
+}
+
+/// Record one peer-profile observation that could not be tracked
+/// because the peer registry was full, either globally
+/// (`sbproxy_extension::mcp::peer_profile::MAX_TRACKED_PEERS`) or for
+/// the caller's tenant
+/// (`MAX_TRACKED_PEERS_PER_TENANT`)
+/// (`sbproxy_mcp_peer_registry_saturated_total`, WOR-2384 whole-branch
+/// review, item 1: fail-closed per-pair, no shared fallback profile,
+/// mirroring `record_mcp_session_registry_saturated`'s own redesign).
+/// No labels, same reasoning as that counter's: the tenant that caused
+/// it is exactly the caller-controlled string the cap exists to bound.
+/// Ticks on every refused-tracking call regardless of `downgrade:`
+/// policy -- registry capacity is a fact independent of whether the
+/// caller then refuses (`block`) or allows (`warn`) the call; the
+/// once-per-tenant `tracing::warn!` line that accompanies it is a
+/// separate, deliberately noisier-than-this-counter dedup (see
+/// `peer_profile::warned_tenants`'s doc comment).
+pub fn record_mcp_peer_registry_saturated() {
+    use prometheus::{register_int_counter, IntCounter};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter!(
+            "sbproxy_mcp_peer_registry_saturated_total",
+            "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant",
+        )
+        .expect("mcp peer registry saturated counter registers")
+    });
+    counter.inc();
+}
+
+/// Record one `content_filters` category outcome that was not a plain
+/// miss, on `sbproxy_mcp_content_filter_total{tenant, category,
+/// verdict}` (WOR-2384, MCP01/MCP10). `category` is `"secrets"` or
+/// `"pii"`; `verdict` is `"warn"`, `"redact"`, or `"deny"`. A category
+/// that matched nothing (or is `off`) is not recorded here, matching
+/// the sibling `mcp_argument_policy` / `mcp_flow` triggers, which also
+/// only ever record a triggered outcome.
+///
+/// `category` is a fixed, closed-vocabulary string (not operator-
+/// supplied), so cardinality here is bounded by this crate rather than
+/// by config.
+pub fn record_mcp_content_filter(tenant: &str, category: &'static str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_content_filter_total",
+            "MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict",
+            &["tenant", "category", "verdict"],
+        )
+        .expect("mcp content filter counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[tenant.as_str(), category, verdict])
+        .inc();
+}
+
+/// Record one `result_policies[]` rule outcome that was not a plain
+/// allow, on `sbproxy_mcp_result_policy_total{tenant, rule, verdict}`
+/// (WOR-2384, MCP01/MCP10). `verdict` is `"warn"` or `"deny"`. Mirrors
+/// [`record_mcp_argument_policy`] exactly, for the result-side surface.
+///
+/// `rule` is the operator-configured rule name, so cardinality here is
+/// bounded by config, the same reasoning `record_mcp_argument_policy`
+/// documents.
+pub fn record_mcp_result_policy(tenant: &str, rule: &str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_result_policy_total",
+            "MCP result-policy rule triggers, by tenant, rule name, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp result policy counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    let rule = sanitize_label("rule", rule);
+    counter
+        .with_label_values(&[tenant.as_str(), rule.as_str(), verdict])
+        .inc();
+}
+
+/// Record one session-flow enforcement outcome that was not a plain
+/// allow, on `sbproxy_mcp_flow_total{tenant, rule, verdict}` (WOR-2384,
+/// MCP06; fix round 1 added the confidentiality-axis and pair-rule
+/// values). `rule` is one of the closed set: `"flow_taint"` (a session
+/// newly tainted -- leg 1) or `"flow_sensitive_touched"` (a session
+/// newly touched sensitive-labeled data -- leg 2), both always recorded
+/// with `verdict = "warn"` since the read that caused either transition
+/// was itself permitted; `"flow_exfil_block"` (an outbound-tool call
+/// while the default `rule: two_of_three` is satisfied -- both legs 1
+/// and 2) or `"flow_pair_block"` (an outbound-tool call while the
+/// explicit `rule: taint_and_outbound` is satisfied -- leg 1 alone),
+/// either recorded with `verdict = "warn"` or `"deny"` depending on
+/// `flow.mode`. A compliant call is not recorded here,
+/// matching the sibling `mcp_rbac` / `mcp_quota` / `mcp_peer_downgrade`
+/// / `mcp_argument_policy` triggers, which also only ever record a
+/// triggered outcome.
+///
+/// `rule` is a fixed, closed-vocabulary string (not operator-supplied,
+/// unlike `sbproxy_mcp_argument_policy_total`'s `rule` label), so
+/// cardinality here is bounded by this crate rather than by config.
+pub fn record_mcp_flow(tenant: &str, rule: &'static str, verdict: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_mcp_flow_total",
+            "MCP session-flow enforcement triggers, by tenant, rule id, and verdict",
+            &["tenant", "rule", "verdict"],
+        )
+        .expect("mcp flow counter registers")
+    });
+    let tenant = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[tenant.as_str(), rule, verdict])
+        .inc();
+}
+
 /// Record a static tool-poisoning indicator found in advertised tool text on
 /// `sbproxy_mcp_poison_indicators_total{field, indicator, kind}`.
 ///
@@ -7143,6 +7372,75 @@ mod tests {
                 .any(|(labels, value)| labels.contains("policy=budget_share") && *value >= 1.0),
             "sbproxy_policy_panic_total did not register or did not carry \
              the policy label: {counted:?}"
+        );
+    }
+
+    /// An MCP argument-policy trigger is counted on
+    /// `sbproxy_mcp_argument_policy_total{tenant, rule, verdict}` and
+    /// carries all three labels (WOR-2384, MCP05).
+    #[test]
+    fn mcp_argument_policy_trigger_is_counted_with_its_tenant_rule_and_verdict_labels() {
+        record_mcp_argument_policy("acme", "no-path-traversal", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_argument_policy_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=no-path-traversal")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_argument_policy_total did not register or did not carry \
+             the tenant/rule/verdict labels: {counted:?}"
+        );
+    }
+
+    /// A session-flow enforcement trigger is counted on
+    /// `sbproxy_mcp_flow_total{tenant, rule, verdict}` and carries all
+    /// three labels (WOR-2384, MCP06).
+    #[test]
+    fn mcp_flow_trigger_is_counted_with_its_tenant_rule_and_verdict_labels() {
+        record_mcp_flow("acme", "flow_exfil_block", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_flow_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_exfil_block")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not register or did not carry \
+             the tenant/rule/verdict labels: {counted:?}"
+        );
+    }
+
+    /// The full rule vocabulary WOR-2384 fix round 1 added
+    /// (`flow_sensitive_touched`, `flow_pair_block`) is recorded the
+    /// same way the pre-existing `flow_exfil_block` rule already was.
+    #[test]
+    fn mcp_flow_records_the_confidentiality_axis_and_pair_rule_labels() {
+        record_mcp_flow("acme", "flow_sensitive_touched", "warn");
+        record_mcp_flow("acme", "flow_pair_block", "deny");
+
+        let counted = gathered_series("sbproxy_mcp_flow_total");
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_sensitive_touched")
+                    && labels.contains("verdict=warn")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not carry flow_sensitive_touched: {counted:?}"
+        );
+        assert!(
+            counted.iter().any(|(labels, value)| {
+                labels.contains("tenant=acme")
+                    && labels.contains("rule=flow_pair_block")
+                    && labels.contains("verdict=deny")
+                    && *value >= 1.0
+            }),
+            "sbproxy_mcp_flow_total did not carry flow_pair_block: {counted:?}"
         );
     }
 }

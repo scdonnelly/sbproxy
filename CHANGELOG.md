@@ -12,6 +12,125 @@ the next version cut.
 
 ### Added
 
+- **MCP tool calls emit a governance evidence event, with an optional
+  fail-closed guarantee.** The `events:` type list grows to thirteen
+  declared types, eleven of which publish today (see
+  [events.md](docs/events.md)). The new one,
+  `mcp_governance_decision`, carries OTel GenAI/MCP semantic-convention
+  attribute names plus sbproxy's own `sbproxy.*` fields (verdict,
+  redacted reason, a salted argument hash, and a per-tenant gapless
+  sequence number a SIEM can use to detect a dropped record) for every
+  dispatched `tools/call`. `events.fail_closed` names event types that
+  must never be silently dropped; when `mcp_governance_decision` is
+  listed there and the record cannot be queued, the tool call is
+  refused with a JSON-RPC internal error rather than served
+  un-evidenced, and `sbproxy_mcp_evidence_fail_closed_total{tenant}`
+  counts every refusal. Everything else keeps the existing best-effort,
+  drop-and-count contract.
+
+- **`mcp_governance_decision` covers tool-definition and registry
+  changes, plus an opt-in verbatim-arguments capture.** The
+  version-lockfile gate now emits a `tool_definition_changed` record
+  (verdict matching the gate's own `mode: block`/`warn` posture, old
+  and new contract-digest prefixes, never the contract text) whenever
+  a live tool contract moves without a matching declared version bump.
+  A federated server's registry approval status transitioning across a
+  config reload (`draft`, `approved`, `deprecated`) emits one
+  `server_status_changed` record per transition, not one per call.
+  New `mcp_audit.capture_arguments` (default `false`) opts a dispatched
+  call's record into `gen_ai.tool.call.arguments`: the call's
+  arguments, redacted and size-bounded the same way `mcp_audit`'s own
+  content fields already are, alongside the salted digest every call
+  already carries.
+
+- **Federated MCP servers resist a silent protocol or auth downgrade.**
+  `federated_servers[].protocol` pins one upstream to `2025-06-18`
+  (the only era outbound federation speaks today; pinning `2026-07-28`
+  is a config-compile error until outbound federation speaks it too);
+  the default, `auto`, negotiates and remembers, per tenant, the best
+  era and strictest auth posture that upstream has ever demonstrated.
+  A later contact that looks weaker, a legacy-only answer after
+  showing a stronger era, or a successful call needing no credentials
+  after having required them (classified from the upstream's real HTTP
+  response, a 401/407 for "required" and a clean unauthenticated
+  success for "not required"), is a downgrade:
+  `federated_servers[].downgrade: warn` (default) logs, counts, and
+  emits an `mcp_governance_decision` evidence event with verdict
+  `warn`; `block` refuses the call until the operator pins `protocol`
+  explicitly or edits that server entry. A refusal emits the same
+  event with verdict `deny`, and a `SecurityAuditEntry` policy
+  violation; `rule_id` is `peer_downgrade` for an actual downgrade and
+  `protocol_pin_mismatch` for a pinned peer answering the wrong era.
+  `resources/read` and `prompts/get` reach the same downgrade check for
+  the federated peer they contact, alongside `tools/call`.
+
+- **The base MCP connect is gated and inventoried, and federated
+  servers get a registry approval status.** `federated_servers[].egress`
+  now applies to a plain `type: mcp` server's base connect
+  (`streamable_http` or `sse`), not just a `type: openapi` server's REST
+  calls; an unconfigured policy is stamped `ungated` rather than
+  silently allowed, and every dial's outcome shows up at
+  `GET /api/egress` under purpose `mcp_upstream`. A `type: openapi`
+  server's egress denial, previously silent, is now recorded there too.
+  `federated_servers[].status: draft | approved | deprecated` (absent
+  means `approved`, so existing configs are unaffected) stages a
+  Draft-to-Approved-to-Deprecated review lifecycle: `draft` hides a
+  server's tools from `tools/list` and refuses every call against them,
+  naming the status; `deprecated` keeps the server fully callable but
+  emits a warn-level `mcp_governance_decision` event on every call.
+  Optional `approved_by` / `approved_at` metadata is operator-attested
+  and stored, not verified.
+
+- **MCP tool calls can be authorized on their arguments, not just their
+  name.** An `mcp` action's `argument_policies[]` evaluates a CEL or
+  OPA-compatible Rego expression against the tool-call context
+  (`mcp.tool.name`, `mcp.server`, `mcp.session.id`, `mcp.arguments`,
+  `mcp.tenant`, `mcp.principal.{sub,team,project,user}`) after RBAC and
+  JSON-Schema validation pass and before the call quotas and
+  dispatches: a rule can only narrow an already-passed RBAC allow,
+  never widen it. `mode: warn` (default) logs and emits a
+  `mcp_governance_decision` event with verdict `warn`; `mode: block`
+  refuses the call with a JSON-RPC error and verdict `deny`, naming the
+  rule as `sbproxy.decision.rule_id`. A rule that cannot be evaluated,
+  or whose engine panics, fails closed regardless of `mode`. Optional
+  `principals[]` selectors scope a rule to a tenant, team, or project,
+  the same shape as the RBAC `tool_access[].principals` rows. Legacy-era
+  `tools/call` requests with a compiled contract now also get the
+  JSON-Schema check modern-era calls already had.
+
+- **Deterministic session-flow enforcement gates a session that read
+  something untrusted and sensitive, then tries to leave (Meta's Rule of
+  Two).** An `mcp` action's `flow` block tracks two session-scoped,
+  most-restrictive-wins labels that never lower within a session:
+  `integrity` (`trusted` -> `tainted`, leg 1) and `sensitive_touched`
+  (`false` -> sticky `true`, leg 2). Leg 3 (an externally visible or
+  state-changing action) is evaluated fresh at each `tools/call` against
+  `flow.outbound_tools`, not stored. A `tools/call` result (or
+  `resources/read`) from a server outside `flow.trusted_servers` taints
+  the session (unlabeled upstream is untrusted, fail closed); one from a
+  server in `flow.sensitive_servers`, or a `tools/call` for a tool
+  matching `flow.sensitive_tools`, sets `sensitive_touched` (absent
+  sensitivity config reads default-open, unlike `integrity`). The
+  default rule, `flow.rule: two_of_three`, is Rule of Two itself: the
+  violation is a session with both legs tripped attempting an outbound
+  call; the explicit `flow.rule: taint_and_outbound` reproduces a
+  strictly stricter pair rule (tainted + outbound, sensitivity not
+  considered) for an operator who wants that instead.
+  `flow.mode: warn` logs and emits a `mcp_governance_decision` event
+  with verdict `warn`; `mode: block` refuses the call before dispatch
+  with verdict `deny`; `mode: off` (the default) tracks nothing. Every
+  transition and violation carries its own `sbproxy.decision.rule_id`:
+  `flow_taint`, `flow_sensitive_touched`, `flow_exfil_block` (the
+  default rule), or `flow_pair_block` (the explicit rule). Runs after
+  RBAC, per-tool quota, and `argument_policies[]` have already allowed
+  the call, and composes with (rather than replaces) `lethal_trifecta`
+  and `dual_llm_quarantine`. Without `sessions.enabled: true`, this
+  degrades to single-call scope, the same fallback `lethal_trifecta`
+  uses. The labels are also exposed on the `mcp` CEL/Rego namespace as
+  `mcp.session.integrity` and `mcp.session.sensitive_touched`, so a
+  custom `argument_policies[]` rule can compose a policy the two
+  built-in rules do not express.
+
 - **A gate refuses Apache-2.0-only crates that NOTICE does not name.**
   `scripts/check-notice.sh` (local `scripts/check.sh` and the CI lint
   job) fails when an Apache-2.0-only dependency is missing a stanza,

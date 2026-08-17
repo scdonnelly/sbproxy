@@ -674,6 +674,25 @@ fn compile_rule(rule: &PiiRule) -> anyhow::Result<CompiledRule> {
     })
 }
 
+/// Detector names from [`default_rules`] that shape-match credentials
+/// (API keys, tokens) rather than personal data.
+///
+/// Split out so a consumer that wants an independent `secrets:` vs
+/// `pii:` control (e.g. the MCP gateway's `content_filters` block,
+/// WOR-2384 MCP01/MCP10) can partition the one shared catalogue into
+/// two subsets without forking the regex definitions. The complement
+/// of this set within [`default_rules`]'s names is the "pii" subset:
+/// `email`, `us_ssn`, `credit_card`, `phone_us`, `ipv4`, `iban`.
+pub fn secret_detector_names() -> &'static [&'static str] {
+    &[
+        "openai_key",
+        "anthropic_key",
+        "aws_access",
+        "github_token",
+        "slack_token",
+    ]
+}
+
 /// Default detector catalogue: returns the built-in PII / secrets
 /// regex rules. Useful for downstream policies (DLP) that want to
 /// reuse the catalogue without going through the full Redactor
@@ -930,6 +949,57 @@ mod tests {
         let r = defaults();
         let out = r.redact("Server 192.168.1.100 is offline.");
         assert_eq!(out, "Server [REDACTED:IP] is offline.");
+    }
+
+    #[test]
+    fn secret_detector_names_are_a_proper_subset_of_default_rules() {
+        // WOR-2384 (MCP01/MCP10): every name in the secrets subset must
+        // actually exist in the shared catalogue, and at least one
+        // default-rule name (e.g. `email`) must fall outside it so the
+        // "pii" complement is non-empty.
+        let rules = default_rules();
+        let all: std::collections::HashSet<&str> = rules.iter().map(|r| r.name.as_str()).collect();
+        for name in secret_detector_names() {
+            assert!(
+                all.contains(name),
+                "secret_detector_names() names {name:?}, which is not in default_rules()"
+            );
+        }
+        assert!(
+            !secret_detector_names().contains(&"email"),
+            "email is personal data, not a credential shape"
+        );
+    }
+
+    /// The catalogue partition is exhaustive by name: every rule in
+    /// [`default_rules`] must be explicitly classified as either a
+    /// credential shape ([`secret_detector_names`]) or personal data
+    /// (the list below). A new detector added to the catalogue fails
+    /// this test until someone decides which side it belongs on --
+    /// without this, a new credential detector would silently land in
+    /// the `pii` complement, and a consumer running
+    /// `secrets: block, pii: off` would stop catching it.
+    #[test]
+    fn every_default_rule_is_classified_as_secret_or_pii() {
+        const PII_DETECTOR_NAMES: &[&str] =
+            &["email", "us_ssn", "credit_card", "phone_us", "ipv4", "iban"];
+        let rules = default_rules();
+        for rule in &rules {
+            let is_secret = secret_detector_names().contains(&rule.name.as_str());
+            let is_pii = PII_DETECTOR_NAMES.contains(&rule.name.as_str());
+            assert!(
+                is_secret ^ is_pii,
+                "detector {:?} must be classified in exactly one of \
+                 secret_detector_names() or the pii list (secret={is_secret}, pii={is_pii}); \
+                 classify it before shipping it",
+                rule.name
+            );
+        }
+        assert_eq!(
+            rules.len(),
+            secret_detector_names().len() + PII_DETECTOR_NAMES.len(),
+            "the two subsets must partition the whole catalogue"
+        );
     }
 
     #[test]

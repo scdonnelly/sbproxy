@@ -28,7 +28,8 @@ use super::sse_client::send_via_sse;
 use super::streamable::send_request;
 use super::types::{JsonRpcRequest, JsonRpcResponse, META_TRACEPARENT, SEP_414_RESERVED_META_KEYS};
 use sbproxy_security::egress::{
-    record_egress_seen, AuthorizedDestination, EgressPurpose, EgressSightingStatus, HostResolver,
+    record_egress_refused, record_egress_seen, AuthorizedDestination, EgressPurpose,
+    EgressSightingStatus, HostResolver,
 };
 
 /// Outcome of [`McpFederation::call_tool_with_policy`].
@@ -98,7 +99,7 @@ pub struct OpenApiBacking {
 }
 
 /// Configuration for one upstream MCP server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct McpServerConfig {
     /// Human-readable name for this server.
     pub name: String,
@@ -112,6 +113,13 @@ pub struct McpServerConfig {
     /// spec (tools derived locally, `tools/call` dispatched as REST)
     /// rather than by speaking MCP to `url`.
     pub openapi: Option<OpenApiBacking>,
+    /// Deterministic egress policy for the base MCP dial itself
+    /// (`EgressPurpose::McpUpstream`, WOR-2384 / MCP09), independent
+    /// of any `OpenApiBacking::egress_policy` an `openapi`-backed
+    /// server also carries for its REST calls. `stdio` servers carry
+    /// a policy too (uniform construction) but it is never consulted:
+    /// stdio is a local process spawn, not a network dial.
+    pub egress_policy: EgressPolicy,
 }
 
 /// Resolve the advertised (and registry-key) name for a tool or resource
@@ -155,6 +163,17 @@ fn federated_name(
 pub struct FederatedTool {
     /// Unique tool name (may be prefixed with server name on conflict).
     pub name: String,
+    /// Original name the upstream advertised, so dispatch reaches it
+    /// with the name it knows (WOR-2384). Equal to `name` when no
+    /// collision (and no `namespace: always`) triggered the prefix.
+    /// Set once at fetch time, before `advertise_as` can run,
+    /// and never touched by it -- mirrors [`FederatedPrompt::upstream_name`]
+    /// and [`FederatedResource::upstream_uri`], which solved the same
+    /// problem for their surfaces. Not part of any client-facing
+    /// document (`contract`, `legacy_document`, and the `tools/list`
+    /// serializers below all read `name`, never this field), so the
+    /// unprefixed upstream name never reaches a caller.
+    pub upstream_name: String,
     /// Human-readable description.
     pub description: String,
     /// JSON Schema for the tool's input arguments.
@@ -204,10 +223,12 @@ pub struct FederatedTool {
 impl std::fmt::Debug for FederatedTool {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = bounded_control_free_identifier(&self.name, 96);
+        let upstream_name = bounded_control_free_identifier(&self.upstream_name, 96);
         let server_name = bounded_control_free_identifier(&self.server_name, 96);
         formatter
             .debug_struct("FederatedTool")
             .field("name", &name)
+            .field("upstream_name", &upstream_name)
             .field("server_name", &server_name)
             .field("streaming", &self.streaming)
             .field("has_meta", &self.meta.is_some())
@@ -312,6 +333,7 @@ impl FederatedTool {
         let legacy_document = contract.is_none().then_some(document);
 
         Ok(Self {
+            upstream_name: name.clone(),
             name,
             description,
             input_schema,
@@ -329,6 +351,11 @@ impl FederatedTool {
     /// keep the frozen routing conveniences in lockstep. A malformed
     /// legacy definition has no strict contract, so its raw fallback
     /// is the authoritative source for this rewrite.
+    ///
+    /// Deliberately never touches [`Self::upstream_name`]: that field
+    /// is the whole point of calling this the *advertised* name
+    /// rather than a rename, and it must still name what the upstream
+    /// itself calls the tool after this runs.
     fn advertise_as(&mut self, advertised_name: &str) {
         if let Some(contract) = self.contract.as_ref() {
             self.contract = Some(contract.with_advertised_name(advertised_name));
@@ -1169,6 +1196,29 @@ pub struct McpFederation {
     /// needs to know what an upstream supports, so adding a surface
     /// does not add a handshake.
     server_capabilities: ArcSwap<HashMap<String, serde_json::Value>>,
+    /// server_name -> the `protocolVersion` string the upstream answered
+    /// with on its last `initialize`, refreshed by
+    /// `refresh_server_capabilities` in the same pass as
+    /// `server_capabilities`. This map is process-wide -- there is
+    /// exactly one upstream behind a server name, so what it answers is
+    /// not a per-tenant fact. Per-tenant downgrade-resistance scoping
+    /// happens in `sbproxy_extension::mcp::peer_profile`, which a caller
+    /// consults using the value this map reports (WOR-2384).
+    server_protocol_versions: ArcSwap<HashMap<String, String>>,
+    /// server_name -> whether the upstream's last classifiable contact
+    /// required authentication, refreshed by
+    /// `refresh_server_capabilities` in the same pass, and rebuilt from
+    /// scratch every cycle exactly like `server_capabilities` and
+    /// `server_protocol_versions` are: a server this cycle could not
+    /// classify (a network error, a 5xx, a malformed response) is
+    /// simply absent from the new map, the same "an upstream missing
+    /// from the snapshot simply declares nothing" contract those two
+    /// siblings already document, rather than carrying a stale value
+    /// forward. A successful unauthenticated probe (this cycle's
+    /// `initialize` call, which always dispatches with no credentials)
+    /// records `false`; a 401 or 407 records `true` -- see
+    /// `classify_auth_required_from_error`. WOR-2384.
+    server_auth_required: ArcSwap<HashMap<String, bool>>,
     /// WOR-818: mcpApps capability values mirrored from any
     /// upstream that advertised one. Empty when no upstream
     /// supports SEP-1865. The first non-empty value is what the
@@ -1321,6 +1371,8 @@ impl McpFederation {
             prompts: ArcSwap::from_pointee(HashMap::new()),
             prompt_catalog_owner: Arc::new(()),
             server_capabilities: ArcSwap::from_pointee(HashMap::new()),
+            server_protocol_versions: ArcSwap::from_pointee(HashMap::new()),
+            server_auth_required: ArcSwap::from_pointee(HashMap::new()),
             mcp_apps_capability: ArcSwap::from_pointee(None),
             client,
             openapi_client,
@@ -1797,15 +1849,41 @@ impl McpFederation {
     /// Returns the number of upstreams that answered.
     pub async fn refresh_server_capabilities(&self) -> usize {
         let mut snapshot: HashMap<String, serde_json::Value> = HashMap::new();
+        // WOR-2384 fix round 2: unlike `snapshot` and `auth_required`,
+        // which are rebuilt from scratch every cycle, `protocol_versions`
+        // starts from the CURRENT stored map and is only ever advanced
+        // by a fresh positive observation. A single `initialize` round
+        // trip can only ever produce ONE of "here is the protocol
+        // version" (a success) or "here is the auth posture" (a
+        // classified 401/407) -- never both -- so rebuilding this map
+        // fresh every cycle would erase a peer's last known protocol on
+        // exactly the cycle where the auth signal matters most (a 401
+        // carries no protocol version at all), leaving the dispatch-time
+        // downgrade check with nothing to compare against right when an
+        // auth-posture observation needs a protocol to pair it with. See
+        // [`Self::last_negotiated_protocol`]'s doc comment for the read
+        // side of this contract.
+        let mut protocol_versions: HashMap<String, String> =
+            (*self.server_protocol_versions.load_full()).clone();
+        let mut auth_required: HashMap<String, bool> = HashMap::new();
         for server in &self.servers {
             if server.openapi.is_some() {
                 continue;
             }
             match self.fetch_server_capabilities(server).await {
-                Ok(caps) => {
+                Ok((caps, protocol_version)) => {
                     snapshot.insert(server.name.clone(), caps);
+                    protocol_versions.insert(server.name.clone(), protocol_version);
+                    // WOR-2384: this probe always dispatches with `&[]`
+                    // extra_headers (see `fetch_server_capabilities`),
+                    // so a success is unambiguous proof the upstream
+                    // did not require auth for this contact.
+                    auth_required.insert(server.name.clone(), false);
                 }
                 Err(e) => {
+                    if let Some(required) = classify_auth_required_from_error(&e) {
+                        auth_required.insert(server.name.clone(), required);
+                    }
                     warn!(
                         server = %server.name,
                         error = %e,
@@ -1816,6 +1894,9 @@ impl McpFederation {
         }
         let count = snapshot.len();
         self.server_capabilities.store(Arc::new(snapshot));
+        self.server_protocol_versions
+            .store(Arc::new(protocol_versions));
+        self.server_auth_required.store(Arc::new(auth_required));
         count
     }
 
@@ -1830,12 +1911,58 @@ impl McpFederation {
             .is_some()
     }
 
-    /// Initialize the upstream and return the whole `capabilities`
-    /// object it advertised, or `Value::Null` when it advertised none.
+    /// The `protocolVersion` string `server_name` answered with on its
+    /// last successful `initialize`, or `None` when it has never
+    /// answered at all (never probed yet, an OpenAPI-backed upstream, or
+    /// every probe ever attempted has failed). Feeds the peer-profile
+    /// downgrade check (WOR-2384); call after at least one
+    /// [`Self::refresh_server_capabilities`].
+    ///
+    /// Unlike [`Self::last_auth_required`], this value **persists
+    /// across a cycle that fails** (see `refresh_server_capabilities`'s
+    /// doc comment): a 401/407 or a network error does not clear a
+    /// previously observed protocol version. A single `initialize`
+    /// round trip cannot produce both a protocol answer and an auth
+    /// classification, so without this persistence a cycle that
+    /// classifies auth posture would always report `None` here,
+    /// leaving the dispatch-time downgrade check nothing to pair the
+    /// fresh auth observation against.
+    pub fn last_negotiated_protocol(&self, server_name: &str) -> Option<String> {
+        self.server_protocol_versions
+            .load()
+            .get(server_name)
+            .cloned()
+    }
+
+    /// Whether `server_name` required authentication on its last
+    /// classifiable contact, or `None` when *this* cycle could not
+    /// classify it (never probed yet, an OpenAPI-backed upstream, or a
+    /// probe failure that was not a 401/407). Feeds the peer-profile
+    /// auth-posture downgrade check (WOR-2384); call after at least one
+    /// [`Self::refresh_server_capabilities`].
+    ///
+    /// Unlike [`Self::last_negotiated_protocol`], this value is rebuilt
+    /// fresh every cycle and does **not** persist a stale classification
+    /// forward on its own; a caller that needs "the best posture ever
+    /// observed" across a cycle with no fresh classification falls back
+    /// to the peer-profile registry's own recorded value instead (see
+    /// `mcp_peer_downgrade_check` in `sbproxy-core`), which is where
+    /// that persistence already lives.
+    pub fn last_auth_required(&self, server_name: &str) -> Option<bool> {
+        self.server_auth_required.load().get(server_name).copied()
+    }
+
+    /// Initialize the upstream and return the `capabilities` object it
+    /// advertised (or `Value::Null` when it advertised none) alongside
+    /// the `protocolVersion` string it answered with. A response that
+    /// omits `protocolVersion`, or carries a non-string value, is
+    /// treated as [`super::types::LEGACY_PROTOCOL_VERSION`]: only
+    /// positive modern evidence counts as modern, the same rule
+    /// inbound era classification already applies (`classify_http_era`).
     async fn fetch_server_capabilities(
         &self,
         server: &McpServerConfig,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<(serde_json::Value, String)> {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "initialize".to_string(),
@@ -1856,7 +1983,13 @@ impl McpFederation {
             );
         }
         let result = resp.result.unwrap_or_default();
-        Ok(result.get("capabilities").cloned().unwrap_or_default())
+        let capabilities = result.get("capabilities").cloned().unwrap_or_default();
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or(super::types::LEGACY_PROTOCOL_VERSION)
+            .to_string();
+        Ok((capabilities, protocol_version))
     }
 
     /// Fetch the resource list from one upstream server. Pure
@@ -2593,12 +2726,23 @@ impl McpFederation {
                 .await;
         }
 
+        // WOR-2384: the upstream never learned the advertised
+        // (possibly server-prefixed) name -- `advertise_as` rewrites
+        // `federated.name`/`contract`/`legacy_document` for clients,
+        // never `upstream_name`, so this is the one field that still
+        // names what the upstream itself calls the tool. Sending
+        // `tool_name` (the advertised name) here always failed
+        // upstream with an unknown-tool error under `namespace:
+        // always` or a collision rename. Mirrors
+        // `get_prompt_from_snapshot`'s `prompt.upstream_name` and
+        // `read_resource_inner`'s `resource.upstream_uri`, which
+        // solved the identical problem for their surfaces.
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             method: "tools/call".to_string(),
             params: Some(merge_trace_context(
                 json!({
-                    "name": tool_name,
+                    "name": federated.upstream_name.as_str(),
                     "arguments": arguments,
                 }),
                 &trace_pairs,
@@ -2735,6 +2879,23 @@ impl McpFederation {
                     EgressSightingStatus::Denied,
                     Some(e),
                 );
+                // WOR-2384 (MCP09) + WOR-2486: the refusal also reaches
+                // the typed `egress_refused` event. Whole-branch
+                // review, item 6: labeled with `server.name`, not
+                // `federated_name`. `record_egress_seen`'s sighting row
+                // just above stays on `federated_name` deliberately --
+                // that inventory is keyed on `(purpose, host, port)`,
+                // capped at 1024 entries regardless of how many
+                // distinct `origin` strings pass through it, so a tool
+                // name there cannot grow the map unboundedly.
+                // `record_egress_refused` is different: `origin` is a
+                // literal Prometheus label value on
+                // `sbproxy_egress_refused_total`, with no cap of its
+                // own, so an unbounded, caller-influenceable tool name
+                // there is a real cardinality-explosion vector this
+                // fixes. The sibling `McpUpstream` egress-refused site
+                // already uses `&server.name` for the same reason.
+                record_egress_refused(EgressPurpose::OpenApiTool, e, "", &server.name);
                 return Err(anyhow::anyhow!("egress denied: {e:?}"));
             }
         };
@@ -2897,10 +3058,25 @@ impl McpFederation {
         req: &JsonRpcRequest,
         extra_headers: &[(String, String)],
     ) -> anyhow::Result<JsonRpcResponse> {
+        // WOR-2384 (MCP09): every non-stdio dial to this upstream --
+        // the `initialize` capability probe, `tools/call`,
+        // `refresh_tools`, `refresh_resources`, `refresh_prompts` --
+        // funnels through this one function, so gating here covers
+        // every connect site the base (non-`openapi`) MCP path has.
+        // `stdio` spawns a local process and is out of scope for a
+        // network egress purpose. Fix round 1: the authorized client
+        // (pinned when the destination has verified addresses, shared
+        // otherwise) is what must be dialled with, not `&self.client`
+        // unconditionally -- see `authorize_mcp_upstream_dial`.
+        let dial_client = if server.transport.as_str() != "stdio" {
+            Some(self.authorize_mcp_upstream_dial(server)?)
+        } else {
+            None
+        };
         let result = match server.transport.as_str() {
             "sse" => {
                 send_via_sse(
-                    &self.client,
+                    dial_client.as_ref().unwrap_or(&self.client),
                     &server.url,
                     req,
                     self.max_response_bytes,
@@ -2925,7 +3101,7 @@ impl McpFederation {
             // Default to streamable HTTP for "streamable_http" or unknown.
             _ => {
                 send_request(
-                    &self.client,
+                    dial_client.as_ref().unwrap_or(&self.client),
                     &server.url,
                     req,
                     self.max_response_bytes,
@@ -2938,6 +3114,145 @@ impl McpFederation {
             sbproxy_observe::metrics::record_mcp_upstream_io_failure(classify_io_failure(e));
         }
         result
+    }
+
+    /// Authorize the base MCP dial itself (`EgressPurpose::McpUpstream`,
+    /// WOR-2384 / MCP09) before any connect, mirroring the discipline
+    /// `EgressPurpose::OpenApiTool` already applies to `type: openapi`
+    /// REST calls a few methods above. Production always passes
+    /// [`SystemHostResolver`]; see
+    /// [`Self::authorize_mcp_upstream_dial_with_resolver`] for the
+    /// resolver-injectable version tests use, the same split
+    /// `call_openapi_tool` / `call_openapi_tool_with_resolver`
+    /// establishes.
+    fn authorize_mcp_upstream_dial(
+        &self,
+        server: &McpServerConfig,
+    ) -> anyhow::Result<reqwest::Client> {
+        self.authorize_mcp_upstream_dial_with_resolver(server, &SystemHostResolver)
+    }
+
+    /// [`Self::authorize_mcp_upstream_dial`] with an injected resolver
+    /// (WOR-2080), so a test can simulate a DNS answer that changes
+    /// between authorize and dial without live DNS.
+    ///
+    /// The branch inspected is `server.egress_policy.mode` directly,
+    /// never a collapsed `Result`: a server with no `egress:`
+    /// configured (the legacy-compatible default) is stamped `Ungated`
+    /// in the sightings inventory rather than silently counted as
+    /// "allowed", the same wrinkle the AI-provider gate closed for
+    /// `EgressPurpose::AiProvider` (WOR-2476), and the shared
+    /// `self.client` is returned unchanged since there is no pin to
+    /// dial with. An enforced policy authorizes, then hands off to
+    /// [`Self::mcp_upstream_dial_client`] to close the
+    /// resolve-to-connect window (WOR-2080) `openapi_dial_client`
+    /// already closes for `type: openapi`: the returned client, not
+    /// `self.client`, is what a caller must dial with for a pin to
+    /// mean anything. Callers skip this whole function for `stdio`
+    /// servers: a local process spawn is not a network dial and has no
+    /// `EgressPurpose::McpUpstream` sighting to record.
+    fn authorize_mcp_upstream_dial_with_resolver(
+        &self,
+        server: &McpServerConfig,
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<reqwest::Client> {
+        if !server.egress_policy.mode.is_enforce() {
+            record_egress_seen(
+                EgressPurpose::McpUpstream,
+                &server.url,
+                &server.name,
+                EgressSightingStatus::Ungated,
+                None,
+            );
+            return Ok(self.client.clone());
+        }
+        let dest =
+            match server
+                .egress_policy
+                .authorize(EgressPurpose::McpUpstream, &server.url, resolver)
+            {
+                Ok(dest) => {
+                    record_egress_seen(
+                        EgressPurpose::McpUpstream,
+                        &server.url,
+                        &server.name,
+                        EgressSightingStatus::Allowed,
+                        None,
+                    );
+                    dest
+                }
+                Err(e) => {
+                    record_egress_seen(
+                        EgressPurpose::McpUpstream,
+                        &server.url,
+                        &server.name,
+                        EgressSightingStatus::Denied,
+                        Some(e),
+                    );
+                    record_egress_refused(EgressPurpose::McpUpstream, e, "", &server.name);
+                    return Err(anyhow::anyhow!("egress denied: {e:?}"));
+                }
+            };
+        self.mcp_upstream_dial_client(server, &dest, resolver)
+    }
+
+    /// Build the client for one MCP-upstream dial of `dest` (WOR-2080),
+    /// mirroring `openapi_dial_client` above. A pinned destination gets
+    /// a per-dial client whose resolver override carries exactly the
+    /// verified pin set, so the connector cannot re-resolve the host on
+    /// its own; a rebound DNS answer is refused with the closed
+    /// `DnsPinMismatch` reason before any connect. An unpinned
+    /// destination keeps the shared, re-resolving `self.client`.
+    ///
+    /// Fix round 3: also disables redirects, like `openapi_dial_client`
+    /// does. Re-review found the earlier "leave redirects on" choice
+    /// was a full bypass, not a residual gap: `reqwest`'s default
+    /// policy follows up to 10 redirects *inside* `send()`, the
+    /// `resolve_to_addrs` pin only scopes to the dial's original
+    /// hostname, and `send_request` / `send_via_sse` only look at the
+    /// final response's status, after any redirect already happened --
+    /// so one authorized upstream answering `Location:
+    /// http://anything` would have silently dialled a host this gate
+    /// never authorized at all, egress mode notwithstanding. With
+    /// redirects off, a 3xx from an MCP upstream instead comes back as
+    /// a non-success status `send_request` (`streamable.rs`) /
+    /// `send_via_sse` (`sse_client.rs`) already turn into a refused
+    /// `McpUpstreamHttpStatus` error -- fail closed. Unlike the
+    /// OpenAPI REST path (`call_openapi_tool_with_resolver`'s
+    /// redirect loop a few hundred lines above, which re-authorizes
+    /// and re-pins each hop before following it), the base MCP
+    /// transports get no equivalent per-hop follow-and-reauthorize
+    /// loop here: a redirecting MCP upstream is refused outright
+    /// rather than chased. That parity gap is deliberate and out of
+    /// scope for this fix -- closing the rebind/bypass window, not
+    /// adding redirect support the base MCP path never had.
+    fn mcp_upstream_dial_client(
+        &self,
+        server: &McpServerConfig,
+        dest: &AuthorizedDestination,
+        resolver: &dyn HostResolver,
+    ) -> anyhow::Result<reqwest::Client> {
+        let Some(addrs) = server
+            .egress_policy
+            .verified_dial_addrs(dest, resolver)
+            .map_err(|e| anyhow::anyhow!("egress denied: {e:?}"))?
+        else {
+            return Ok(self.client.clone());
+        };
+        let host = dest
+            .url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("authorized MCP upstream URL lost its host"))?;
+        // Unlike the constructor's shared client, a builder failure
+        // here must not fall back to a default client: a default
+        // client would re-resolve and silently drop the pin defense.
+        reqwest::Client::builder()
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addrs)
+            .build()
+            .map_err(|e| anyhow::anyhow!("pinned MCP upstream client construction failed: {e}"))
     }
 
     /// Test-only: publish a tool registry and its matching version-gate
@@ -2965,6 +3280,43 @@ impl McpFederation {
         );
         self.primed
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: publish `server_protocol_versions` and
+    /// `server_auth_required` directly, the same way
+    /// [`Self::seed_tools_for_test`] does for the tool registry. Lets a
+    /// caller in another crate (WOR-2384's peer-downgrade dispatch
+    /// tests in `sbproxy-core`) drive
+    /// [`Self::last_negotiated_protocol`] / [`Self::last_auth_required`]
+    /// without a real upstream round trip, since both fields are
+    /// private and only [`Self::refresh_server_capabilities`] would
+    /// otherwise populate them.
+    #[doc(hidden)]
+    pub fn seed_server_observations_for_test(
+        &self,
+        protocol_versions: HashMap<String, String>,
+        auth_required: HashMap<String, bool>,
+    ) {
+        self.server_protocol_versions
+            .store(Arc::new(protocol_versions));
+        self.server_auth_required.store(Arc::new(auth_required));
+    }
+
+    /// Test-only: publish the resource registry directly, the same way
+    /// [`Self::seed_tools_for_test`] does for tools. Lets a caller in
+    /// another crate exercise `resources/read` (WOR-2384's peer-downgrade
+    /// check applies there too) without a real upstream `resources/list`.
+    #[doc(hidden)]
+    pub fn seed_resources_for_test(&self, resources: HashMap<String, FederatedResource>) {
+        self.resources.store(Arc::new(resources));
+    }
+
+    /// Test-only: publish the prompt registry directly. See
+    /// [`Self::seed_resources_for_test`]; same reasoning, for
+    /// `prompts/get`.
+    #[doc(hidden)]
+    pub fn seed_prompts_for_test(&self, prompts: HashMap<String, FederatedPrompt>) {
+        self.prompts.store(Arc::new(prompts));
     }
 
     /// Publish every state component of a completed refresh without
@@ -3359,7 +3711,7 @@ impl McpFederation {
             // contract in the lockfile the grade is structural;
             // digest-only baselines can still prove "changed", which
             // is at least a patch.
-            let verdict = match lock.contract.as_ref() {
+            let mut verdict = match lock.contract.as_ref() {
                 Some(old_contract) => {
                     let inputs = super::compat::OracleInputs {
                         tool: name,
@@ -3403,13 +3755,29 @@ impl McpFederation {
                 None => super::compat::CompatibilityVerdict {
                     tool: name.clone(),
                     from_digest: lock.contract_digest.clone(),
-                    to_digest: live_digest,
+                    to_digest: live_digest.clone(),
                     grade: super::compat::SemverGrade::Patch,
                     findings: Vec::new(),
                     behavioral_evaluated: false,
                     needs_confirmation: false,
                 },
             };
+            // Post-merge fix (main's #1091/#1092 reshaped this flow):
+            // the oracle's own `from_digest`/`to_digest` are always
+            // legacy-scheme (`compat::oracle::evaluate_compatibility`
+            // has no notion of which scheme a lockfile baseline was
+            // written under, unlike `digest_matching_scheme` above,
+            // which this function already used to compute both
+            // `live_contract` and `live_digest` under the baseline's
+            // own scheme). Overwrite with those already scheme-correct
+            // values so the governance event's digest fields keep
+            // correlating with what the lockfile actually pinned --
+            // `mcp-contract-v2-sha256:...` included -- regardless of
+            // which arm above produced the verdict, rather than
+            // silently downgrading a v2 baseline's reported digest to
+            // the legacy scheme.
+            verdict.from_digest = lock.contract_digest.clone();
+            verdict.to_digest = live_digest.clone();
             let declared = gate.declared_versions.get(name).unwrap_or(&lock.semver);
             let grade_label = match verdict.grade {
                 super::compat::SemverGrade::None => "none",
@@ -3463,7 +3831,18 @@ impl McpFederation {
                         security = verdict.findings.iter().any(|f| f.security),
                         "tool contract changed without a matching version bump"
                     );
-                    if gate.mode == VersioningMode::Block {
+                    let is_blocked = gate.mode == VersioningMode::Block;
+                    // WOR-2392: the SIEM-routable sibling of the
+                    // `sbproxy::audit` line just above -- same fact,
+                    // same verdict, delivered on the `events:` bus
+                    // instead of (or in addition to) a log line.
+                    emit_tool_definition_changed_event(
+                        name,
+                        &tool.server_name,
+                        is_blocked,
+                        &verdict,
+                    );
+                    if is_blocked {
                         blocked.insert(name.clone(), detail);
                     }
                 }
@@ -3693,6 +4072,21 @@ fn classify_io_failure(e: &anyhow::Error) -> &'static str {
     "other"
 }
 
+/// Classify an upstream contact failure for the peer-profile
+/// auth-posture observation (WOR-2384). `Some(true)` only for a
+/// classified 401 or 407 (`www_authenticate_present` is corroborating,
+/// not required, since some servers omit the header on a bare 401).
+/// Every other failure -- a network error, a 5xx, a malformed response,
+/// a JSON-RPC-level error object -- is not trustworthy evidence either
+/// way and yields `None`, so [`McpFederation::refresh_server_capabilities`]
+/// leaves that server absent from this cycle's auth map rather than
+/// guessing.
+fn classify_auth_required_from_error(e: &anyhow::Error) -> Option<bool> {
+    e.downcast_ref::<super::streamable::McpUpstreamHttpStatus>()
+        .filter(|status| status.status == 401 || status.status == 407)
+        .map(|_| true)
+}
+
 /// Render CodeMode from exactly one loaded catalogue state. The lazy
 /// cache uses this rather than calling back through `McpFederation`,
 /// which would otherwise permit a refresh between its generation read
@@ -3800,6 +4194,119 @@ fn modern_serialized_tool_entry(tool: &FederatedTool) -> Option<SerializedToolEn
         server_name: tool.server_name.clone(),
         json: contract.as_value().to_string(),
     })
+}
+
+/// Stable `sbproxy.decision.rule_id` every `tool_definition_changed`
+/// `mcp_governance_decision` event carries (WOR-2392): the
+/// WOR-1635/2444 lockfile/digest gate is the one rule that produces
+/// this reason, the same one-rule-id-per-mechanism convention
+/// [`super::peer_profile::PEER_DOWNGRADE_RULE_ID`] and
+/// `sbproxy_modules::action::mcp::MCP_SERVER_APPROVAL_RULE_ID`
+/// (a different crate; not importable from here) already follow.
+pub const TOOL_VERSIONING_VIOLATION_RULE_ID: &str = "mcp_tool_versioning";
+
+/// Truncate a `contract_digest` string (e.g. `sha256:ab12..` or
+/// `mcp-contract-v2-sha256:ab12..`) to a short, stable prefix for a
+/// governance-evidence field.
+///
+/// The digest is not secret -- it is a structural fingerprint of a tool
+/// contract, not the contract itself -- so no redaction or salting
+/// applies here, unlike `mcp_audit`'s content-field hashing. Truncation
+/// exists only to keep the event payload small.
+///
+/// WOR-2392 fix round 1: a flat leading-N-chars truncation used to slice
+/// through the `scheme:` prefix itself before reaching any hash
+/// material. `mcp-contract-v2-sha256:` alone is 23 characters, so a
+/// flat 24-char prefix kept exactly one hex digit of the actual digest
+/// -- correlating two v2-scheme events against each other, or against
+/// the lockfile, was close to impossible. This keeps the *whole*
+/// scheme prefix (so the reader can still tell which digest scheme
+/// produced it) plus `HEX_PREFIX_LEN` characters of the hash material
+/// that follows the scheme's `:`, so both the short legacy `sha256:`
+/// scheme and the long `mcp-contract-v2-sha256:` one keep the same
+/// amount of real correlation entropy. A digest with no `:` (a future
+/// scheme this build does not recognize the shape of) falls back to a
+/// flat prefix of the whole string.
+fn digest_field_prefix(digest: &str) -> String {
+    const HEX_PREFIX_LEN: usize = 16;
+    let scheme_end = digest.find(':').map(|i| i + 1).unwrap_or(0);
+    let (scheme, hash_material) = digest.split_at(scheme_end);
+    let hash_prefix: String = hash_material.chars().take(HEX_PREFIX_LEN).collect();
+    format!("{scheme}{hash_prefix}")
+}
+
+/// WOR-2392: emit one `mcp_governance_decision` evidence event when
+/// [`McpFederation::evaluate_tool_versioning_snapshot`] grades a live
+/// contract change as [`super::compat::BumpVerdict::Violation`] (a
+/// tool's live contract moved without a matching declared version
+/// bump). Reason `tool_definition_changed`. Verdict mirrors exactly
+/// what that call site already decided for this violation -- `deny`
+/// under `VersioningMode::Block` (the tool is refused), `warn`
+/// otherwise (the tool still serves, but the change is on record) --
+/// so this event never disagrees with the enforcement path it
+/// describes.
+///
+/// Carries only digest prefixes ([`digest_field_prefix`]), never the
+/// tool contract or its full description text: the same "digests,
+/// never definitions" discipline the lockfile gate itself already
+/// applies when it logs `mcp.tool_versioning.violation`.
+///
+/// This is a background refresh-loop detection, not a per-request
+/// decision: there is no `RequestContext`, no single tenant, and no
+/// one inbound origin to attribute it to. `hostname` and `tenant_id`
+/// are both empty, the same convention
+/// [`sbproxy_observe::events::EventType::ConfigReloaded`] already uses
+/// for a proxy-wide fact with no request behind it; the per-tenant
+/// evidence sequence advances in the shared empty-tenant bucket that
+/// convention implies.
+fn emit_tool_definition_changed_event(
+    tool_name: &str,
+    server: &str,
+    blocked: bool,
+    verdict: &super::compat::CompatibilityVerdict,
+) {
+    use sbproxy_observe::events::{EventType, ProxyEvent};
+
+    let event_type = EventType::McpGovernanceDecision;
+    // Mirrors `emit_mcp_governance_evidence`'s own ordering (WOR-2384):
+    // check whether anything would even receive this before taking the
+    // evidence-sequence lock or building the payload, so the sequence
+    // only advances across the window delivery is actually enabled.
+    if !sbproxy_observe::event_sink::wants_event(event_type) {
+        return;
+    }
+    let seq = sbproxy_observe::evidence_seq::next_seq("");
+    let mut fields = serde_json::Map::new();
+    fields.insert("gen_ai.tool.name".to_string(), tool_name.into());
+    fields.insert("sbproxy.tool.server".to_string(), server.into());
+    fields.insert(
+        "sbproxy.decision.verdict".to_string(),
+        (if blocked { "deny" } else { "warn" }).into(),
+    );
+    fields.insert(
+        "sbproxy.decision.reason".to_string(),
+        "tool_definition_changed".into(),
+    );
+    fields.insert(
+        "sbproxy.decision.rule_id".to_string(),
+        TOOL_VERSIONING_VIOLATION_RULE_ID.into(),
+    );
+    if blocked {
+        fields.insert("error.type".to_string(), "policy_denied".into());
+    }
+    fields.insert(
+        "sbproxy.tool.digest.old".to_string(),
+        digest_field_prefix(&verdict.from_digest).into(),
+    );
+    fields.insert(
+        "sbproxy.tool.digest.new".to_string(),
+        digest_field_prefix(&verdict.to_digest).into(),
+    );
+    fields.insert("sbproxy.tenant.id".to_string(), "".into());
+    fields.insert("sbproxy.evidence.seq".to_string(), seq.into());
+    let data = serde_json::Value::Object(fields);
+    let event = ProxyEvent::new(event_type, String::new(), String::new(), data);
+    sbproxy_observe::event_sink::publish_proxy_event(event_type, || event);
 }
 
 /// Project and digest a live tool under the same scheme its baseline was
@@ -4135,6 +4642,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         }
     }
 
@@ -4466,6 +4974,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            egress_policy: EgressPolicy::default(),
         }]);
 
         assert_eq!(federation.refresh_tools().await.expect("refresh"), 1);
@@ -5536,6 +6045,317 @@ mod tests {
         assert_eq!(advertised, json!({ "listChanged": false }));
     }
 
+    #[test]
+    fn last_negotiated_protocol_reads_back_what_a_refresh_recorded() {
+        // WOR-2384: `refresh_server_capabilities` stores into
+        // `server_protocol_versions` in the same pass as
+        // `server_capabilities`; this test seeds the ArcSwap directly
+        // (mirroring `prompts_capability_is_absent_until_an_upstream_declares_one`
+        // above) so it does not need a live upstream to prove the
+        // accessor reads back what a refresh would have written.
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://gh.test"),
+            mock_server("docs", "http://docs.test"),
+        ]);
+        assert_eq!(
+            fed.last_negotiated_protocol("gh"),
+            None,
+            "nothing has been probed yet"
+        );
+
+        let mut versions = HashMap::new();
+        versions.insert(
+            "gh".to_string(),
+            crate::mcp::types::MODERN_PROTOCOL_VERSION.to_string(),
+        );
+        fed.server_protocol_versions.store(Arc::new(versions));
+
+        assert_eq!(
+            fed.last_negotiated_protocol("gh").as_deref(),
+            Some(crate::mcp::types::MODERN_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            fed.last_negotiated_protocol("docs"),
+            None,
+            "a server this refresh never recorded declares nothing"
+        );
+    }
+
+    #[test]
+    fn last_auth_required_reads_back_what_a_refresh_recorded() {
+        // Same seed-the-ArcSwap-directly pattern as
+        // `last_negotiated_protocol_reads_back_what_a_refresh_recorded`.
+        let fed = McpFederation::new(vec![
+            mock_server("gh", "http://gh.test"),
+            mock_server("docs", "http://docs.test"),
+        ]);
+        assert_eq!(
+            fed.last_auth_required("gh"),
+            None,
+            "nothing has been classified yet"
+        );
+
+        let mut required = HashMap::new();
+        required.insert("gh".to_string(), true);
+        fed.server_auth_required.store(Arc::new(required));
+
+        assert_eq!(fed.last_auth_required("gh"), Some(true));
+        assert_eq!(
+            fed.last_auth_required("docs"),
+            None,
+            "a server this refresh never classified declares nothing"
+        );
+    }
+
+    #[test]
+    fn classify_auth_required_from_error_reads_401_and_407_as_true_and_everything_else_as_none() {
+        use super::super::streamable::McpUpstreamHttpStatus;
+
+        let unauthorized: anyhow::Error = McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: true,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&unauthorized), Some(true));
+
+        // A bare 401 with no WWW-Authenticate header still classifies:
+        // the header is corroborating, not required.
+        let bare_unauthorized: anyhow::Error = McpUpstreamHttpStatus {
+            status: 401,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(
+            classify_auth_required_from_error(&bare_unauthorized),
+            Some(true)
+        );
+
+        let proxy_auth_required: anyhow::Error = McpUpstreamHttpStatus {
+            status: 407,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(
+            classify_auth_required_from_error(&proxy_auth_required),
+            Some(true)
+        );
+
+        // A 2xx never reaches this function (it is not an error at
+        // all), but any other non-2xx status is not trustworthy
+        // evidence of "auth required" either way.
+        let not_found: anyhow::Error = McpUpstreamHttpStatus {
+            status: 404,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&not_found), None);
+
+        let server_error: anyhow::Error = McpUpstreamHttpStatus {
+            status: 500,
+            www_authenticate_present: false,
+        }
+        .into();
+        assert_eq!(classify_auth_required_from_error(&server_error), None);
+
+        let unrelated = anyhow::anyhow!("connection refused");
+        assert_eq!(classify_auth_required_from_error(&unrelated), None);
+    }
+
+    /// A one-shot upstream that answers exactly one HTTP request with a
+    /// fixed raw response (status line, headers, body), then closes.
+    /// Reused for the auth-posture stub-upstream test below: a real
+    /// `refresh_server_capabilities` round trip against a peer that
+    /// answers 401 with `WWW-Authenticate`, proving the classification
+    /// is wired end to end and not just unit-tested against a
+    /// synthetic error.
+    fn one_shot_http_server(status_line: &str, extra_headers: &str) -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("one-shot fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("one-shot fixture address")
+            .port();
+        let status_line = status_line.to_string();
+        let extra_headers = extra_headers.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "{status_line}\r\n{extra_headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        mock_server("stub-auth", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    #[tokio::test]
+    async fn a_dual_era_stub_answering_401_with_www_authenticate_records_auth_required() {
+        // WOR-2384 fix round 1, item 5: proves the real signal is wired
+        // end to end, not just the pure classifier.
+        let server = one_shot_http_server(
+            "HTTP/1.1 401 Unauthorized",
+            "WWW-Authenticate: Bearer realm=\"mcp\"\r\n",
+        );
+        let fed = McpFederation::new(vec![server]);
+        let answered = fed.refresh_server_capabilities().await;
+        assert_eq!(answered, 0, "a 401 initialize probe answers nothing");
+        assert_eq!(
+            fed.last_auth_required("stub-auth"),
+            Some(true),
+            "a classified 401 must record auth_required = true"
+        );
+        assert_eq!(
+            fed.last_negotiated_protocol("stub-auth"),
+            None,
+            "a failed probe never learns a protocol version either"
+        );
+    }
+
+    /// A one-shot upstream that answers exactly one HTTP request with a
+    /// real JSON-RPC `initialize` success body, so `fetch_server_capabilities`
+    /// gets all the way through parsing rather than failing on an empty
+    /// body.
+    fn one_shot_initialize_success_server() -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("one-shot fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("one-shot fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": super::super::types::LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                },
+                "id": 1,
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        mock_server("stub-auth", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    #[tokio::test]
+    async fn a_successful_unauthenticated_initialize_records_auth_required_false() {
+        // This probe always dispatches with no credentials (`&[]`
+        // extra_headers), so a clean success is unambiguous proof the
+        // peer did not require auth for this contact.
+        let server = one_shot_initialize_success_server();
+        let fed = McpFederation::new(vec![server]);
+        let answered = fed.refresh_server_capabilities().await;
+        assert_eq!(answered, 1);
+        assert_eq!(fed.last_auth_required("stub-auth"), Some(false));
+    }
+
+    /// A stub upstream that answers a SEQUENCE of full raw HTTP
+    /// responses, one per incoming connection, repeating the last one
+    /// once the sequence is exhausted. Lets a test drive multiple
+    /// `refresh_server_capabilities` cycles against one upstream and
+    /// control exactly what each cycle observes.
+    fn sequential_http_server(responses: Vec<String>) -> McpServerConfig {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|error| panic!("sequential fixture bind failed: {error}"));
+        let port = listener
+            .local_addr()
+            .expect("sequential fixture address")
+            .port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut index = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let _ = stream.read(&mut request);
+                let response = responses
+                    .get(index)
+                    .or_else(|| responses.last())
+                    .cloned()
+                    .unwrap_or_default();
+                index += 1;
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        mock_server("sequential-stub", &format!("http://127.0.0.1:{port}/mcp"))
+    }
+
+    fn initialize_success_response(protocol_version: &str) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {}},
+            },
+            "id": 1,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn initialize_401_response() -> String {
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"mcp\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_negotiated_protocol_survives_a_later_cycle_that_401s() {
+        // WOR-2384 fix round 2: `server_protocol_versions` persists a
+        // positive protocol observation across a LATER cycle that
+        // fails to classify anything but auth posture -- unlike the
+        // old rebuild-from-scratch behavior, which the re-review
+        // caught as making the auth axis structurally unreachable (a
+        // 401 cycle used to wipe the protocol map to empty every
+        // time, and `mcp_peer_downgrade_check` bailed out before ever
+        // reading the auth signal, since a single `initialize` round
+        // trip can only ever produce a protocol answer OR an auth
+        // classification, never both).
+        let server = sequential_http_server(vec![
+            initialize_success_response(super::super::types::MODERN_PROTOCOL_VERSION),
+            initialize_401_response(),
+        ]);
+        let fed = McpFederation::new(vec![server]);
+
+        fed.refresh_server_capabilities().await;
+        assert_eq!(
+            fed.last_negotiated_protocol("sequential-stub").as_deref(),
+            Some(super::super::types::MODERN_PROTOCOL_VERSION)
+        );
+
+        fed.refresh_server_capabilities().await;
+        assert_eq!(
+            fed.last_negotiated_protocol("sequential-stub").as_deref(),
+            Some(super::super::types::MODERN_PROTOCOL_VERSION),
+            "a 401 cycle must not erase the protocol this peer already demonstrated"
+        );
+        assert_eq!(
+            fed.last_auth_required("sequential-stub"),
+            Some(true),
+            "the 401 cycle still classifies fresh auth-required evidence"
+        );
+    }
+
     #[tokio::test]
     async fn refresh_prompts_skips_upstreams_that_declare_no_prompts() {
         // Both upstreams are unroutable. If `refresh_prompts` asked
@@ -5579,6 +6399,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing),
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut caps = HashMap::new();
@@ -6102,6 +6923,207 @@ mod tests {
             .await;
         assert!(fed.version_blocked().is_empty());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Poll `path` (an NDJSON event log) until a line satisfies
+    /// `predicate` or 5s elapse. Delivery is asynchronous (a background
+    /// worker drains the egress queue), so a single read right after
+    /// the triggering call would be racy.
+    async fn poll_for_governance_event(
+        path: &std::path::Path,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for line in contents.lines() {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(line) {
+                        if predicate(&event) {
+                            return Some(event);
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// WOR-2392: a live contract change graded `BumpVerdict::Violation`
+    /// (no matching declared version bump) must reach the
+    /// `mcp_governance_decision` evidence bus with reason
+    /// `tool_definition_changed`, carrying only digest prefixes (never
+    /// the contract text) and a verdict that matches whatever the gate
+    /// itself decided -- `deny` in `Block` mode (where the tool is also
+    /// refused), `warn` in `Warn` mode (where it is not).
+    ///
+    /// One test, two scenarios, sharing a single installed egress:
+    /// `install_event_egress` is a process-wide, set-once slot (see
+    /// `sbproxy_observe::event_sink`'s module docs), so this is the one
+    /// place in this crate's test binary allowed to call it, the same
+    /// discipline `action_dispatch.rs`'s
+    /// `wor_2384_rbac_denied_tools_call_emits_a_deny_governance_event`
+    /// documents for the same reason in a different crate.
+    #[tokio::test]
+    async fn wor_2392_definition_change_emits_governance_events_matching_gate_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let events_path = dir.path().join("definition-change-events.ndjson");
+        let egress = sbproxy_observe::event_sink::EventEgress::start(
+            sbproxy_observe::event_sink::EventSinkTarget::File {
+                path: events_path.clone(),
+            },
+            sbproxy_observe::event_sink::EventTypeMask::from_types(&[
+                sbproxy_observe::events::EventType::McpGovernanceDecision,
+            ]),
+            64,
+        )
+        .expect("file egress starts");
+        sbproxy_observe::install_event_egress(egress)
+            .expect("event egress installs exactly once per test binary");
+
+        // --- Scenario 1: Block mode -> verdict deny, error.type set,
+        // and the tool is also blocked (the pre-existing behavior this
+        // event must never disagree with). Uses the v2 digest scheme
+        // deliberately (WOR-2392 fix round 1): `mcp-contract-v2-sha256:`
+        // alone is 23 characters, so this is the scheme a flat
+        // leading-N-chars truncation bug would have all but erased. ---
+        {
+            let path = write_lockfile("wor2392-block", &output_schema_lockfile("old", true));
+            let fed = gated_federation(path.clone(), VersioningMode::Block, None);
+            fed.evaluate_tool_versioning(&output_schema_tool("new"))
+                .await;
+            assert!(
+                fed.version_blocked().contains_key("search"),
+                "block mode must still block the violating tool"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == "search"
+                    && event["data"]["sbproxy.decision.reason"] == "tool_definition_changed"
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the block-mode definition change \
+                 was not observed within 5s",
+            );
+            assert_eq!(event["event_type"], "mcp_governance_decision");
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "deny");
+            assert_eq!(event["data"]["error.type"], "policy_denied");
+            assert_eq!(event["data"]["sbproxy.tool.server"], "srv");
+            assert_eq!(
+                event["data"]["sbproxy.decision.rule_id"],
+                "mcp_tool_versioning"
+            );
+            let old_digest = event["data"]["sbproxy.tool.digest.old"]
+                .as_str()
+                .expect("old digest field present");
+            let new_digest = event["data"]["sbproxy.tool.digest.new"]
+                .as_str()
+                .expect("new digest field present");
+            assert_ne!(
+                old_digest, new_digest,
+                "a definition change must carry two different digests"
+            );
+            assert!(
+                !old_digest.contains("public repositories")
+                    && !new_digest.contains("public repositories"),
+                "digest fields must never carry contract text: old={old_digest} new={new_digest}"
+            );
+            // The bug this guards: a flat 24-char prefix left exactly
+            // one hex digit of real hash material after the 23-char v2
+            // scheme name, making every v2 digest field correlate to
+            // nothing. Both fields must carry the whole scheme name
+            // *and* real hash material beyond it.
+            const V2_SCHEME: &str = "mcp-contract-v2-sha256:";
+            for (label, digest) in [("old", old_digest), ("new", new_digest)] {
+                assert!(
+                    digest.starts_with(V2_SCHEME),
+                    "{label} digest must keep the full v2 scheme prefix: {digest}"
+                );
+                let hash_part = &digest[V2_SCHEME.len()..];
+                assert!(
+                    hash_part.len() >= 12,
+                    "{label} digest must keep real hash material after the v2 scheme \
+                     prefix, not just the scheme name: {digest:?} (hash part {hash_part:?}, \
+                     {} chars)",
+                    hash_part.len()
+                );
+            }
+            let _ = std::fs::remove_file(path);
+        }
+
+        // --- Scenario 2: Warn mode -> verdict warn, no error.type, and
+        // the tool is NOT blocked. ---
+        {
+            let path = write_lockfile("wor2392-warn", &gate_lockfile("original description"));
+            let fed = gated_federation(path.clone(), VersioningMode::Warn, None);
+            fed.evaluate_tool_versioning(&gate_registry("a warn-mode rewrite"))
+                .await;
+            assert!(
+                fed.version_blocked().is_empty(),
+                "warn mode must never block"
+            );
+
+            let event = poll_for_governance_event(&events_path, |event| {
+                event["data"]["gen_ai.tool.name"] == "search"
+                    && event["data"]["sbproxy.decision.reason"] == "tool_definition_changed"
+                    && event["data"]["sbproxy.decision.verdict"] == "warn"
+            })
+            .await
+            .expect(
+                "an mcp_governance_decision event for the warn-mode definition change \
+                 was not observed within 5s",
+            );
+            assert_eq!(event["data"]["sbproxy.decision.verdict"], "warn");
+            assert!(
+                event["data"].get("error.type").is_none(),
+                "a warn verdict must not stamp error.type: {event:?}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// WOR-2392 fix round 1: a flat leading-N-chars truncation used to
+    /// slice through the entire `mcp-contract-v2-sha256:` scheme name
+    /// (23 characters) and leave exactly one hex digit of real hash
+    /// material at a 24-char prefix length -- correlating two v2-scheme
+    /// digests, or one against the lockfile, was close to impossible.
+    /// Both the short legacy `sha256:` scheme and the long v2 scheme
+    /// must keep the *whole* scheme name plus a real run of hash
+    /// characters after it.
+    #[test]
+    fn digest_field_prefix_keeps_real_hash_material_under_both_schemes() {
+        let v1 = "sha256:abcdef0123456789fedcba9876543210";
+        let v1_prefix = digest_field_prefix(v1);
+        assert!(
+            v1_prefix.starts_with("sha256:"),
+            "must keep the legacy scheme prefix: {v1_prefix}"
+        );
+        assert_eq!(
+            &v1_prefix["sha256:".len()..],
+            "abcdef0123456789",
+            "must keep 16 hex chars of real hash material: {v1_prefix}"
+        );
+
+        let v2 = "mcp-contract-v2-sha256:abcdef0123456789fedcba9876543210";
+        let v2_prefix = digest_field_prefix(v2);
+        assert!(
+            v2_prefix.starts_with("mcp-contract-v2-sha256:"),
+            "must keep the full v2 scheme prefix: {v2_prefix}"
+        );
+        let v2_hash_part = &v2_prefix["mcp-contract-v2-sha256:".len()..];
+        assert_eq!(
+            v2_hash_part, "abcdef0123456789",
+            "the v2 scheme must keep the same 16 hex chars of real hash material as the \
+             legacy scheme does, not the one leftover digit a flat 24-char prefix left: \
+             {v2_prefix}"
+        );
+
+        // A scheme this build does not recognize the shape of (no `:`)
+        // falls back to a flat prefix of the whole string rather than
+        // panicking.
+        let unscoped = "deadbeefcafef00d1234567890abcdef";
+        assert_eq!(digest_field_prefix(unscoped), "deadbeefcafef00d");
     }
 
     #[tokio::test]
@@ -6885,6 +7907,7 @@ mod tests {
             transport: "sse".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         assert_eq!(config.transport, "sse");
     }
@@ -6927,6 +7950,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut tools = HashMap::new();
@@ -6962,6 +7986,96 @@ mod tests {
         );
     }
 
+    /// WOR-2384, a live-verified product bug (test.sbproxy.dev serves
+    /// bare `hello`/`echo` and refuses a prefixed name): `namespace:
+    /// always` (or a collision rename) advertises a server-prefixed
+    /// name to clients, and `resolve_tool` routes lookups by it, but
+    /// the upstream never heard that name -- it only ever advertised
+    /// the bare one. Before `FederatedTool::upstream_name`, dispatch
+    /// sent the advertised name verbatim in `tools/call`'s `"name"`
+    /// field, so every namespaced or collision-renamed MCP-native tool
+    /// failed upstream with "Unknown tool: <prefixed>". Red before the
+    /// fix: the stub below would have recorded `"reports.hello"`, not
+    /// `"hello"`.
+    #[tokio::test]
+    async fn call_tool_sends_the_upstream_name_not_the_advertised_prefixed_name() {
+        use std::io::{Read, Write};
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(String::new()));
+        let seen_thread = Arc::clone(&seen);
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping upstream tool-name wire test: loopback bind denied: {err}");
+                return;
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        };
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *seen_thread.lock().unwrap() = req;
+                let body = r#"{"jsonrpc":"2.0","result":{"content":[{"type":"text","text":"ok"}]},"id":1}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let server = McpServerConfig {
+            name: "reports".to_string(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::Always,
+            openapi: None,
+            egress_policy: EgressPolicy::default(),
+        };
+        let fed = McpFederation::new(vec![server]);
+
+        // Exactly what `refresh_tools` would have produced for this
+        // tool under `namespace: always`: the upstream advertised
+        // `hello`, `advertise_as("reports.hello")` is what namespaces
+        // it for clients, and `upstream_name` must still read `hello`
+        // afterward.
+        let tool = prepared_tool(
+            json!({
+                "name": "hello",
+                "description": "greet",
+                "inputSchema": {"type": "object", "properties": {}},
+            }),
+            "reports",
+            "reports.hello",
+        );
+        assert_eq!(tool.name, "reports.hello");
+        assert_eq!(tool.upstream_name, "hello");
+        let mut tools = HashMap::new();
+        tools.insert("reports.hello".to_string(), tool);
+        fed.seed_tools_for_test(tools, None);
+
+        fed.call_tool("reports.hello", json!({}))
+            .await
+            .expect("tool call must succeed");
+
+        let captured = seen.lock().unwrap().clone();
+        let body_start = captured
+            .find("\r\n\r\n")
+            .map(|i| i + 4)
+            .expect("captured request has a header/body split");
+        let body: serde_json::Value = serde_json::from_str(&captured[body_start..])
+            .expect("captured upstream request body is JSON");
+        assert_eq!(
+            body["params"]["name"], "hello",
+            "the upstream must see its own bare name, not the advertised one, got:\n{captured}"
+        );
+    }
+
     #[tokio::test]
     async fn openapi_tool_denies_unlisted_egress_host_before_io() {
         let fed = McpFederation::new(vec![]);
@@ -6989,6 +8103,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         };
 
         let err = fed
@@ -7003,6 +8118,323 @@ mod tests {
         assert!(
             !rendered.contains("api.example.com"),
             "denial must not embed the blocked host, got: {rendered}"
+        );
+
+        // WOR-2384 (MCP09): this denial used to be silent -- the
+        // sighting inventory never heard about an `openapi_tool`
+        // egress decision at all. It must now show up as a `denied`
+        // sighting, same as every purpose that already gates
+        // production traffic.
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.purpose == "openapi_tool" && s.host == "api.example.com" && s.port == 443)
+            .expect("a denied openapi_tool dial must be recorded in the egress inventory snapshot");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("unlisted_host"));
+    }
+
+    /// WOR-2384 (MCP09): `EgressPurpose::McpUpstream` had zero production
+    /// call sites before this change -- a private-address `type: mcp`
+    /// origin dialled through unchecked regardless of any `egress:`
+    /// configured for it, because no gate existed at all. Exercises all
+    /// three sighting states from the one real gate function
+    /// (`authorize_mcp_upstream_dial`), each against a distinct port so
+    /// the assertions below can find their own entry in the process-wide
+    /// inventory without depending on test execution order.
+    #[test]
+    fn mcp_upstream_dial_is_gated_and_inventoried_for_all_three_sighting_states() {
+        let fed = McpFederation::new(vec![]);
+
+        // Ungated: no `egress:` configured for this server (the
+        // legacy-compatible, allow-by-default default).
+        let ungated = McpServerConfig {
+            name: "ungated-mcp".to_string(),
+            url: "http://127.0.0.1:18391/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy::default(),
+        };
+        fed.authorize_mcp_upstream_dial(&ungated)
+            .expect("an unconfigured egress policy must not block the dial");
+
+        // Allowed: enforce mode, host listed, private address explicitly
+        // opted in (this is a loopback fixture host, not a real private
+        // network).
+        let allowed = McpServerConfig {
+            name: "allowed-mcp".to_string(),
+            url: "http://127.0.0.1:18392/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:allowed-mcp".to_string(),
+            },
+        };
+        fed.authorize_mcp_upstream_dial(&allowed)
+            .expect("a listed, allow-private host must authorize");
+
+        // Denied: the headline red-first case -- a private-address
+        // `type: mcp` origin is refused when the egress mode denies it.
+        // Before this change nothing gated this dial at all, so this
+        // call would have succeeded.
+        let denied = McpServerConfig {
+            name: "denied-mcp".to_string(),
+            url: "http://127.0.0.1:18393/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: false,
+                scope: "server:denied-mcp".to_string(),
+            },
+        };
+        let err = fed
+            .authorize_mcp_upstream_dial(&denied)
+            .expect_err("a private address must be refused when egress mode denies it");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("PrivateAddress"),
+            "denial must use the closed EgressDenied vocabulary, got: {rendered}"
+        );
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let find = |port: u16| {
+            snapshot
+                .iter()
+                .find(|s| s.purpose == "mcp_upstream" && s.host == "127.0.0.1" && s.port == port)
+                .unwrap_or_else(|| panic!("no mcp_upstream sighting recorded for port {port}"))
+        };
+        assert_eq!(find(18391).status, "ungated");
+        assert_eq!(find(18392).status, "allowed");
+        assert_eq!(find(18393).status, "denied");
+        assert_eq!(find(18393).last_reason, Some("private_address"));
+    }
+
+    /// WOR-2384 (MCP09): a covered function is not a wired one -- this
+    /// proves the gate runs through the real `refresh_tools` ->
+    /// `fetch_tools_from_server` -> `dispatch_request` path a live
+    /// deployment actually uses, not just that
+    /// `authorize_mcp_upstream_dial` behaves correctly when called
+    /// directly (the test above). No listener is bound on this port at
+    /// all, so a plain connection refusal would also make
+    /// `refresh_tools` return zero tools; the inventory assertion is
+    /// what distinguishes "the egress gate refused it" from "nothing
+    /// was listening".
+    #[tokio::test]
+    async fn refresh_tools_records_a_denied_mcp_upstream_sighting_for_a_gated_private_server() {
+        let server = McpServerConfig {
+            name: "gated-mcp".to_string(),
+            url: "http://127.0.0.1:18394/mcp".to_string(),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["127.0.0.1".to_string()],
+                suffixes: vec![],
+                allow_private: false,
+                scope: "server:gated-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![server]);
+
+        let count = fed
+            .refresh_tools()
+            .await
+            .expect("refresh_tools must not bail out on a per-server failure");
+        assert_eq!(count, 0, "the gated server's tools must never be fetched");
+
+        let snapshot = sbproxy_security::egress::egress_inventory_snapshot();
+        let sighting = snapshot
+            .iter()
+            .find(|s| s.purpose == "mcp_upstream" && s.host == "127.0.0.1" && s.port == 18394)
+            .expect("refresh_tools must have run the dial through the mcp_upstream egress gate");
+        assert_eq!(sighting.status, "denied");
+        assert_eq!(sighting.last_reason, Some("private_address"));
+    }
+
+    /// WOR-2384 (MCP09) fix round 1: mirrors
+    /// `openapi_tool_dials_the_verified_pin_for_a_synthetic_host` below
+    /// -- proves `authorize_mcp_upstream_dial_with_resolver`'s returned
+    /// client is actually usable to dial the verified pin, not just
+    /// that it builds without error. "mcp-pin-dial.invalid" is
+    /// unresolvable by system DNS, so a response from the loopback
+    /// fixture proves the connector dialled the pin override, not a
+    /// live re-resolution.
+    #[tokio::test]
+    async fn mcp_upstream_dial_uses_the_verified_pin_for_a_synthetic_host() {
+        let body = json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string();
+        let Some((addr, was_hit)) = dial_fixture(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![("mcp-pin-dial.invalid", vec![vec![addr]])]);
+        let server = McpServerConfig {
+            name: "pin-dial-mcp".to_string(),
+            url: format!("http://mcp-pin-dial.invalid:{}/mcp", addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                // allow_private so the loopback fixture pins authorize.
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-pin-dial.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:pin-dial-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let client = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect("pinned client must build for a verified destination");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let resp = send_request(&client, &server.url, &req, 1 << 20, &[])
+            .await
+            .expect("pinned dial must reach the fixture");
+        assert_eq!(resp.id, Some(json!(1)));
+        assert!(
+            was_hit.load(Ordering::SeqCst),
+            "the pinned fixture must have served the call"
+        );
+    }
+
+    /// WOR-2384 (MCP09) fix round 1: mirrors
+    /// `openapi_tool_refuses_a_dns_answer_that_changed_before_dial`
+    /// below. Authorization pins the first fixture's address; the
+    /// dial-time re-verification answer has been rebound to the second
+    /// fixture. The gate must refuse with the closed `DnsPinMismatch`
+    /// and contact neither address.
+    #[tokio::test]
+    async fn mcp_upstream_dial_refuses_a_dns_answer_that_changed_before_dial() {
+        let Some((pinned_addr, pinned_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let Some((rebound_addr, rebound_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![(
+            "mcp-pin-rebind.invalid",
+            vec![vec![pinned_addr], vec![rebound_addr]],
+        )]);
+        let server = McpServerConfig {
+            name: "rebind-mcp".to_string(),
+            url: format!("http://mcp-pin-rebind.invalid:{}/mcp", pinned_addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-pin-rebind.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:rebind-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let err = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect_err("a rebound DNS answer must be refused");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("DnsPinMismatch"),
+            "expected DnsPinMismatch, got: {rendered}"
+        );
+        assert!(
+            !pinned_hit.load(Ordering::SeqCst),
+            "refusal must occur before any connect"
+        );
+        assert!(
+            !rebound_hit.load(Ordering::SeqCst),
+            "the rebound address must never be contacted"
+        );
+    }
+
+    /// WOR-2384 (MCP09) fix round 3: re-review found the earlier "leave
+    /// redirects on" choice for the pinned MCP-upstream client was a
+    /// full bypass, not a residual gap -- `reqwest`'s default policy
+    /// follows a redirect *inside* `send()`, before `send_request`'s
+    /// own status check ever runs, and the DNS pin only scopes to the
+    /// original hostname, so a redirect target was never
+    /// re-authorized at all. A stub upstream answers `301` with a
+    /// `Location` pointing at a second, distinct listener; the second
+    /// listener must never be contacted, and the call must surface the
+    /// refused status as an error.
+    #[tokio::test]
+    async fn mcp_upstream_dial_client_never_follows_a_redirect_to_a_second_listener() {
+        let Some((second_addr, second_hit)) = dial_fixture(ok_response("{}")) else {
+            return;
+        };
+        let redirect = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:{}/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            second_addr.port()
+        );
+        let Some((first_addr, first_hit)) = dial_fixture(redirect) else {
+            return;
+        };
+
+        let resolver = RebindResolver::new(vec![("mcp-redirect.invalid", vec![vec![first_addr]])]);
+        let server = McpServerConfig {
+            name: "redirect-mcp".to_string(),
+            url: format!("http://mcp-redirect.invalid:{}/mcp", first_addr.port()),
+            transport: "streamable_http".to_string(),
+            namespace: NamespaceMode::default(),
+            openapi: None,
+            egress_policy: EgressPolicy {
+                mode: crate::mcp::EgressMode::Enforce,
+                hosts: vec!["mcp-redirect.invalid".to_string()],
+                suffixes: vec![],
+                allow_private: true,
+                scope: "server:redirect-mcp".to_string(),
+            },
+        };
+        let fed = McpFederation::new(vec![]);
+
+        let client = fed
+            .authorize_mcp_upstream_dial_with_resolver(&server, &resolver)
+            .expect("pinned client must build for a verified destination");
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let err = send_request(&client, &server.url, &req, 1 << 20, &[])
+            .await
+            .expect_err("a redirect from an MCP upstream must not be followed");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("301"),
+            "expected the refused status to surface, got: {rendered}"
+        );
+        assert!(
+            first_hit.load(Ordering::SeqCst),
+            "the first (authorized) listener must have been contacted"
+        );
+        assert!(
+            !second_hit.load(Ordering::SeqCst),
+            "the second listener must never be contacted -- no redirect must be followed"
         );
     }
 
@@ -7056,6 +8488,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         };
 
         let err = fed
@@ -7141,6 +8574,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: Some(backing.clone()),
+            egress_policy: EgressPolicy::default(),
         }
     }
 
@@ -7992,6 +9426,7 @@ mod tests {
             transport: "streamable_http".to_string(),
             namespace: NamespaceMode::default(),
             openapi: None,
+            egress_policy: EgressPolicy::default(),
         };
         let fed = McpFederation::new(vec![server]);
         let mut tools = HashMap::new();

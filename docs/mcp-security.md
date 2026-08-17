@@ -1,6 +1,11 @@
 # MCP security
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
+
+For a row-by-row scorecard against the OWASP MCP Top 10, coverage stated
+plainly as full, partial, or out of gateway scope, see
+[mcp-security-coverage.md](mcp-security-coverage.md). This page is the
+threat-by-threat narrative behind that table.
 
 MCP moves two things that a language model will act on: the tool definitions it
 advertises, and the tool output it returns. Both arrive from a server you may
@@ -70,6 +75,40 @@ chooses to type into a tool argument. If your agent has a long-lived secret in
 its context, no proxy can unsee that. Scope credentials down and keep them out
 of the model's reach in the first place.
 
+An MCP origin's responses are written directly, outside the generic HTTP
+`response_filter` phase the `pii:`/`dlp:` policy blocks are wired to, so those
+controls never see a tool-call argument or result on their own. `content_filters`
+closes that seam for MCP specifically, reusing the same detector catalogue:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      content_filters:
+        secrets: redact
+        pii: warn
+```
+
+`secrets` matches API-key and token shapes (`openai_key`, `anthropic_key`,
+`aws_access`, `github_token`, `slack_token`); `pii` matches personal-data shapes
+(`email`, `us_ssn`, `credit_card`, `phone_us`, `ipv4`, `iban`). Both run against
+tool-call arguments on the way out and tool-call results on the way back, and
+against `resources/read` and `prompts/get` results too, before any of them
+reaches the upstream server or the caller. `redact` replaces a match with
+the same `[REDACTED:<NAME>]` marker `pii:` uses and emits a governance event
+on a `tools/call`, or a `security_audit` entry (no `mcp_governance_decision`
+event, the same boundary the peer-downgrade and approval-status checks below
+already draw for these two methods) on a `resources/read` or `prompts/get`;
+`block` refuses the call or the result outright either way. Both default to
+`off`. A tool-call's own captured audit arguments (`mcp_audit.capture_arguments:
+true`) pass through the same redaction before they ever reach the
+`mcp_governance_decision` event, so a shape `content_filters` strips from the
+wire cannot reappear in the evidence trail instead.
+
+**Still yours.** A regex catalogue matches known shapes, not every secret
+format an upstream could mint, and it cannot see a credential the agent already
+holds and chooses to type into a tool argument as ordinary-looking text. If your
+agent has a long-lived secret in its context, no proxy can unsee that. Scope
+credentials down and keep them out of the model's reach in the first place.
+
 ## Access widening quietly over time
 
 **What goes wrong.** A tool is approved at one scope. Later it gains a
@@ -107,6 +146,83 @@ A related way to keep the surface small is not advertising the whole
 federated catalogue to the model in the first place; see
 [`examples/mcp-progressive-discovery/`](../examples/mcp-progressive-discovery/).
 
+## A permitted tool called with an argument that should not be
+
+**What goes wrong.** RBAC and an allowlist answer "can this caller invoke
+`send_email` at all", not "should this particular call go through". A
+principal allowed to call a tool can still supply an argument that steers it
+somewhere it should not go: an external recipient on an internal-only tool, a
+path outside a sandboxed directory, a destination host outside an approved
+set. JSON-Schema validation checks shape, not intent.
+
+**What the gateway does.** `argument_policies[]` evaluates a CEL or
+OPA-compatible Rego expression against the tool-call context, including the
+parsed arguments, after RBAC and JSON-Schema validation pass and before the
+call dispatches:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      argument_policies:
+        - name: internal-recipients-only
+          when: mcp.tool.name == "send_email"
+          engine: cel
+          source: mcp.arguments.to.endsWith("@company.com")
+          mode: block
+        - name: internal-recipients-only-rego
+          engine: rego
+          source: |
+            package sbproxy
+            default allow := false
+            allow if {
+                endswith(input.mcp.arguments.to, "@company.com")
+            }
+          mode: block
+```
+
+An expression can also live in its own file: `path` reads it once at
+config-compile time instead of taking it inline as `source`, mirroring
+`federated_servers[].spec_path`. Exactly one of `source`/`path` is
+required per rule.
+
+The expression's boolean result follows the CEL/Rego convention used
+everywhere else in this gateway: `true` is compliant, `false` is a
+violation. `mode: warn` (the default) logs the violation and emits a
+`mcp_governance_decision` event with verdict `warn`, but the call still
+proceeds; `mode: block` refuses it with a JSON-RPC error and verdict `deny`,
+naming the rule as `sbproxy.decision.rule_id`. A rule can only turn an
+already-passed RBAC allow into a refusal, never the reverse: it runs after
+RBAC and per-tool quota, so an RBAC denial always wins and an argument
+policy never even evaluates against a call RBAC already refused. A rule
+whose expression cannot be evaluated, or whose engine panics, refuses the
+call regardless of the configured `mode`, the same fail-closed posture
+`policy: rego` already has. Optional `principals[]` selectors, the same
+shape as `rbac_policies[].tool_access[].principals`, scope a rule to one
+tenant, team, or project.
+
+**Still yours.** Writing the predicate. The gateway evaluates whatever CEL or
+Rego you give it against `mcp.tool.name`, `mcp.server`, `mcp.session.id`,
+`mcp.arguments`, `mcp.tenant`, and `mcp.principal.{sub,team,project,user}`; it
+has no opinion about which arguments matter for your tools.
+
+`result_policies[]` is the same mechanism pointed the other direction: a rule
+evaluated against the tool-call *result*, after dispatch and after
+`content_filters`, before the result enters the session or reaches the caller.
+The vocabulary is identical plus one binding, `mcp.result`, so a rule can
+correlate what was asked for with what came back:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      result_policies:
+        - name: no-internal-hostnames-in-result
+          engine: cel
+          source: '!mcp.result.content[0].text.contains("internal.corp")'
+          mode: block
+```
+
+Same polarity, same `mode: warn`/`block` split, same fail-closed posture on an
+expression that cannot be evaluated, same monotonic ordering: a result policy
+can only narrow what `content_filters` already allowed through, never widen it.
+
 ## A tool definition changing after you approved it
 
 **What goes wrong.** This is the rug pull. A server advertises a benign tool,
@@ -133,7 +249,12 @@ into one a host auto-approves, and that is a change worth noticing.
 Verdicts land on `sbproxy_mcp_tool_compat_verdicts_total`, and each change
 emits an audit event: `mcp.tool_versioning.changed`,
 `mcp.tool_versioning.renamed`, `mcp.tool_versioning.removed`, or
-`mcp.tool_versioning.needs_confirmation`.
+`mcp.tool_versioning.needs_confirmation`. An unbumped change graded a
+violation also reaches your SIEM through `events:`: a
+`mcp_governance_decision` record with reason `tool_definition_changed`,
+verdict `deny` in `mode: block` or `warn` otherwise, and old/new digest
+prefixes rather than the contract text itself. See [No usable record of
+what happened](#no-usable-record-of-what-happened).
 
 Renames are caught too. The digest covers the name, so a renamed tool would
 otherwise look like a brand new one; the gate re-digests each baseline with the
@@ -234,16 +355,136 @@ lifecycle the trifecta guardrail's risk accumulation depends on, and
 [`examples/prompt-injection-sidecar/`](../examples/prompt-injection-sidecar/)
 for an out-of-process classifier that can scan tool output directly.
 
+## A session that reads something untrusted, then tries to leave
+
+**What goes wrong.** An agent session reads data from a source it does not
+fully control (a federated server nobody has vetted, a search result, a
+document another tenant uploaded), and the same session then calls a tool
+that sends data somewhere external or changes state. If the read carried
+injected instructions, the outbound call is how they leave. This is Meta's
+Rule of Two: at most two of {touched untrusted input, touched sensitive
+data, took an externally visible or state-changing action} in one session;
+the third is the violation.
+
+**What the gateway does.** `flow` tracks two session-scoped labels the
+gateway can observe deterministically at the dispatch seam, most-restrictive-
+wins and never lowering within a session: `integrity` (`trusted` ->
+`tainted`, leg 1: touched untrusted input) and `sensitive_touched` (`false`
+-> sticky `true`, leg 2: touched sensitive data). Leg 3 (the externally
+visible or state-changing action) is not stored; it is evaluated fresh at
+each `tools/call` against `outbound_tools`. A `tools/call` result (or a
+`resources/read`) from a server outside `trusted_servers` taints the
+session; one from a server in `sensitive_servers`, or a `tools/call` for a
+tool matching `sensitive_tools`, sets `sensitive_touched`. The default rule,
+`two_of_three`, is Rule of Two itself: the violation is a session that is
+BOTH tainted AND has touched sensitive data, then attempts a call to a tool
+matching `outbound_tools` -- the third leg.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      sessions:
+        enabled: true
+      flow:
+        mode: block
+        trusted_servers: [internal-docs, customer-db]
+        sensitive_servers: [customer-db]
+        sensitive_tools: ["db.query_pii"]
+        outbound_tools: ["email.*", "slack.*"]
+```
+
+`customer-db` is internal infrastructure, so it belongs in `trusted_servers`
+too: reading from it should mark `sensitive_touched`, not also taint
+`integrity` the way a genuinely uncontrolled, external source would. The two
+lists answer different questions -- "do I trust what this server tells me"
+and "does this server's data need special handling" -- and a server can
+answer yes to both.
+
+`mode: warn` logs and emits a `mcp_governance_decision` event with verdict
+`warn` but allows the call; `mode: block` refuses it before dispatch with
+verdict `deny`. `mode: off` (the default) tracks nothing at all. Every
+transition and violation carries its own `sbproxy.decision.rule_id`, so a
+SIEM can tell exactly which leg (or leg combination) it is looking at:
+`flow_taint` (a session newly tainted), `flow_sensitive_touched` (a session
+newly touched sensitive data), and `flow_exfil_block` (all three legs, under
+the default `rule: two_of_three`). This runs after RBAC, per-tool quota, and
+`argument_policies[]` have already allowed the call, so it can only narrow
+that allow, never widen it, and it composes with `lethal_trifecta` and
+`dual_llm_quarantine` above rather than replacing either. Without
+`sessions.enabled: true`, this degrades to single-call scope: with no memory
+across calls, the only thing one call can prove is whether it is itself
+simultaneously every leg the configured rule requires. The modern
+2026-07-28 transport degrades to that same single-call scope today
+regardless of `sessions.enabled`, since outbound federation does not yet
+mint an `Mcp-Session-Id` on that path.
+
+**Two rules, one default.** `flow.rule: two_of_three` (the default) is Rule
+of Two proper, described above. `flow.rule: taint_and_outbound` is a
+strictly stricter, explicit opt-in: the violation is tainted AND outbound,
+with sensitivity never considered, so a session that has read anything
+untrusted at all is gated the moment it tries an outbound call, and its
+evidence carries `rule_id: flow_pair_block` instead. Reach for it when the
+operating posture is "any untrusted read plus any outbound call is worth
+refusing," and `sensitive_servers`/`sensitive_tools` are more configuration
+than the deployment wants to maintain.
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      flow:
+        mode: block
+        rule: taint_and_outbound
+        trusted_servers: [internal-docs]
+        outbound_tools: ["email.*", "slack.*"]
+```
+
+A custom CEL or Rego rule under `argument_policies[]` can read the same
+labels directly, `mcp.session.integrity` and `mcp.session.sensitive_touched`,
+to compose a policy the two built-in rules do not express, for example
+denying outright the moment both legs are set rather than only gating the
+tools named in `outbound_tools`.
+
+**A rollout escape hatch.** `flow.taint_reads` (default `true`) is the one
+knob that does not gate a leg directly. Set it `false` and the outbound
+check stays live, reading whatever the session's labels currently are, but
+nothing can ever move `integrity` off its `trusted` default: a `tools/call`
+result or `resources/read` from an untrusted server stops tainting. Use it
+to turn the outbound gate on before the read-side tainting it depends on,
+if a deployment needs to see how `outbound_tools` alone behaves first.
+`sensitive_touched` has no equivalent switch; leaving `sensitive_servers`
+and `sensitive_tools` empty already keeps that axis inert.
+
+**Still yours.** This is a deterministic, config-driven approximation of the
+Rule of Two, not a semantic understanding of what a session actually did. It
+has real false positives: a session that reads one untrusted, sensitive
+paragraph for unrelated reasons and later, coincidentally, sends an
+unrelated email is blocked exactly the same as one that is actually
+exfiltrating. The literature proposing this class of control is explicit
+about the same tradeoff, and the honest framing carries over here: this
+constrains the blast radius of a session that might be compromised, it does
+not detect whether one actually is. Naming which servers are
+`trusted_servers`, which are `sensitive_servers`, and which tools are
+`outbound_tools` is the operator's judgment call, not something the gateway
+can infer from a catalog. The two axes default in opposite directions on
+purpose: an empty `trusted_servers` list trusts nothing (fail closed, since
+an unlabeled upstream is exactly the untrusted case this control exists
+for), while an empty `sensitive_servers`/`sensitive_tools` reads
+default-open (nothing is sensitive until an operator says so, since a
+gateway cannot know what data a deployment considers sensitive). An empty
+`outbound_tools` list makes the gate a no-op regardless of `mode` or `rule`.
+
 ## Untrusted or unexpected upstream servers
 
 **What goes wrong.** A federated server resolves somewhere you did not intend,
 or a tool call reaches a host nobody approved. In the worst version this is an
 internal address.
 
-**What the gateway does.** For an OpenAPI-backed federated server
-(`type: openapi`), egress is deny-by-default per origin and per federated
-server, and the authorizer refuses destinations that resolve to private
-address space unless explicitly allowed.
+**What the gateway does.** Egress is deny-by-default per origin and per
+federated server, and the authorizer refuses destinations that resolve to
+private address space unless explicitly allowed. This applies both to an
+OpenAPI-backed server's REST calls (`type: openapi`) and, since WOR-2384, to
+a plain `type: mcp` server's base connect over `streamable_http` or `sse`.
+Every dial's outcome (allowed, denied, or ungated, when no `egress:` is
+configured) is recorded and readable at `GET /api/egress`; see
+[admin-api-reference.md](admin-api-reference.md).
 
 <!-- sbproxy-config-excerpt -->
 ```yaml
@@ -259,13 +500,15 @@ address space unless explicitly allowed.
             hosts: [api.example.com]
 ```
 
-**Still yours.** This egress control is scoped to OpenAPI-backed servers. A
-plain `type: mcp` federated server dials its configured `origin` directly:
-there is no deny-by-default allowlist and no private-address check on that
-path today, so keeping the origin honest is a network-design problem, not a
-config one. SBproxy also does not implement per-upstream certificate pinning.
-TLS validation is standard chain validation. If you need to pin a specific key
-for an upstream, that is not available here today.
+**Still yours.** `stdio` servers spawn a local process and are outside this
+control entirely; keeping the launched command honest is a supply-chain
+problem, not a config one. Without an `egress:` block at all (the legacy
+default, `mode: allow_by_default`), any server dials its origin unchecked,
+same as before this control existed; the sighting inventory still records the
+dial as `ungated` rather than staying silent about it. SBproxy also does not
+implement per-upstream certificate pinning. TLS validation is standard chain
+validation. If you need to pin a specific key for an upstream, that is not
+available here today.
 
 See [`examples/mcp-federation/`](../examples/mcp-federation/) for a complete
 working config of multiple federated upstreams behind one gateway.
@@ -313,12 +556,16 @@ an authorization problem, not an authentication one. See the RBAC section above.
 
 ## No usable record of what happened
 
-**What goes wrong.** An incident review asks which tool was called, by whom,
-with what, and the answer is scattered across application logs that were never
-designed for the question.
+**What goes wrong.** An incident review asks which agent called which tool
+with what arguments, and who approved that access, and the answer is
+scattered across application logs that were never designed for the question.
+This is MCP08 in the OWASP taxonomy: an interaction log an auditor can
+actually answer that question from, without reconstructing it from call
+volume or grepping free text.
 
-**What the gateway does.** Every governed decision emits a structured record on
-the security audit stream, and tool dispatch is metered.
+**What the gateway does.** Every governed decision emits a `mcp_governance_decision`
+record over `events:` (see [events.md](events.md)), and tool dispatch is
+metered:
 
 ```
 sbproxy_mcp_tool_dispatch_total
@@ -326,12 +573,102 @@ sbproxy_mcp_tool_dispatch_duration_seconds
 sbproxy_mcp_tool_cost_usd_total
 ```
 
-Evidence is structured logs aimed at your SIEM rather than a separate store, so
-it lands beside every other denial you already collect. The session ledger
-records per-session activity; see [mcp.md](mcp.md).
+`mcp_governance_decision` is one wire event covering three moments, each with
+its own reason and its own subset of fields:
 
-**Still yours.** Retention, correlation, and alerting. The gateway emits; your
-SIEM decides what matters.
+- **Tool invocations.** Every dispatched `tools/call`, plus every call refused
+  before dispatch (RBAC, per-tool quota, an argument policy, a downgraded
+  peer, a `draft` server, a session-flow guardrail violation). Every one of
+  these carries the decision and, opt-in, the arguments themselves (below);
+  only a *dispatched* call also carries a salted digest of the arguments
+  (`sbproxy.tool.arguments_hash`), since a call refused before dispatch was
+  never captured to hash in the first place.
+- **`resources/read` and `prompts/get` decisions.** A `draft`-server or
+  peer-downgrade refusal, a deprecated-server warning, or a content-filter
+  warn/redact/block on either method's result, reason and rule id matching
+  the identical gate's `tools/call` record exactly. `mcp.method.name` names
+  the method (`resources/read` or `prompts/get`) instead of `tools/call`;
+  neither carries `gen_ai.tool.name`, since neither method names a tool.
+- **Tool definition changes.** The version-lockfile gate's per-refresh
+  contract check, reason `tool_definition_changed`. See [A tool definition
+  changing after you approved it](#a-tool-definition-changing-after-you-approved-it).
+- **Registry changes.** A federated server's approval status (`draft`,
+  `approved`, `deprecated`) transitioning across a config reload, reason
+  `server_status_changed`, emitted once per transition rather than once per
+  call.
+
+### Field mapping
+
+The OWASP MCP Top 10 is still in incubation, so treat the left column as the
+audit question rather than a stable section number. Right column names are
+this event's actual field names.
+
+| MCP08 asks | sbproxy field | Present on |
+|---|---|---|
+| Which tenant / caller | `tenant_id` (envelope), `sbproxy.tenant.id` | every record |
+| Which tool | `gen_ai.tool.name` | tool-invocation and definition-change records |
+| On which upstream server | `sbproxy.tool.server` | every record |
+| With what arguments | `sbproxy.tool.arguments_hash` (dispatched calls only, salted digest) / `gen_ai.tool.call.arguments` (opt-in, verbatim, every tool-invocation record, dispatched or refused) | tool-invocation records |
+| What was decided, and why | `sbproxy.decision.verdict`, `sbproxy.decision.reason` | every record |
+| Under which rule | `sbproxy.decision.rule_id` | records where a named rule fired |
+| When, in order, without gaps | `sbproxy.evidence.seq`, `timestamp` (envelope) | every record |
+| What the tool contract was before/after | `sbproxy.tool.digest.old`, `sbproxy.tool.digest.new` | definition-change records |
+| What the registry status was before/after | `sbproxy.registry.status.old`, `sbproxy.registry.status.new` | registry-change records |
+
+The gapless property on `sbproxy.evidence.seq` is per tenant. Tool-invocation
+records carry the caller's own tenant, so gaps are detectable within one
+tenant's own traffic. Definition-change and registry-change records have no
+caller (they come from a background catalog refresh or a config reload, not a
+request) and share one sequence under the empty-tenant bucket; do not expect
+per-record-kind gaplessness across that shared bucket, only across each
+tenant's own tool-invocation stream and the shared background-event stream
+each on their own terms.
+
+"Who approved that access" splits in two. Which rule authorized a call is on
+the record (`sbproxy.decision.rule_id`, `sbproxy.decision.reason`). Who
+approved a *server's* registry status (`federated_servers[].approved_by` /
+`approved_at`) is operator-attested config, never verified by the gateway,
+and travels through the ordinary config-change audit trail rather than a
+dedicated event field: it is a fact about your process, not one the gateway
+can witness.
+
+### Verbatim argument capture
+
+`sbproxy.tool.arguments_hash` ships by default on a *dispatched* call's
+record: enough to confirm two calls used the same arguments, or that a
+specific known-bad payload was replayed, without the arguments themselves
+ever leaving the process. A call refused before dispatch (RBAC, quota, an
+argument policy, a downgraded peer, a `draft` server, a session-flow
+guardrail violation) carries no hash either, by default, for the same
+reason it carries no upstream response: nothing was captured to hash. That
+is deliberately not enough to answer "what were the arguments" on any
+record, and closing that gap is an explicit opt-in:
+
+<!-- sbproxy-config-excerpt -->
+```yaml
+      mcp_audit:
+        capture_arguments: true
+```
+
+When set, every tool-invocation record, dispatched or refused, also carries
+`gen_ai.tool.call.arguments`: the call's arguments, redacted (the same
+secret-pattern scrub `mcp_audit`'s own content fields already go through)
+and capped at 8 KiB, the same bound. Off by
+default, because shipping raw tool-call arguments to every configured
+`events:` sink is a real tradeoff, not a free one: the redaction pass
+recognizes credential shapes, not your customers' PII or business-sensitive
+free text sitting in an argument the model happened to fill in. Turn this on
+only once you have looked at what your tools actually receive.
+
+Evidence is structured logs aimed at your SIEM rather than a separate store,
+so it lands beside every other denial you already collect. The session
+ledger records per-session activity; see [mcp.md](mcp.md).
+
+**Still yours.** Retention, correlation, and alerting. `sbproxy.evidence.seq`
+is a gapless per-tenant counter while emission is enabled, which is what
+makes SIEM-side retention safe to rely on: your consumer can prove it has
+every record rather than trusting that it does. See [events.md](events.md#retention).
+The gateway emits; your SIEM decides what matters and how long to keep it.
 
 ## Servers nobody sanctioned
 
@@ -349,28 +686,86 @@ traverses it.
 
 ## Context crossing a boundary it should not
 
-**What goes wrong.** One tenant's catalog, tools, or context reaches another
-tenant's agent.
+**What goes wrong.** One tenant's catalog, tools, session state, or result
+content reaches another tenant's agent.
 
 **What the gateway does.** MCP catalogs are tenant-scoped. A key policy naming
 an MCP gateway resolves only within the request route's tenant, so a reference
 that crosses a tenant boundary resolves to nothing rather than to someone else's
 catalog. Two tenants may run gateways with the same `server_info.name` without
-seeing each other's tools.
+seeing each other's tools. A cross-tenant reference is no longer only quiet in
+the logs either: it emits a `mcp_inject_source_denied` audit event (readable
+through `GET /api/audit/events` or the `security_audit` tracing target) alongside
+the existing `warn!` line, so a misconfigured or probed reference is
+SIEM-visible rather than something you have to know to grep for.
 
-**Worth checking on an existing config.** This scoping is newer than the
-feature. A reference that crosses tenants now yields a successful request with
-an empty tool array, which is quiet. Give the MCP origin the same `tenant_id` as
-the `ai_proxy` origin whose keys name it, and grep for
-`inject_mcp references an unknown MCP gateway` to find one. Details in
-[key-management.md](key-management.md).
+`sessions.enabled` state is bound to the tenant that minted it: a session id is
+stamped with its tenant at `initialize` and every later request presenting it
+is checked against that tenant, not just against existence and expiry. A
+session id guessed or replayed by a different tenant is refused (the same
+generic "unknown or expired" response a stranger gets, so the refusal itself
+does not confirm the id belongs to someone) and audited as
+`mcp_session_tenant_mismatch`. This was already an isolation invariant in
+practice -- session ids were opaque per-deployment UUIDs before -- so turning
+it on cannot change behavior for an existing legitimate config.
+
+Session establishment is capacity-bounded too, per tenant and globally: a
+live entry costs registry memory for as long as its TTL, so an unbounded
+mint is a denial-of-service surface in its own right, and one tenant
+minting sessions without bound should not be able to crowd out another's.
+`initialize` refuses to mint a session once the caller's tenant already
+holds 256 live sessions, or the registry holds 4096 across every tenant,
+with an explicit JSON-RPC error rather than a `200` carrying no
+`Mcp-Session-Id` header, so a caller cannot mistake refusal for silent
+statelessness. The refusal is audited as `mcp_session_registry_saturated`
+via `security_audit` rather than a `mcp_governance_decision` event --
+`initialize` is never itself a `tools/call`, the boundary that event stays
+scoped to throughout this page -- and counted on
+`sbproxy_mcp_session_registry_saturated_total`. Neither cap touches an
+existing session: one already minted keeps working and renewing its TTL on
+every request exactly as before, and every other tenant's headroom is
+unaffected; only the establishment of a *new* session, for a tenant or a
+registry that is already full, is refused. The arithmetic is worth
+stating plainly: 4096 global divided by 256 per tenant means sixteen
+tenants can hold full sub-caps at once, so the global cap is a
+deployment-sizing fact, not a per-tenant isolation guarantee.
+
+The peer-profile registry that backs downgrade detection carries the
+same shape of bound, with the same caps (256 pairs per tenant, 4096
+globally), because a tracked profile is likewise memory an unbounded
+peer set could exhaust. A federated call whose `(tenant, peer)` pair
+cannot be tracked gets no downgrade baseline, and a control that cannot
+observe cannot enforce: under `downgrade: block` that call is refused
+fail-closed with rule id `peer_profile_saturated` and a
+`mcp_governance_decision` record; under `warn` (the default) it is
+served, logged once per tenant, and counted on
+`sbproxy_mcp_peer_registry_saturated_total` either way. Pairs already
+tracked keep enforcing normally while the registry is saturated.
+
+And a tool-call *result* can carry another tenant's data through an upstream
+that itself mixes tenants; `content_filters` (see "Credentials reaching a tool
+that should not see them" above) and `result_policies[]` (see "A permitted tool
+called with an argument that should not be") both run against the result
+document specifically, so a shape a detector recognizes, or a rule an operator
+writes against `mcp.result`, is caught before that document ever enters the
+session or reaches the caller.
+
+**Still yours.** `content_filters` is shape-based and `result_policies[]` is
+whatever an operator writes; neither one understands your data model well
+enough to know, unprompted, that a given field is another tenant's. Give the
+MCP origin the same `tenant_id` as the `ai_proxy` origin whose keys name it if
+cross-tenant injection was never the intent.
 
 ## Where to go next
 
+- [mcp-security-coverage.md](mcp-security-coverage.md) for the OWASP MCP
+  Top 10 scorecard this page's sections answer to.
 - [mcp.md](mcp.md) for the gateway itself: wire shape, sessions, OAuth, and the
   dual-era transport.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) for the guardrail
   mechanisms in depth, including supervised stdio and run-as-user.
 - [tool-versioning.md](tool-versioning.md) for the digest recipe and the
   compatibility oracle.
+- [events.md](events.md) for the `mcp_governance_decision` wire shape,
+  fail-closed delivery, and retention.
 - [security.md](security.md) for the whole picture.

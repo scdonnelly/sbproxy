@@ -1786,6 +1786,17 @@ pub const METRICS: &[MetricCapability] = &[
         dead_reason: None,
     },
     MetricCapability {
+        name: "sbproxy_evidence_seq_tenant_cap_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_evidence_seq_tenant_cap"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "Evidence sequence lookups for a tenant past the tracked-tenant cap, sharing the overflow counter.",
+        dead_reason: None,
+    },
+    MetricCapability {
         name: "sbproxy_gateway_reconcile_duration_seconds",
         kind: MetricKind::Histogram,
         writer: Writer::Recorder("record_reconcile"),
@@ -2172,6 +2183,83 @@ pub const METRICS: &[MetricCapability] = &[
         registry: Registry::Default,
         labels: &["grade", "outcome"],
         description: "Tool-versioning oracle verdicts, by computed grade and outcome.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_evidence_fail_closed_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_evidence_fail_closed"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant"],
+        description: "MCP tool calls refused because fail-closed evidence delivery failed, by tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_argument_policy_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_argument_policy"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP argument-policy rule triggers, by tenant, rule name, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_flow_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_flow"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP session-flow enforcement triggers, by tenant, rule id, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_session_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_session_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP session mints refused because the session registry was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_peer_registry_saturated_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_peer_registry_saturated"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &[],
+        description: "MCP peer-profile observations that could not be tracked because the peer registry was at capacity, globally or for the caller's tenant.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_content_filter_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_content_filter"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "category", "verdict"],
+        description: "MCP content-filter (secrets/pii) triggers, by tenant, category, and verdict.",
+        dead_reason: None,
+    },
+    MetricCapability {
+        name: "sbproxy_mcp_result_policy_total",
+        kind: MetricKind::Counter,
+        writer: Writer::Recorder("record_mcp_result_policy"),
+        support: SupportLevel::Stable,
+        compat: CompatTier::Beta,
+        registry: Registry::Default,
+        labels: &["tenant", "rule", "verdict"],
+        description: "MCP result-policy rule triggers, by tenant, rule name, and verdict.",
         dead_reason: None,
     },
     MetricCapability {
@@ -3548,6 +3636,25 @@ pub const TENANT_SCOPED_METRICS: &[&str] = &[
     "sbproxy_inbound_key_requests_total",
     "sbproxy_judge_budget_exhausted_total",
     "sbproxy_label_cardinality_overflow_per_tenant_total",
+    // WOR-2384. A fail-closed MCP evidence refusal is a security-policy
+    // outcome for one tenant's traffic. Merged across tenants it answers
+    // "some evidence write failed somewhere", which cannot tell an
+    // operator whose governed calls are being blocked.
+    "sbproxy_mcp_evidence_fail_closed_total",
+    // WOR-2384 (MCP05). An argument-policy trigger is a security-policy
+    // outcome for one tenant's tool-call traffic, same reasoning as the
+    // evidence fail-closed counter directly above.
+    "sbproxy_mcp_argument_policy_total",
+    // WOR-2384 (MCP06). A session-flow enforcement trigger is a
+    // security-policy outcome for one tenant's tool-call traffic, same
+    // reasoning as the argument-policy counter directly above.
+    "sbproxy_mcp_flow_total",
+    // WOR-2384 (MCP01/MCP10). A content-filter (secrets/pii) trigger and
+    // a result-policy trigger are both security-policy outcomes for one
+    // tenant's tool-call traffic, same reasoning as the argument-policy
+    // and flow counters directly above.
+    "sbproxy_mcp_content_filter_total",
+    "sbproxy_mcp_result_policy_total",
     // Every meter family with a tenant dimension. Tenant-relevant is not a
     // judgment call here: a metering counter exists to say what one
     // customer owes, and one that merged every customer's units into a

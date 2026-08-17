@@ -6480,6 +6480,7 @@ mod event_egress_tests {
             url: None,
             signing_secret: None,
             types: Vec::new(),
+            fail_closed: Vec::new(),
             queue_capacity: None,
         }
     }
@@ -6593,6 +6594,7 @@ mod event_egress_tests {
             path: None,
             signing_secret: Some("vault://nowhere/nothing".to_string()),
             types: Vec::new(),
+            fail_closed: Vec::new(),
             queue_capacity: None,
         };
 

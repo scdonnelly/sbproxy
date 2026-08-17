@@ -1,6 +1,6 @@
 # SBproxy documentation
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy is an open source Enterprise AI Gateway for API, MCP and agent, and AI model traffic. Every feature in this repository ships under Apache-2.0.
 
@@ -100,6 +100,7 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 - [mcp.md](mcp.md) - the MCP gateway: wire shape, capabilities, and `experimental.agentSkillsUrl` advertising.
 - [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md) - MCP gateway guardrails: egress, session risk, quarantine, stdio, run-as-user, and compaction.
 - [mcp-security.md](mcp-security.md) - MCP and agent threat classes: tool poisoning, definition tampering, prompt injection in tool output, and tenant isolation.
+- [mcp-security-coverage.md](mcp-security-coverage.md) - see [Security](#security).
 - [admin-mcp.md](admin-mcp.md) - manage SBproxy from an MCP client: the gateway's own admin API as governed, read-only-by-default MCP tools for Claude Code or Cursor.
 - [tool-versioning.md](tool-versioning.md) - the rollout plane (publish several versions of one tool, resolve per consumer, adapt, sunset) plus the compatibility oracle: a contract digest and a semver grade per tool, with a version-bump linter that fails an under-bump.
 - [a2a-gateway.md](a2a-gateway.md) - the `a2a` action and policy: envelope trust, per-hop chain limits, push-notification target validation, typed AgentCard, and modality negotiation helpers.
@@ -156,6 +157,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [threat-model.md](threat-model.md) - trust boundaries and per-wave review checklist.
 - [api-security.md](api-security.md) - API threat classes and the policy configuration for each, from object-level authorization to bot traffic.
 - [ai-gateway-security-coverage.md](ai-gateway-security-coverage.md) - the eight gateway-layer controls no published list covers, and a row-by-row OWASP LLM Top 10 (2026) mapping, each claim backed by a named test or signal and every limit paired with its rationale.
+- [mcp-security-coverage.md](mcp-security-coverage.md) - a row-by-row OWASP MCP Top 10 mapping, coverage stated as full, partial, or out of gateway scope, each claim backed by a named test or config example.
 - [mcp-security.md](mcp-security.md) - see [MCP and agents](#mcp-and-agents).
 - [auth-oidc.md](auth-oidc.md) - the `oidc` auth provider: OpenID Connect Relying-Party login flow (authorization-code + PKCE, sealed session cookie, optional userinfo trust-header projection, RP-initiated logout).
 - [web-bot-auth.md](web-bot-auth.md) - the `bot_auth` provider: verifying RFC 9421-signed AI crawlers against a published key directory.
@@ -168,7 +170,7 @@ Point a framework you already run at the gateway: chat completions through the O
 - [audit-log.md](audit-log.md) - tamper-evident audit log of admin actions.
 - [observability.md](observability.md) - metrics, logs, traces, and the bundled dashboards.
 - [clickhouse-attribution.md](clickhouse-attribution.md) - access-log schema, pre-aggregations, and sample attribution queries.
-- [events.md](events.md) - the twelve typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
+- [events.md](events.md) - the thirteen typed events, the `events:` file and webhook sinks, decision-audit, and how the pieces fit into a SIEM integration.
 - [metrics-stability.md](metrics-stability.md) - Prometheus metric naming and stability.
 - [decision-records.md](decision-records.md) - what a SIEM consumer may rely on from the decision-audit feed.
 - [operator-runbook.md](operator-runbook.md) - the `runbook_id` index every paging alert resolves through, a response section per id, plus dashboard triage and rollback actions.

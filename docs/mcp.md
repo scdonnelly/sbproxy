@@ -1,6 +1,6 @@
 # MCP gateway
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-17*
 
 SBproxy ships an MCP (Model Context Protocol) gateway that speaks
 JSON-RPC 2.0 over HTTP POST. Configure the `mcp` action on an origin
@@ -359,6 +359,11 @@ success.
 | `server_info.version` | string | `0.1.0` | Returned in `initialize` responses. |
 | `rbac_policies` | map<string, ToolAccessPolicy> | `{}` | Named tool-access labels referenced by `federated_servers[].rbac`. |
 | `federated_servers` | list | required, non-empty | Upstream MCP servers to aggregate. |
+| `argument_policies` | list | `[]` | CEL or OPA-compatible Rego rules evaluated against the tool-call context (name, server, session, tenant, principal, parsed arguments) after RBAC and JSON-Schema validation, before dispatch. `mode: warn` (default) or `block`. See [mcp-security.md](mcp-security.md#a-permitted-tool-called-with-an-argument-that-should-not-be). |
+| `result_policies` | list | `[]` | Same CEL/Rego shape as `argument_policies`, evaluated against the tool-call result (`mcp.result`) after dispatch and after `content_filters`, before the result reaches the caller. |
+| `content_filters` | object | `{secrets: off, pii: off}` | Secret- and PII-shape detection over tool-call arguments (outbound) and tool-call results, `resources/read`, and `prompts/get` responses (inbound). Each of `secrets` / `pii` is `off` \| `warn` \| `redact` \| `block`. See [mcp-security.md](mcp-security.md#credentials-reaching-a-tool-that-should-not-see-them). |
+| `flow` | object | `{mode: off}` | Deterministic session-flow enforcement (Meta's Rule of Two): `mode` (`off`/`warn`/`block`), `rule` (`two_of_three`/`taint_and_outbound`), `trusted_servers`, `sensitive_servers`, `sensitive_tools`, `outbound_tools`, `taint_reads`. See [mcp-security.md](mcp-security.md#a-session-that-reads-something-untrusted-then-tries-to-leave). |
+| `mcp_audit` | object | `{capture_arguments: false}` | Opt-in redacted, size-bounded verbatim tool-call arguments on `mcp_governance_decision` evidence records. See [events.md](events.md) and [mcp-security.md](mcp-security.md#verbatim-argument-capture). |
 | `guardrails` | list | `[]` | Gateway-level safety checks. |
 | `progressive_discovery` | bool | `false` | Advertise `search` / `execute` meta-tools instead of the full catalog (see [`examples/mcp-progressive-discovery`](../examples/mcp-progressive-discovery)). |
 | `oauth` | object | unset | RFC 9728 auth discovery (see the OAuth section below and [`examples/mcp-oauth-discovery`](../examples/mcp-oauth-discovery)). |
@@ -386,10 +391,14 @@ success.
 | `timeout` | duration | unset | Caps each `tools/call` dispatch. Accepts `250ms`, `10s`, `2m`. |
 | `transport` | string | `streamable_http` | `streamable_http`, `sse`, or supervised local `stdio`. |
 | `command` / `args` | string / list | unset | Required command and optional arguments for `transport: stdio`. |
-| `egress` | object | inherited | Per-server OpenAPI REST egress policy. |
+| `egress` | object | inherited | Per-server egress policy for this upstream's outbound dials: the OpenAPI REST calls a `type: openapi` server makes, or the base MCP connect a plain `type: mcp` server makes over `streamable_http` or `sse`. `stdio` servers spawn a local process and never consult it. Omitted inherits the action-level `egress`, then allow-all (legacy, ungated). |
 | `headers` | map<string, string> | `{}` | Static headers attached to every REST request a `type: openapi` server dispatches, e.g. a shared service credential. Values pass through `${VAR}` interpolation; keep secrets in the environment. Rejected on non-`openapi` servers. |
 | `run_as_user_auth` | bool | `false` | Mint per-caller upstream `Authorization` via `upstream_auth` (never tool args). |
 | `upstream_auth` | object | unset | Required when `run_as_user_auth` is true. See [mcp-gateway-guardrails.md](mcp-gateway-guardrails.md). |
+| `protocol` | string | `auto` | `auto` negotiates and remembers, per tenant, the best MCP era this upstream has demonstrated; today that ceiling is `2025-06-18`, since outbound federation does not yet speak the modern era. Pinning `2025-06-18` never negotiates: any other answer is refused. Pinning `2026-07-28` is a config-compile error until outbound federation speaks it too. |
+| `downgrade` | string | `warn` | `warn` or `block`. Applies only when `protocol: auto` and this upstream's contact looks weaker, on protocol era or auth posture, than what it has shown before. Auth posture is classified from the upstream's real response (a 401/407 means "required"; a clean unauthenticated success means "not required"). `warn` logs, allows, and emits an evidence event with verdict `warn`; `block` refuses until the operator pins `protocol` explicitly or edits this server entry. Applies to `tools/call`, `resources/read`, and `prompts/get` alike. |
+| `status` | string | `approved` | `draft`, `approved`, or `deprecated`. Absent means `approved`, so existing configs are unaffected. `draft` hides this server's tools from `tools/list` and refuses every `tools/call` against them, naming the status in the refusal. `deprecated` keeps the server fully callable but emits a warn-level `mcp_governance_decision` event on every call, so a slow migration off a sunset server stays visible without an outage. |
+| `approved_by` / `approved_at` | string | unset | Free-text, operator-attested record of who approved this server and when. sbproxy never verifies these values or requires them for `status: approved`; they are only stored and can be reviewed later. Changing them is audited the same way every other config edit is (`config_audit`), not by a dedicated event. |
 
 A `rbac` value that does not match a key in `rbac_policies` is a hard
 config error, and so is a server with no `rbac` label at all while
@@ -857,10 +866,17 @@ When a subscriber is attached to the `mcp_audit` tracing target, each
 arguments, the SEP-1865 `params.audit.cause` when present, the upstream
 status, and the duration. The event is gated on that subscriber, so a
 deployment that attaches none pays nothing; there is no separate YAML
-knob. The per-call spend and behavioral
+knob for this specific event. The per-call spend and behavioral
 record live in the session ledger below, not this event. Source:
 `emit_mcp_prompt_audit` in
 `crates/sbproxy-core/src/server/action_dispatch.rs`.
+
+A related, `events:`-facing knob does exist: `mcp_audit.capture_arguments`
+opts a dispatched call's `mcp_governance_decision` evidence event into
+carrying the redacted, size-bounded call arguments too, independent of
+whether anything subscribes to the `mcp_audit` tracing target above.
+Off by default. See [mcp-security.md](mcp-security.md#no-usable-record-of-what-happened)
+for the tradeoff and [events.md](events.md) for the event shape.
 
 ## Session ledger
 
@@ -917,6 +933,8 @@ walks through that same fixture end to end, including a real
 
 ## See also
 
+- [`mcp-security-coverage.md`](mcp-security-coverage.md): the OWASP MCP
+  Top 10 scorecard for the surfaces on this page.
 - [`use-case-mcp-federation.md`](use-case-mcp-federation.md): the
   solution guide: problem, RBAC allowlist, and next steps.
 - [`migration-mcp-rbac.md`](migration-mcp-rbac.md): upgrade

@@ -390,3 +390,21 @@
 # cross-crate test to reach it at all, and the alternative (asserting only
 # on the registry, not on the client the registry is supposed to arm)
 # would stop proving the property the bug was about.
+
+# 2026-08-16 (WOR-2384 fix round 1): 290 -> 293. Three new
+# `McpFederation` test seams in sbproxy-extension/src/mcp/federation.rs:
+# `seed_resources_for_test`, `seed_prompts_for_test`, and
+# `seed_server_observations_for_test`. All three are `#[doc(hidden)]
+# pub fn`, named `..._for_test`, and exist for exactly the reason the
+# pre-existing `seed_tools_for_test` (already in this baseline, unaffected
+# by this bump) does: `server_protocol_versions`, `server_auth_required`,
+# `resources`, and `prompts` are private `McpFederation` fields that only
+# a real upstream round trip (`refresh_server_capabilities`) would
+# otherwise populate, so a caller in another crate (sbproxy-core's
+# peer-downgrade dispatch tests) needs a seam to seed them directly. Not
+# narrowable: the whole point is a public entry point a different crate's
+# `#[test]`/`#[tokio::test]` functions call.
+
+# 2026-08-17 (WOR-2384 main-sync): 293/291 -> 294. The two entries above
+# landed on separate branches from the same 290 base; the union after the
+# merge is 294 (three federation `_for_test` seams + `authorize_provider_url`).

@@ -216,6 +216,10 @@ pub enum EventType {
     /// Event name `egress_refused`. An outbound dial was refused by
     /// purpose-scoped egress authorization (WOR-2486).
     EgressRefused,
+    /// Event name `mcp_governance_decision`. An MCP `tools/call` dispatch
+    /// was decided (allowed or refused), emitted from the same funnel
+    /// every MCP tool dispatch already passes through (WOR-2384).
+    McpGovernanceDecision,
 }
 
 impl ProxyEvent {
@@ -255,10 +259,10 @@ impl ProxyEvent {
 ///
 /// The array length is written out, so a variant added to the enum and
 /// not added here fails to compile. That is deliberate. The failure
-/// mode this prevents is a thirteenth event type that no `events:` sink
+/// mode this prevents is a fourteenth event type that no `events:` sink
 /// can ever be told to deliver, which looks exactly like a working sink
 /// to everyone except the operator waiting for the event.
-pub const ALL_EVENT_TYPES: [EventType; 12] = [
+pub const ALL_EVENT_TYPES: [EventType; 13] = [
     EventType::RequestStarted,
     EventType::RequestCompleted,
     EventType::RequestError,
@@ -271,6 +275,7 @@ pub const ALL_EVENT_TYPES: [EventType; 12] = [
     EventType::GuardrailTriggered,
     EventType::ConfigReloaded,
     EventType::EgressRefused,
+    EventType::McpGovernanceDecision,
 ];
 
 impl EventType {
@@ -295,6 +300,7 @@ impl EventType {
             Self::GuardrailTriggered => "guardrail_triggered",
             Self::ConfigReloaded => "config_reloaded",
             Self::EgressRefused => "egress_refused",
+            Self::McpGovernanceDecision => "mcp_governance_decision",
         }
     }
 
@@ -323,6 +329,7 @@ impl EventType {
             Self::GuardrailTriggered => 9,
             Self::ConfigReloaded => 10,
             Self::EgressRefused => 11,
+            Self::McpGovernanceDecision => 12,
         }
     }
 
@@ -353,6 +360,7 @@ impl EventType {
                 | Self::GuardrailTriggered
                 | Self::ConfigReloaded
                 | Self::EgressRefused
+                | Self::McpGovernanceDecision
         )
         // `CacheHit` and `CacheMiss` are deliberately absent: wiring
         // them per-request would put an NDJSON line on every configured
@@ -511,6 +519,10 @@ mod tests {
             (EventType::GuardrailTriggered, "\"guardrail_triggered\""),
             (EventType::ConfigReloaded, "\"config_reloaded\""),
             (EventType::EgressRefused, "\"egress_refused\""),
+            (
+                EventType::McpGovernanceDecision,
+                "\"mcp_governance_decision\"",
+            ),
         ];
 
         for (variant, expected) in variants {
@@ -533,6 +545,33 @@ mod tests {
                 serialized,
                 format!("\"{}\"", variant.as_str()),
                 "as_str disagrees with serde for {variant:?}"
+            );
+        }
+    }
+
+    /// WOR-2384: the previous test pins the bare `EventType`'s own
+    /// serialization; this pins the same thing one layer up, on the
+    /// envelope that actually reaches a file or a webhook. A struct
+    /// derive routes a field through that field type's own `Serialize`
+    /// impl, so this cannot observably differ from
+    /// `event_type_as_str_matches_serde` today, but a future
+    /// hand-written `Serialize` on `ProxyEvent` (or a `#[serde(with =
+    /// ..)]` on the field) could take a different path for the type
+    /// name than `EventType`'s own impl does, and this is the test that
+    /// would catch it. The gap this closes is exactly the one that
+    /// shipped: `EventType`'s bare serialization matching `as_str()`
+    /// was never actually the same question as "what does a SIEM
+    /// reading the NDJSON line see", even though for every variant so
+    /// far the two have had one answer.
+    #[test]
+    fn proxy_event_envelope_serializes_the_same_type_name_as_as_str() {
+        for variant in ALL_EVENT_TYPES {
+            let envelope = make_event(variant);
+            let json = serde_json::to_value(&envelope).expect("serialize envelope");
+            assert_eq!(
+                json["event_type"],
+                variant.as_str(),
+                "the envelope's event_type field disagrees with as_str() for {variant:?}"
             );
         }
     }

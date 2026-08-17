@@ -5199,11 +5199,58 @@ pub(super) async fn handle_ai_proxy(
                     ));
                 }
                 None => {
+                    // WOR-2384 (MCP10): this `None` covers two cases the
+                    // registry cannot distinguish from here -- a plain
+                    // typo (the reference names no MCP gateway at all)
+                    // and a cross-tenant reference (the reference exists,
+                    // but under a different tenant than this request's
+                    // route-derived one; `McpInjectRegistry::get` looks
+                    // up the tenant's own sub-map first, so a match under
+                    // another tenant is invisible from here by
+                    // construction). Both were previously only a `warn!`
+                    // log line, which is not durable and not
+                    // SIEM-visible unless an operator happens to be
+                    // tailing this exact target. Promoted to an audited
+                    // event so a misconfigured (or maliciously probed)
+                    // cross-tenant reference is not a silent miss --
+                    // the empty-catalog behavior itself (the request
+                    // still succeeds, with no tools injected) is
+                    // unchanged.
                     warn!(
                         mcp_ref = %inject.reference,
                         tenant = %ctx.tenant_id,
                         "AI proxy: inject_mcp references an unknown MCP gateway in the route tenant; no tools injected"
                     );
+                    sbproxy_observe::metrics::record_policy(
+                        ctx.hostname.as_str(),
+                        "mcp_inject_source",
+                        "deny",
+                    );
+                    // Latched per (config revision, tenant, reference): a
+                    // plain typo in a virtual key's `inject_mcp.ref` fires
+                    // this arm on every request through that key, and one
+                    // audit entry per request would evict real violations
+                    // from the bounded security-audit ring. The per-request
+                    // metric above keeps counting so dashboards still see
+                    // the rate; the durable audit record is written once
+                    // per config generation for each distinct reference.
+                    if mcp_inject_denial_first_seen(
+                        &pipeline.config_revision,
+                        ctx.tenant_id.as_str(),
+                        &inject.reference,
+                    ) {
+                        sbproxy_observe::SecurityAuditEntry::policy_violation(
+                            "mcp_inject_source_denied",
+                            "inject_mcp reference resolved to no MCP gateway for this request's tenant",
+                            200,
+                            Some(ctx.hostname.to_string()),
+                            ctx.client_ip,
+                            Some(ctx.request_id.to_string()),
+                            Some(session.req_header().method.as_str().to_string()),
+                        )
+                        .with_tenant_id(ctx.tenant_id.to_string())
+                        .emit();
+                    }
                 }
             }
         }
@@ -8954,6 +9001,37 @@ pub(super) async fn handle_ai_proxy(
         );
         Err(Error::new(ErrorType::HTTPStatus(502)))
     }
+}
+
+/// Whether this is the first `inject_mcp` resolution failure seen for
+/// `(config_revision, tenant, reference)` this process.
+///
+/// The caller uses this to write the durable security-audit record once
+/// per config generation instead of once per request: the audit ring is
+/// bounded, and a typo'd reference on a busy virtual key would otherwise
+/// evict real violations with thousands of copies of the same line. The
+/// set is capped; on overflow it is cleared, degrading to one audit
+/// record per `MCP_INJECT_DENIAL_LATCH_CAP` distinct-key floods rather
+/// than growing without bound on attacker-chosen tenant ids.
+fn mcp_inject_denial_first_seen(config_revision: &str, tenant: &str, reference: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    const MCP_INJECT_DENIAL_LATCH_CAP: usize = 1024;
+    static SEEN: OnceLock<Mutex<HashSet<(String, String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = match seen.lock() {
+        Ok(guard) => guard,
+        // A poisoned latch must never suppress an audit record.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.len() >= MCP_INJECT_DENIAL_LATCH_CAP {
+        guard.clear();
+    }
+    guard.insert((
+        config_revision.to_string(),
+        tenant.to_string(),
+        reference.to_string(),
+    ))
 }
 
 fn record_ai_transport_failure(
@@ -14033,6 +14111,7 @@ origins:
                 tool_name.to_string(),
                 sbproxy_extension::mcp::FederatedTool {
                     name: tool_name.to_string(),
+                    upstream_name: tool_name.to_string(),
                     description: "pinned dispatch fixture".to_string(),
                     input_schema,
                     server_name: "catalog".to_string(),
@@ -14194,6 +14273,98 @@ origins:
             body["tools"],
             serde_json::json!([]),
             "an empty governed MCP result must replace, never preserve, caller tools"
+        );
+    }
+
+    /// WOR-2384 (MCP10) red-first: the pipeline's MCP inject source is
+    /// compiled under `tenant-a`; issuing the same `inject_mcp.ref`
+    /// under a route resolved to `tenant-b` must resolve to no source
+    /// (this half was already true before this ticket -- see
+    /// `mcp_inject_registry_tests::task_5b_mcp_inject_lookup_fails_closed_outside_its_tenant_or_name`
+    /// in `pipeline.rs`) and, new in this ticket, must promote that
+    /// miss from a `warn!`-only log line to a durable, SIEM-visible
+    /// audit event. The request itself still succeeds with no tools
+    /// injected -- the empty-catalog behavior is unchanged.
+    #[tokio::test]
+    async fn task_5b_cross_tenant_mcp_inject_reference_is_denied_and_audited() {
+        let pipeline = pipeline_with_mcp_inject_tool("catalog.allowed");
+        let (upstream_url, hits, captured) = capturing_upstream_fixture(
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
+        let config = sbproxy_ai::AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "openai",
+                "provider_type": "openai",
+                "base_url": upstream_url,
+                "allow_private_base_url": true,
+                "api_key": "fixture-key"
+            }],
+            "virtual_keys": [{
+                "key": "tenant-a-key",
+                "key_id": "tenant-a-key-id",
+                "inject_mcp": {"ref": "task-5b-pinned-dispatch"}
+            }]
+        }))
+        .expect("AI proxy config");
+        let request = serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{"role": "user", "content": "fixture prompt"}]
+        });
+        let (mut session, client) = downstream_session(request).await;
+        session
+            .req_header_mut()
+            .insert_header("authorization", "Bearer tenant-a-key")
+            .expect("authorization header");
+        let mut context = crate::context::RequestContext::new();
+        // The pipeline's MCP inject source is registered under
+        // `tenant-a` (see `pipeline_with_mcp_inject_tool`); this
+        // request's route resolves to `tenant-b` instead.
+        context.tenant_id = "tenant-b".into();
+
+        super::handle_ai_proxy(
+            &mut session,
+            &config,
+            &pipeline,
+            "ai.test",
+            &mut context,
+            None,
+        )
+        .await
+        .expect("AI request dispatches");
+        drop(session);
+
+        let response = live_downstream_body(client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "a cross-tenant inject_mcp reference must not fail the request: {response:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let upstream_request = captured.await.expect("capturing upstream task");
+        let request_text = String::from_utf8(upstream_request).expect("upstream request UTF-8");
+        let body: serde_json::Value = serde_json::from_str(
+            request_text
+                .split_once("\r\n\r\n")
+                .expect("upstream request body")
+                .1,
+        )
+        .expect("upstream JSON body");
+        assert!(
+            body.get("tools").is_none() || body["tools"] == serde_json::json!([]),
+            "a cross-tenant reference must inject no tools: {body}"
+        );
+
+        let events = sbproxy_observe::audit_ring::recent_audit_events(
+            50,
+            Some("security"),
+            Some("mcp_inject_source_denied"),
+            None,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.tenant_id.as_deref() == Some("tenant-b")),
+            "the cross-tenant inject_mcp miss must be an audited event, not only a log line: {events:?}"
         );
     }
 
@@ -20071,5 +20242,35 @@ mod served_model_rewrite_tests {
         let out = rewrite_stream_chunk_model(chunk.clone(), "qwen3-14b");
         // Zero-copy pass-through: same bytes, not a re-serialization.
         assert_eq!(out, chunk);
+    }
+
+    /// The audit record for a bad `inject_mcp` reference is latched per
+    /// (config revision, tenant, reference), so a typo on a busy virtual
+    /// key cannot evict real violations from the bounded audit ring; a
+    /// hot reload (new revision) re-arms it.
+    #[test]
+    fn mcp_inject_denial_audit_latches_per_revision_tenant_and_reference() {
+        use crate::server::ai_dispatch::mcp_inject_denial_first_seen;
+        // Unique key material so this test cannot collide with another
+        // test's entries in the process-wide latch.
+        let rev_a = "rev-latch-test-a";
+        let rev_b = "rev-latch-test-b";
+        assert!(mcp_inject_denial_first_seen(rev_a, "acme", "gw-typo"));
+        assert!(
+            !mcp_inject_denial_first_seen(rev_a, "acme", "gw-typo"),
+            "the same triple must not audit twice in one config generation"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_a, "acme", "other-ref"),
+            "a different reference is a different misconfiguration"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_a, "globex", "gw-typo"),
+            "a different tenant is a different misconfiguration"
+        );
+        assert!(
+            mcp_inject_denial_first_seen(rev_b, "acme", "gw-typo"),
+            "a hot reload re-arms the latch for the same reference"
+        );
     }
 }

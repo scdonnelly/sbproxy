@@ -2,7 +2,7 @@
 
 *Last modified: 2026-08-16*
 
-SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of twelve), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
+SBproxy hands a SIEM three different things, and this page is the map of how they fit together: typed proxy events (the `events:` block, a closed set of thirteen), decision-audit records (`observability.log.decision_audit`, eighteen pipeline decisions normalized to OCSF), and four audit channels that write to their own tracing targets (`security_audit`, `config_audit`, `key_audit`, and the admin action ring). Two of those four, `security_audit` and `config_audit`, can additionally be hash-chained and Ed25519-signed for tamper evidence.
 
 If you only read one section, read [How the four audit channels relate to the event stream](#how-the-four-audit-channels-relate-to-the-event-stream). It is the piece that is easy to miss: `events:` is a delivery mechanism, not a source of truth, and most of what it delivers is a typed copy of a record another channel already produced.
 
@@ -22,14 +22,15 @@ If you only read one section, read [How the four audit channels relate to the ev
 | `budget_exceeded` | An AI spend or quota budget was exhausted and the request was blocked. | Yes, on the deny only |
 | `guardrail_triggered` | An AI guardrail blocked a request or a response. | Yes, on the block only |
 | `config_reloaded` | The proxy configuration changed, or a reload was refused. | Yes |
+| `mcp_governance_decision` | An MCP interaction was decided: a `tools/call` allowed or refused by a governance gate, a pre-dispatch RBAC or quota refusal, a tool-contract change against its version lockfile, or a federated server's approval-status transition. | Yes |
 | `cache_hit` | A response was served from the response cache. | No |
 | `cache_miss` | The cache lookup found no usable entry. | No |
 
-Ten of the twelve publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
+Eleven of the thirteen publish today. The other two, `cache_hit` and `cache_miss`, are declared on purpose and will not be wired: both fire on every cacheable request, and putting an NDJSON line on a configured webhook per cache lookup is a cost nobody asked to pay. The forensic question either answers, "did this response come from cache," already has a home: the `cache.admit` and `cache.key` decision-audit events (below) and the access log's `cache_status` column. If you write `events.types: [cache_hit]`, the proxy still boots, because refusing a name here would also block pre-configuring a type a later release wires. It just tells you at startup that nothing will ever arrive.
 
 ### The boot warning, so a quiet sink is a fact, not a guess
 
-An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all twelve") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
+An empty `events:` sink and a broken one look identical from the outside: neither delivers anything. So at boot, the proxy checks every name in `events.types:` (or, when `types:` is absent, every name that means "all thirteen") against the emitters that actually exist, and warns once, by name, for anything that will never fire:
 
 ```
 WARN events.types selects event types that nothing publishes yet; the configured sink will not
@@ -40,7 +41,7 @@ This is the same shape `observability.log.decision_audit` has used for a while, 
 
 ### Verdict-level, not per-request
 
-Three of the ten wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
+Three of the eleven wired events are worth being explicit about, because "wired" does not mean "fires on every request that touches the feature":
 
 - **`provider_selected`** fires on a provider failover or advance, never on the provider chosen for an ordinary first attempt. The data carries `from_provider`, `to_provider`, and the reason (`http_503`, `transport`, `content_policy`, `managed_cold_fallback`). A deployment with healthy providers and no failovers sees none of these, which is correct: routing choice by itself is not a security-relevant event, a transition off the configured plan is.
 - **`budget_exceeded`** fires once per request that actually crosses a configured cap and gets blocked, at the same site that already builds the 402 response body. It does not fire for a request that stays under budget, and it does not fire on a soft-landing downgrade, only on a hard block. The data carries `scope` (the limit's scope label), `reason`, `max_tokens`, `max_cost_usd`, and `window_secs`.
@@ -48,7 +49,7 @@ Three of the ten wired events are worth being explicit about, because "wired" do
 
 ## Decision-audit: the other eighteen
 
-Eleven of the twelve typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
+Most of the thirteen typed proxy events map onto request lifecycle and infrastructure facts. The gateway's actual security decisions, "did the WAF block this," "did the AI guardrail block this," "did this MCP tool dispatch succeed," live on a separate, wider channel: `DecisionEvent`, configured under `proxy.observability.log.decision_audit` and documented in full in [observability.md](observability.md#decision-audit-records) and the generated [decision-records.md](decision-records.md).
 
 The short version, because this page is where the two channels need to be told apart:
 
@@ -86,6 +87,7 @@ pub struct ProxyEvent {
 - `egress_refused` carries the four fields `record_egress_refused` already puts on its Prometheus series: `purpose`, `reason`, `tenant`, `origin`, all closed, bounded labels.
 - `provider_selected`, `budget_exceeded`, and `guardrail_triggered` carry the fields listed under [Verdict-level, not per-request](#verdict-level-not-per-request) above.
 - `request_completed` and `request_error` carry the full request envelope: latency, status, provider, model, token counts, and cost.
+- `mcp_governance_decision` carries OTel GenAI/MCP semantic-convention attribute names (Development stability) plus sbproxy's own `sbproxy.*` namespace: the tool name and call id, the MCP method and protocol version, the decision verdict and redacted reason, a salted hash of the tool arguments (never the arguments themselves, unless `mcp_audit.capture_arguments` opts a deployment into the redacted, size-bounded verbatim arguments too), the tenant id, and a per-tenant gapless sequence number a SIEM can use to detect a dropped record. It is emitted from the one funnel every MCP tool dispatch passes through, plus the RBAC and per-tool-quota denial sites that refuse a call before that funnel, the tool-version lockfile gate's per-refresh contract check, and the federated-server approval-status transition check. A tool-definition-change or registry-status-change record instead carries digest prefixes or the old/new status labels; see [mcp-security.md](mcp-security.md#no-usable-record-of-what-happened) for the full field mapping.
 
 None of those payloads carries a credential, and that is a property under test rather than a convention. `api_key_id` is the public id or a derived `sk_<hex>` fingerprint and never the secret. `prompt_fingerprint` is salted and non-reversible. No field holds prompt text, a header value, or a resolved config value. A field added to any of these records fails a test until somebody has confirmed it can be sent to a third party, because with a webhook sink these bytes leave your network.
 
@@ -109,7 +111,8 @@ events:
 | `path` | Output file for `sink: file`. Parent directories are created at boot. Required by `file`, refused otherwise. |
 | `url` | Destination for `sink: webhook`. Must be `http://` or `https://`. Required by `webhook`, refused otherwise. |
 | `signing_secret` | HMAC-SHA256 key for the webhook signature. Takes a secret reference and nothing else; see below. |
-| `types` | Which event types to deliver. Empty or absent means all twelve. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
+| `types` | Which event types to deliver. Empty or absent means all thirteen. An unrecognized name is refused at compile time with the accepted list; a recognized but unwired name compiles and warns at boot (see above). |
+| `fail_closed` | Event type names that must never be silently dropped. Empty by default. Same accepted set and refusal as `types`. See [Fail-closed delivery](#fail-closed-delivery). |
 | `queue_capacity` | Depth of the hand-off queue. Defaults to 4096. Zero is refused. |
 
 A worked example for an AI-heavy deployment that wants the abuse and cost signals in one place:
@@ -244,6 +247,34 @@ Every other way an event fails to arrive lands on the same counter, so an empty 
 
 A steady `queue_full` rate against a healthy collector usually means `types:` is too broad. `request_completed` fires once per request; `policy_denied` fires once per denial; `provider_selected`, `budget_exceeded`, and `guardrail_triggered` fire only on the verdict transitions described above, so a high rate on any of those three is itself worth looking at before you widen the queue.
 
+## Fail-closed delivery
+
+Everything above this line describes the default, best-effort contract: a full queue drops the newest event and counts it, and the request that produced it keeps going. `events.fail_closed` is the one way to opt an event type out of that.
+
+```yaml
+events:
+  sink: webhook
+  url: https://siem.example.com/sbproxy
+  types:
+    - mcp_governance_decision
+  fail_closed:
+    - mcp_governance_decision
+```
+
+`mcp_governance_decision` is the only publisher wired to this today. When it is named in `fail_closed` and the record cannot be handed to the queue (`queue_full`, `worker_stopped`, or no sink is configured to deliver it at all), the MCP tool call that would have produced that record is refused with a JSON-RPC internal error rather than served with no evidence behind it. `sbproxy_mcp_evidence_fail_closed_total{tenant}` counts every refusal.
+
+A `fail_closed` entry does not have to also appear in `types`, but if it does not, nothing will ever deliver that type, so every governed call is refused. That is a valid configuration (it reads as "block MCP tool calls until the sink is fixed"), not a bug, but it is worth naming so it is not the surprise that turns up in an incident review.
+
+`sbproxy.evidence.seq` only advances while something installed would actually receive `mcp_governance_decision`, so the sequence covers the period evidence emission is enabled: turning it off freezes the counter rather than creating a gap, and turning it back on resumes from where it left off.
+
+A gap inside that enabled period does not automatically mean a lost record. The sequence number is allocated before the delivery attempt, not after it succeeds, so a `fail_closed`-refused call still consumes one: the record was never queued, never delivered, and the caller was refused instead of served un-evidenced. That number then reads to a SIEM exactly like a genuinely dropped best-effort record would, a hole with nothing behind it, even though nothing was actually lost, because nothing was ever produced to lose. A SIEM rule alerting on a gap in this stream should therefore treat it as "a governed call may have been refused for lack of evidence, or a record was dropped," not "a record was dropped" alone, and corroborate against `sbproxy_mcp_evidence_fail_closed_total{tenant}` (ticks on exactly the refusal case) before assuming data loss over a fail-closed refusal.
+
+## Retention
+
+There is no `retention:` key anywhere in the `events:` block, and that is deliberate rather than an omission. The gateway is a producer, not a store: it appends to a file or POSTs to a webhook and moves on, and a per-event-type retention window would mean the proxy owning a decision it has no way to enforce once the bytes have left the process.
+
+`sbproxy.evidence.seq` is what makes retention safe to delegate entirely. Because the sequence is gapless per tenant while emission is enabled, a consumer on the SIEM side can always prove it has received every record in a range rather than trusting that it has: a missing number is a detectable hole, not a silent one. That is the property a retention policy actually needs, and it lives on the SIEM side of the wire, where the durable store, the query engine, and the compliance window already are. Configure retention there, the same as you would for any other ingested log stream.
+
 ## Shutdown does not flush
 
 Stated plainly so nobody assumes otherwise. On `SIGTERM` or `SIGKILL` the process exits with whatever is still queued still queued: up to `queue_capacity` events, plus the batch the worker was mid-delivery on.
@@ -261,8 +292,8 @@ Every one of these is a config that would compile, boot, serve traffic, and deli
 - A `url` that is not `http://` or `https://`.
 - `queue_capacity: 0`.
 - `types:` or `queue_capacity:` under `sink: none`.
-- An event name `types:` does not recognize. The error quotes the name and lists all twelve.
-- Any key the block does not define, so a hopeful `retries:` or `batch_size:` fails rather than being dropped.
+- An event name `types:` or `fail_closed:` does not recognize. The error quotes the name and lists all thirteen.
+- Any key the block does not define, so a hopeful `retries:`, `batch_size:`, or `retention:` fails rather than being dropped. See [Retention](#retention) for why the last one is absent on purpose.
 
 A recognized but unwired name (`cache_hit`, `cache_miss`) is different from all of the above: it compiles, because the config layer cannot know which names a future release will wire, and it warns once at boot instead. See [The boot warning](#the-boot-warning-so-a-quiet-sink-is-a-fact-not-a-guess).
 

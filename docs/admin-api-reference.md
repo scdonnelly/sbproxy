@@ -997,8 +997,9 @@ stops being tracked while every already-tracked one keeps updating. Every
 wired egress purpose writes here: AI providers, the dual-LLM quarantine
 judge, OpenAPI-backed MCP tools, token exchange, webhooks, usage sinks,
 model and engine artifact downloads, extension bundle hooks, and the
-OTLP telemetry exporters. `mcp_upstream` is a reserved purpose label
-with no production call site yet, so it never appears.
+OTLP telemetry exporters. `mcp_upstream` covers the base MCP connect
+for a plain `type: mcp` federated server, gated and DNS-pinned at the
+dial.
 
 The top-level `egress:` section (see
 [Egress allowlists](configuration.md#egress-allowlists)) arms six of
@@ -1009,17 +1010,16 @@ resolver only), and `telemetry`. Until a sub-block sets
 `mode: deny_by_default`, its purpose stays `ungated`: reached, but
 nothing was ever denied because nothing was armed.
 
-Three more purposes arm outside that section, per-tool or per-action:
-OpenAPI-backed MCP tools and the MCP token-exchange path each take a
-per-server `egress:` block (see [mcp-security.md](mcp-security.md));
+Four more purposes arm outside that section, per-tool or per-action:
+MCP upstream connects, OpenAPI-backed MCP tools, and the MCP
+token-exchange path each take a per-server `egress:` block (see [mcp-security.md](mcp-security.md));
 the dual-LLM quarantine judge takes a per-action `egress:` block.
 Extension bundle hooks are armed automatically from the bundle's own
 outbound grant and never appear as `ungated`.
 
-Two purposes cannot be armed by any config today: engine-artifact
-downloads pass no authorizer, and `mcp_upstream` has no production dial
-to attach one to. Both stay `ungated`, or in `mcp_upstream`'s case
-absent from the inventory entirely, regardless of configuration.
+One purpose cannot be armed by any config today: engine-artifact
+downloads pass no authorizer, so they stay `ungated` regardless of
+configuration.
 
 | Status | When |
 |---|---|
