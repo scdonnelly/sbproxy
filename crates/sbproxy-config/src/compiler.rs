@@ -15,17 +15,20 @@ use sbproxy_platform::storage::{
 };
 use smallvec::SmallVec;
 
-use crate::snapshot::{CompiledConfig, CompiledOrigin};
+use sbproxy_security::egress::{EgressAuthorizer, EgressConfig, EgressPurpose, PurposeAllowlist};
+
+use crate::snapshot::{CompiledConfig, CompiledEgressGates, CompiledOrigin};
 use crate::types::{
     AttestationBillableConfig, AttestationConfig, AttestationLedgerConfig,
     AttestationMeasuredConfig, AttestationOriginHeaderConfig, AttestationQueueConfig,
     AttestationRole, AttestationRouteWeightConfig, AuditConfig, AuditSinkKind, ConfigFile,
-    ConnectionPoolConfig, EnforcementMode, EventSinkKind, EventsConfig, FailureMode, L2CacheConfig,
-    L2CacheParams, OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts,
-    UpstreamTimeoutsConfig, WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH,
-    DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_READ_TIMEOUT_MS, DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS,
-    DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS, MAX_ATTESTATION_QUEUE_ENTRIES,
+    ConnectionPoolConfig, EgressPurposeConfig, EgressTopLevelConfig, EnforcementMode,
+    EventSinkKind, EventsConfig, FailureMode, L2CacheConfig, L2CacheParams,
+    OriginAttestationConfig, RawOriginConfig, UpstreamTimeouts, UpstreamTimeoutsConfig,
+    WebBotAuthConfig, ATTESTATION_SIGN_WITH_WEB_BOT_AUTH, DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS, DEFAULT_UPSTREAM_READ_TIMEOUT_MS,
+    DEFAULT_UPSTREAM_TOTAL_CONNECT_TIMEOUT_MS, DEFAULT_UPSTREAM_WRITE_TIMEOUT_MS,
+    MAX_ATTESTATION_QUEUE_ENTRIES,
 };
 
 const MAX_REDIS_TLS_FILE_BYTES: u64 = 1_048_576;
@@ -2134,6 +2137,10 @@ pub fn compile_config(yaml: &str) -> Result<CompiledConfig> {
         events: config_file.events,
         // WOR-1971: hand the complete top-level flag set to the binary.
         flags: config_file.flags,
+        // WOR-2476/WOR-2481: compile the top-level `egress:` block into
+        // one authorizer per configured purpose. Absent, this is
+        // `CompiledEgressGates::default()`, which arms nothing.
+        egress: compile_egress_gates(config_file.egress.as_ref())?,
     })
 }
 
@@ -2246,6 +2253,37 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
     )
 }
 
+/// Lexically normalize an audit chain path for the pairwise-distinctness
+/// comparison in [`validate_audit`] (WOR-2478 M11).
+///
+/// Splits on `/`, drops empty segments (so a repeated or trailing slash
+/// collapses) and `.` segments, and rejoins, restoring a leading slash
+/// when the input had one. `/a/b.jsonl` and `/a/./b.jsonl` normalize to
+/// the same string, so a config that merely spells one chain path with a
+/// redundant `.` segment cannot slip past the check that exists to catch
+/// two channels sharing one file.
+///
+/// Deliberately does not resolve `..` (a `..` segment's target depends
+/// on what its parent actually resolves to on disk, which this function
+/// cannot know without touching the filesystem, and the paths being
+/// compared here may not exist yet) or symlinks. An operator who wants
+/// that guarantee should not need a `..` or a symlink to bypass a check
+/// that is trying to protect them from themselves; this closes the
+/// purely lexical gap, not every gap.
+fn normalize_chain_path(path: &str) -> String {
+    let leading_slash = path.starts_with('/');
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect();
+    let joined = segments.join("/");
+    if leading_slash {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 /// Validate the top-level `audit:` block (WOR-2318, WOR-2478).
 ///
 /// Each rule exists because the alternative is a deployment that
@@ -2280,6 +2318,16 @@ pub fn ensure_node_local_refs_resolved(resolved_text: &str) -> Result<()> {
 /// two different payload types independently; letting one file answer
 /// for both would make a verification failure on one look like a
 /// failure of the other.
+///
+/// `key_path` and `admin_path` follow the identical pattern (WOR-2478):
+/// each is opt-in, each requires `sink: chain`, and each must differ from
+/// every other chain path this config names. Four channels means six
+/// pairwise checks rather than one; each is written out rather than
+/// looped, matching `config_path`'s check above, so the refusal message
+/// always names the two keys actually in conflict. Every comparison runs
+/// against [`normalize_chain_path`]'s output rather than the raw string
+/// (WOR-2478 M11), so `/a/b.jsonl` and `/a/./b.jsonl` are caught as the
+/// same file even though they differ byte for byte.
 fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) -> Result<()> {
     if audit.sink == AuditSinkKind::Tracing {
         anyhow::bail!(
@@ -2311,6 +2359,20 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
                  chain` or remove the path."
             );
         }
+        if audit.key_path.is_some() {
+            anyhow::bail!(
+                "audit.key_path is set but audit.sink is not `chain`, so nothing would ever be \
+                 written to it. audit.key_path requires `audit.sink: chain`. Set `sink: chain` \
+                 or remove the path."
+            );
+        }
+        if audit.admin_path.is_some() {
+            anyhow::bail!(
+                "audit.admin_path is set but audit.sink is not `chain`, so nothing would ever \
+                 be written to it. audit.admin_path requires `audit.sink: chain`. Set `sink: \
+                 chain` or remove the path."
+            );
+        }
         return Ok(());
     }
 
@@ -2324,10 +2386,76 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     if let Some(config_path) = audit.config_path.as_deref().map(str::trim) {
-        if Some(config_path) == audit.path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(config_path))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
             anyhow::bail!(
                 "the config channel cannot share the security chain file; the two payload \
                  types verify separately"
+            );
+        }
+    }
+
+    if let Some(key_path) = audit.key_path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(key_path))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
+            anyhow::bail!(
+                "the key channel cannot share the security chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(normalize_chain_path(key_path))
+            == audit
+                .config_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
+            anyhow::bail!(
+                "the key channel cannot share the config chain file; the two payload types \
+                 verify separately"
+            );
+        }
+    }
+
+    if let Some(admin_path) = audit.admin_path.as_deref().map(str::trim) {
+        if Some(normalize_chain_path(admin_path))
+            == audit
+                .path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
+            anyhow::bail!(
+                "the admin channel cannot share the security chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(normalize_chain_path(admin_path))
+            == audit
+                .config_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
+            anyhow::bail!(
+                "the admin channel cannot share the config chain file; the two payload types \
+                 verify separately"
+            );
+        }
+        if Some(normalize_chain_path(admin_path))
+            == audit
+                .key_path
+                .as_deref()
+                .map(|p| normalize_chain_path(p.trim()))
+        {
+            anyhow::bail!(
+                "the admin channel cannot share the key chain file; the two payload types \
+                 verify separately"
             );
         }
     }
@@ -2354,6 +2482,130 @@ fn validate_audit(audit: &AuditConfig, web_bot_auth: Option<&WebBotAuthConfig>) 
     }
 
     Ok(())
+}
+
+/// Compile the top-level `egress:` section into one
+/// [`sbproxy_security::egress::EgressAuthorizer`] per configured purpose
+/// (WOR-2476, WOR-2481). `cfg` absent yields a default
+/// [`CompiledEgressGates`] (every field `None`), which arms nothing.
+///
+/// `Err` when any sub-block's `ports:` is present but empty, or names
+/// port `0`; see [`compile_egress_purpose`].
+fn compile_egress_gates(cfg: Option<&EgressTopLevelConfig>) -> Result<CompiledEgressGates> {
+    let Some(cfg) = cfg else {
+        return Ok(CompiledEgressGates::default());
+    };
+    Ok(CompiledEgressGates {
+        ai_providers: compile_egress_purpose(
+            &[EgressPurpose::AiProvider],
+            cfg.ai_providers.as_ref(),
+            "ai_providers",
+        )?,
+        // WOR-2476 fix: `usage_sinks:` has to arm the Webhook sink too,
+        // not just the three sinks that already share
+        // `EgressPurpose::UsageSink` internally (Langfuse, Datadog,
+        // ObjectStore).
+        // `WebhookSink::record` authorizes under its own, separate,
+        // pre-existing `EgressPurpose::Webhook` (see
+        // `crates/sbproxy-ai/src/usage_sink.rs`); an authorizer whose
+        // internal purpose map only has a `UsageSink` entry denies every
+        // Webhook dispatch with `UnlistedPurpose` regardless of `hosts`,
+        // because `EgressAuthorizer::authorize` looks the purpose up by
+        // exact key. Compiling one authorizer keyed under both purposes,
+        // sharing the same allowlist, is what actually arms every
+        // consumer `UsageSinkConfig::build` attaches this to.
+        usage_sinks: compile_egress_purpose(
+            &[EgressPurpose::UsageSink, EgressPurpose::Webhook],
+            cfg.usage_sinks.as_ref(),
+            "usage_sinks",
+        )?,
+        model_artifacts: compile_egress_purpose(
+            &[EgressPurpose::ModelArtifact],
+            cfg.model_artifacts.as_ref(),
+            "model_artifacts",
+        )?,
+        token_exchange: compile_egress_purpose(
+            &[EgressPurpose::TokenExchange],
+            cfg.token_exchange.as_ref(),
+            "token_exchange",
+        )?,
+        telemetry: compile_egress_purpose(
+            &[EgressPurpose::Telemetry],
+            cfg.telemetry.as_ref(),
+            "telemetry",
+        )?,
+    })
+}
+
+/// Compile one sub-block into a real authorizer keyed under every purpose
+/// in `purposes`, all sharing the same allowlist. `section_key` names the
+/// sub-block for the two refusal messages (e.g. `"telemetry"`).
+///
+/// `Ok(None)` when the sub-block is omitted, or when its `mode` is the
+/// inert `allow_by_default` default: either way every named purpose
+/// stays legacy ungated, exactly the contract every consumer already
+/// honors for an absent authorizer. `deny_by_default` builds a real
+/// allowlist scoped to `hosts` (exact match, case-insensitive) and
+/// `ports` (default `[80, 443]`; see `EgressPurposeConfig`'s own field
+/// doc for why a purpose that dials a non-standard port, like
+/// `telemetry`'s OTLP endpoint, must override it).
+///
+/// `Err` when `ports` is present but empty, or names port `0`. Checked
+/// unconditionally, even under `allow_by_default`, because an operator
+/// who wrote either explicitly almost certainly meant something else,
+/// and `allow_by_default` being inert today does not mean a later `mode`
+/// flip should be the first thing to notice.
+///
+/// Most sub-blocks arm exactly one [`EgressPurpose`]; `usage_sinks` arms
+/// two (`UsageSink` and `Webhook`, see the call site's comment) because
+/// the sink implementations underneath it authorize under two different,
+/// pre-existing purposes. `purposes` must be non-empty; every call site
+/// in this file passes a literal slice.
+fn compile_egress_purpose(
+    purposes: &[EgressPurpose],
+    cfg: Option<&EgressPurposeConfig>,
+    section_key: &str,
+) -> Result<Option<EgressAuthorizer>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    if cfg.ports.is_empty() {
+        anyhow::bail!(
+            "egress.{section_key}.ports is empty, which would refuse every destination this \
+             purpose reaches with no host list fix able to recover it. Omit `ports:` to use \
+             the default [80, 443], or name at least one port."
+        );
+    }
+    if cfg.ports.contains(&0) {
+        anyhow::bail!(
+            "egress.{section_key}.ports names port 0, which is never a valid destination \
+             port. Remove it."
+        );
+    }
+    if !cfg.mode.is_enforce() {
+        return Ok(None);
+    }
+    let mut allow = PurposeAllowlist {
+        hosts: cfg
+            .hosts
+            .iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .collect(),
+        allow_private: cfg.allow_private,
+        ..Default::default()
+    };
+    allow.schemes.insert("https".to_string());
+    allow.schemes.insert("http".to_string());
+    for port in &cfg.ports {
+        allow.ports.insert(*port);
+    }
+    let mut purposes_map = std::collections::HashMap::new();
+    for purpose in purposes {
+        purposes_map.insert(*purpose, allow.clone());
+    }
+    Ok(Some(EgressAuthorizer::new(EgressConfig {
+        purposes: purposes_map,
+    })))
 }
 
 /// Validate the top-level `events:` block (WOR-2318).
@@ -5068,6 +5320,389 @@ origins:
         assert!(
             compile_config(yaml).is_ok(),
             "top-level v1-compat metadata keys must still compile"
+        );
+    }
+
+    // WOR-2476/WOR-2481: the top-level `egress:` section.
+
+    #[test]
+    fn egress_section_rejects_an_unknown_sub_key() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    bogus_key: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("unknown egress sub-key must fail compile");
+        assert!(
+            format!("{err:#}").contains("bogus_key"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn egress_section_rejects_an_unknown_top_level_purpose() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  mcp_upstream:
+    mode: deny_by_default
+    hosts: ["mcp.example.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("a purpose this section does not expose must fail compile");
+        assert!(
+            format!("{err:#}").contains("mcp_upstream"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn omitted_egress_section_arms_nothing() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config with no egress: block compiles");
+        assert!(compiled.egress.ai_providers.is_none());
+        assert!(compiled.egress.usage_sinks.is_none());
+        assert!(compiled.egress.model_artifacts.is_none());
+        assert!(compiled.egress.token_exchange.is_none());
+        assert!(compiled.egress.telemetry.is_none());
+    }
+
+    #[test]
+    fn egress_purpose_omitted_from_the_section_stays_ungated() {
+        // Only `ai_providers` is configured; the other four purposes must
+        // still compile to `None` even though `egress:` itself is present.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(compiled.egress.ai_providers.is_some());
+        assert!(compiled.egress.usage_sinks.is_none());
+        assert!(compiled.egress.model_artifacts.is_none());
+        assert!(compiled.egress.token_exchange.is_none());
+        assert!(compiled.egress.telemetry.is_none());
+    }
+
+    #[test]
+    fn egress_allow_by_default_mode_stays_ungated_even_with_hosts_set() {
+        // The default `mode` is inert on purpose (WOR-2476): a `hosts`
+        // list with no explicit `deny_by_default` must not silently start
+        // gating a purpose an operator has not opted into.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    hosts: ["api.openai.com"]
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        assert!(
+            compiled.egress.ai_providers.is_none(),
+            "allow_by_default (the default) must compile to no authorizer"
+        );
+    }
+
+    #[test]
+    fn egress_deny_by_default_compiles_a_real_authorizer() {
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["collector.example.com"]
+    allow_private: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .usage_sinks
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::UsageSink,
+                    "https://attacker.test/collect",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
+            "a host outside the configured allowlist must be denied"
+        );
+    }
+
+    #[test]
+    fn egress_usage_sinks_authorizer_also_arms_the_webhook_purpose() {
+        // Regression test (WOR-2476): `WebhookSink::record` authorizes
+        // under `EgressPurpose::Webhook`, a separate, pre-existing
+        // purpose from `EgressPurpose::UsageSink` that Langfuse/Datadog/
+        // ObjectStore share. An authorizer compiled from `usage_sinks:`
+        // that only covered `UsageSink` denied every Webhook dispatch
+        // with `UnlistedPurpose` regardless of `hosts`, because
+        // `EgressAuthorizer::authorize` looks the purpose up by exact
+        // key. Proves the compiled authorizer covers both: an allowed
+        // host authorizes under either purpose, and an unlisted host is
+        // denied by host, not by purpose, under either.
+        // `allow_private` + a loopback IP literal so the positive case
+        // below resolves with no real DNS lookup (an IP literal needs
+        // none) and stays hermetic.
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  usage_sinks:
+    mode: deny_by_default
+    hosts: ["127.0.0.1"]
+    allow_private: true
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .usage_sinks
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+
+        // Not `UnlistedPurpose`: the Webhook purpose key exists. An
+        // unlisted host is denied by host, which only happens after the
+        // purpose lookup already succeeded.
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Webhook,
+                    "https://attacker.test/ingest",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
+            "an unlisted host must be denied by host, not by a missing Webhook purpose entry"
+        );
+
+        // The allowlisted host authorizes under the Webhook purpose too,
+        // not just UsageSink.
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Webhook,
+                    "https://127.0.0.1/ingest",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "the configured host must authorize under EgressPurpose::Webhook, not just UsageSink"
+        );
+    }
+
+    #[test]
+    fn egress_deny_by_default_with_empty_hosts_denies_everything() {
+        // Proves the acceptance shape the brief calls out directly: an
+        // empty `hosts:` list under `deny_by_default` refuses every
+        // destination, not just unlisted ones (there is nothing listed).
+        let yaml = r#"
+proxy:
+  http_bind_port: 8080
+egress:
+  ai_providers:
+    mode: deny_by_default
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://test.sbproxy.dev
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .ai_providers
+            .expect("deny_by_default must compile a real authorizer even with empty hosts");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::AiProvider,
+                    "https://api.openai.com/v1/chat/completions",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::UnlistedHost,
+        );
+    }
+
+    #[test]
+    fn egress_telemetry_with_an_explicit_port_authorizes_the_default_otlp_endpoint() {
+        // C1 regression: `compile_egress_purpose` used to hardcode
+        // `{80, 443}` regardless of the sub-block's own `ports:`, which
+        // meant `egress.telemetry:` could never be armed at all --
+        // `DEFAULT_OTLP_ENDPOINT` is `http://localhost:4327`, and every
+        // other OTLP default (4317 gRPC, 4318 HTTP) is non-standard too.
+        // An operator following the docs' advice to add the host to
+        // `hosts:` would still get `DisallowedPort` on every dial, with
+        // no config fix available.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["localhost"]
+    ports: [4327]
+    allow_private: true
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .telemetry
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:4327",
+                    &SystemHostResolver,
+                )
+                .is_ok(),
+            "an explicit ports: override must authorize the default OTLP endpoint \
+             (allow_private: true is required too, since localhost resolves to a \
+             loopback address and authorize_inner denies PrivateAddress otherwise, \
+             matching docs/configuration.md's own worked example)"
+        );
+
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:8080",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::DisallowedPort,
+            "a port outside the explicit override must still be refused"
+        );
+    }
+
+    #[test]
+    fn egress_telemetry_without_ports_refuses_the_default_otlp_endpoint() {
+        // The other half of the C1 regression: the default port set
+        // ([80, 443]) does not cover OTLP, so an operator who arms
+        // `egress.telemetry:` without an explicit `ports:` override
+        // gets `DisallowedPort` on the default endpoint, not a working
+        // gate. This is the exact boot failure C1 described: "boot
+        // fails with advice that cannot work" until `ports:` is added.
+        let yaml = r#"
+proxy: {}
+egress:
+  telemetry:
+    mode: deny_by_default
+    hosts: ["localhost"]
+"#;
+        let compiled = compile_config(yaml).expect("config compiles");
+        let authorizer = compiled
+            .egress
+            .telemetry
+            .expect("deny_by_default must compile a real authorizer");
+
+        use sbproxy_security::egress::{EgressDenied, EgressPurpose, SystemHostResolver};
+        assert_eq!(
+            authorizer
+                .authorize(
+                    EgressPurpose::Telemetry,
+                    "http://localhost:4327",
+                    &SystemHostResolver,
+                )
+                .unwrap_err(),
+            EgressDenied::DisallowedPort,
+            "the default port set [80, 443] does not cover OTLP's default port"
+        );
+    }
+
+    #[test]
+    fn egress_section_refuses_an_empty_ports_list() {
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    ports: []
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("an empty ports: list must fail compile");
+        assert!(
+            format!("{err:#}").contains("egress.ai_providers.ports"),
+            "error must name the offending key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn egress_section_refuses_port_zero() {
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+    ports: [443, 0]
+"#;
+        let err = compile_config(yaml)
+            .err()
+            .expect("port 0 must fail compile");
+        assert!(
+            format!("{err:#}").contains("egress.ai_providers.ports"),
+            "error must name the offending key: {err:#}"
         );
     }
 
@@ -8796,6 +9431,176 @@ origins:
         assert_eq!(
             audit.config_path.as_deref(),
             Some("/var/lib/sbproxy/config-audit.jsonl")
+        );
+    }
+
+    // --- WOR-2478: the `key_path` and `admin_path` channels ---
+
+    #[test]
+    fn a_key_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  key_path: /var/lib/sbproxy/key-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("a key_path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.key_path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
+        assert!(
+            error.to_string().contains("audit.sink: chain"),
+            "the refusal names what key_path requires: {error}"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_under_the_memory_sink_is_refused_rather_than_ignored() {
+        let error = compile_config(&audit_yaml(
+            "  sink: memory\n  admin_path: /var/lib/sbproxy/admin-audit.jsonl",
+            " {}",
+        ))
+        .err()
+        .expect("an admin_path nothing writes to must not compile");
+        assert!(
+            error.to_string().contains("audit.admin_path"),
+            "the refusal names the key that would be ignored: {error}"
+        );
+        assert!(
+            error.to_string().contains("audit.sink: chain"),
+            "the refusal names what admin_path requires: {error}"
+        );
+    }
+
+    #[test]
+    fn a_key_path_equal_to_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a key_path that shares the security chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the key channel cannot share the security chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn a_key_path_equal_to_config_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/config-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a key_path that shares the config chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the key channel cannot share the config chain file; the two payload types verify \
+             separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/security-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the security chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the security chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_config_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/config-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the config chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the config chain file; the two payload types \
+             verify separately"
+        );
+    }
+
+    #[test]
+    fn an_admin_path_equal_to_key_path_is_refused() {
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/key-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/key-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("an admin_path that shares the key chain file must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the admin channel cannot share the key chain file; the two payload types verify \
+             separately"
+        );
+    }
+
+    #[test]
+    fn audit_chain_compiles_with_all_four_distinct_paths() {
+        let yaml = audit_yaml(
+            "  sink: chain\n  path: /var/lib/sbproxy/security-audit.jsonl\n  \
+             config_path: /var/lib/sbproxy/config-audit.jsonl\n  \
+             key_path: /var/lib/sbproxy/key-audit.jsonl\n  \
+             admin_path: /var/lib/sbproxy/admin-audit.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        );
+        let compiled = compile_config(&yaml).expect("compile");
+        let audit = compiled.audit.expect("audit block survives compilation");
+        assert_eq!(audit.sink, AuditSinkKind::Chain);
+        assert_eq!(
+            audit.path.as_deref(),
+            Some("/var/lib/sbproxy/security-audit.jsonl")
+        );
+        assert_eq!(
+            audit.config_path.as_deref(),
+            Some("/var/lib/sbproxy/config-audit.jsonl")
+        );
+        assert_eq!(
+            audit.key_path.as_deref(),
+            Some("/var/lib/sbproxy/key-audit.jsonl")
+        );
+        assert_eq!(
+            audit.admin_path.as_deref(),
+            Some("/var/lib/sbproxy/admin-audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn chain_paths_are_compared_after_normalizing_dot_segments() {
+        // WOR-2478 M11: `/a/./b.jsonl` and `/a/b.jsonl` name the same
+        // file lexically, so the pairwise check must catch this collision
+        // even though the two strings differ byte for byte.
+        let error = compile_config(&audit_yaml(
+            "  sink: chain\n  path: /a/b.jsonl\n  \
+             config_path: /a/./b.jsonl\n  sign_with: proxy.web_bot_auth",
+            AUDIT_SIGNER,
+        ))
+        .err()
+        .expect("a config_path that normalizes to the same file as path must not compile");
+        assert_eq!(
+            error.to_string(),
+            "the config channel cannot share the security chain file; the two payload types \
+             verify separately"
         );
     }
 

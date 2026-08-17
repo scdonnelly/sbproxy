@@ -356,18 +356,23 @@ fn install_session_ledger_sink(cfg: &sbproxy_config::types::SessionLedgerConfig)
 /// 64 hex characters, so anything unresolvable here is a bug in that
 /// check rather than an operator error, and it says so.
 ///
-/// WOR-2478: when `audit.config_path` is also set, opens and installs the
-/// second, config-change chain under the same signing identity right
-/// after the security chain above. Same fail-the-boot rationale: an
-/// operator who named the file wants the failure loud, not a proxy that
-/// starts believing it is recording a trail it never opened.
+/// WOR-2478: when `audit.config_path`, `audit.key_path`, or
+/// `audit.admin_path` is also set, opens and installs that channel's own
+/// chain under the same signing identity right after the security chain
+/// above. Same fail-the-boot rationale: an operator who named the file
+/// wants the failure loud, not a proxy that starts believing it is
+/// recording a trail it never opened. The key channel's fingerprint key
+/// (as opposed to the chain file itself) is a separate concern installed
+/// later, once `key_management`'s master key resolves; see
+/// `sbproxy_observe::audit_chain::install_key_audit_fingerprint_key`.
 fn install_audit_chain(
     audit: &sbproxy_config::types::AuditConfig,
     web_bot_auth: Option<&sbproxy_config::types::WebBotAuthConfig>,
 ) -> anyhow::Result<()> {
     use sbproxy_config::types::AuditSinkKind;
     use sbproxy_observe::audit_chain::{
-        install_config_audit_chain, install_security_audit_chain, ConfigAuditChain,
+        install_admin_audit_chain, install_config_audit_chain, install_key_audit_chain,
+        install_security_audit_chain, AdminActionAuditChain, ConfigAuditChain, KeyAuditChain,
         SecurityAuditChain,
     };
 
@@ -429,6 +434,50 @@ fn install_audit_chain(
                 );
             }
             Err(error) => anyhow::bail!("audit.config_path is set but {error}"),
+        }
+    }
+
+    // WOR-2478: opt-in third chain for `key_audit` mutations, same
+    // signing identity.
+    if let Some(key_path) = audit.key_path.as_deref() {
+        let key_chain = KeyAuditChain::open(
+            std::path::Path::new(key_path),
+            &signer.ed25519_seed_hex,
+            &signer.key_id,
+        )?;
+        let key_kid = key_chain.key_id().to_string();
+        match install_key_audit_chain(key_chain) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %key_path,
+                    kid = %key_kid,
+                    "key audit trail is hash-chained and signed; verify it with \
+                     `sbproxy audit verify`"
+                );
+            }
+            Err(error) => anyhow::bail!("audit.key_path is set but {error}"),
+        }
+    }
+
+    // WOR-2478: opt-in fourth chain for admin-console actions, same
+    // signing identity.
+    if let Some(admin_path) = audit.admin_path.as_deref() {
+        let admin_chain = AdminActionAuditChain::open(
+            std::path::Path::new(admin_path),
+            &signer.ed25519_seed_hex,
+            &signer.key_id,
+        )?;
+        let admin_kid = admin_chain.key_id().to_string();
+        match install_admin_audit_chain(admin_chain) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %admin_path,
+                    kid = %admin_kid,
+                    "admin audit trail is hash-chained and signed; verify it with \
+                     `sbproxy audit verify`"
+                );
+            }
+            Err(error) => anyhow::bail!("audit.admin_path is set but {error}"),
         }
     }
 
@@ -1244,11 +1293,13 @@ fn reload_compiled_config_locked(
         warn_unwired_decision_audit_events(compiled);
         warn_legacy_policy_record_format(compiled);
 
-        // Rebuild the AI client alongside the catalog. It lives behind an
-        // `ArcSwap`, so this is a lock-free atomic swap from the reload
-        // thread's perspective. The rebuild does not depend on the
-        // catalog reload succeeding, so it runs unconditionally.
-        reload_ai_client();
+        // WOR-2476: arm the AiProvider, UsageSink, ModelArtifact, and
+        // TokenExchange gates from the compiled `egress:` section, and
+        // rebuild the AI client so it picks up `AiProvider`. The shared
+        // seam `run` (boot) also calls; see its doc comment for why this
+        // is one function with two callers rather than the two-call
+        // sequence it replaced.
+        arm_egress_gates_from_config(compiled);
 
         // WOR-1164: refresh the detection singletons (agent-class resolver,
         // TLS-fingerprint catalogue + CEL matcher, agent-detect scorer) so
@@ -1967,6 +2018,12 @@ pub fn run(config_path: &str, grace: GraceConfig) -> anyhow::Result<()> {
     install_usage_rollups_from_config(&compiled);
     warn_unwired_decision_audit_events(&compiled);
     warn_legacy_policy_record_format(&compiled);
+    // WOR-2476: this is the startup path (the earlier call site runs on
+    // reload); arms the AiProvider/UsageSink/ModelArtifact/TokenExchange
+    // registry and rebuilds the AI client before the pipeline below is
+    // published, so a `deny_by_default` `egress:` section is live from
+    // this process's very first request, not just from its first reload.
+    arm_egress_gates_from_config(&compiled);
 
     // Walk the inventory-based plugin registry once at startup and
     // emit one `sbproxy_plugin_registered_total{kind, plugin}` row
@@ -4300,6 +4357,65 @@ fn install_usage_rollups_from_config(compiled: &sbproxy_config::CompiledConfig) 
     }
 }
 
+/// WOR-2476: install the compiled top-level `egress:` authorizers into
+/// `sbproxy_security::egress`'s process-wide configured-gate registry,
+/// then rebuild the AI client so it picks up `AiProvider` immediately.
+///
+/// **The one seam both [`run`] (boot) and [`reload_compiled_config_locked`]
+/// (SIGHUP / file-watcher / admin reload) call.** A prior version of this
+/// arming installed the registry from `reload_compiled_config_locked`
+/// only; boot never called it, so `AI_CLIENT` stayed the ungated
+/// `LazyLock` default and every other purpose's registry slot stayed
+/// empty until the first reload landed. Splitting "install" and "one of
+/// two callers rebuilds the client" back out would silently reintroduce
+/// that gap the moment a future change touched one call site and not the
+/// other; call this one function from both instead.
+///
+/// Three of the five purposes this section names live behind their own,
+/// separate lazy reader: the usage-sink builder, the model-artifact
+/// fetcher, and the outbound-credential resolver each read their own
+/// purpose out of the registry well after this function returns (the
+/// model-artifact fetcher's own staleness window against a
+/// registry-only reload is documented on
+/// [`sbproxy_model_host::HttpArtifactTransport::with_configured_egress`]).
+/// `AiProvider` is the one purpose armed synchronously, right here,
+/// because `AiClient` is a process-wide `ArcSwap` this function owns
+/// rebuilding, not a lazily-read handle some other call site owns.
+///
+/// `Telemetry` is deliberately not installed here. The OTLP exporters are
+/// built once at process boot, before either caller of this function
+/// runs (see `sbproxy::main`'s `runtime_telemetry_config_for_cli`, which
+/// installs `Telemetry` itself from the same compiled config, ahead of
+/// `run`), and are never rebuilt on reload, so re-installing it on every
+/// reload here would only ever matter for a `Telemetry` sighting the
+/// exporters are not built again to observe. WOR-2481 tracks adding real
+/// reload re-verification.
+fn arm_egress_gates_from_config(compiled: &sbproxy_config::CompiledConfig) {
+    use sbproxy_security::egress::{install_configured_gate, EgressPurpose};
+    install_configured_gate(
+        EgressPurpose::AiProvider,
+        compiled.egress.ai_providers.clone(),
+    );
+    install_configured_gate(
+        EgressPurpose::UsageSink,
+        compiled.egress.usage_sinks.clone(),
+    );
+    install_configured_gate(
+        EgressPurpose::ModelArtifact,
+        compiled.egress.model_artifacts.clone(),
+    );
+    install_configured_gate(
+        EgressPurpose::TokenExchange,
+        compiled.egress.token_exchange.clone(),
+    );
+    // Rebuild the AI client immediately, in the same call, so `AiProvider`
+    // is live before this function returns rather than depending on the
+    // caller to remember a second call. Lives behind an `ArcSwap`, so
+    // this is a lock-free atomic swap regardless of which caller (boot
+    // or reload) triggered it.
+    reload_ai_client();
+}
+
 fn install_sink_dispatcher_from_config(compiled: &sbproxy_config::CompiledConfig) -> bool {
     use sbproxy_observe::sink_dispatcher::{
         install_sink_dispatcher, CompiledSink, SinkDispatcher, SinkScope,
@@ -5489,6 +5605,7 @@ origins:
             request_events: None,
             events: None,
             flags: Vec::new(),
+            egress: Default::default(),
         };
 
         install_op_redact_state(&compiled);
@@ -6194,17 +6311,20 @@ mod event_egress_tests {
     }
 
     #[test]
-    fn install_audit_chain_installs_both_chains_when_config_path_is_set() {
-        // WOR-2478: `audit.config_path` opts a second, config-change chain
-        // into the same boot call that opens the security chain, under
-        // the same signing identity. The two slots this claims
-        // (`sbproxy_observe::audit_chain::CHAIN` and `CONFIG_CHAIN`) are
-        // private and process-wide, so the only externally observable
-        // proof either one installed is that a second install of the same
-        // slot is refused.
+    fn install_audit_chain_installs_all_four_chains_when_every_path_is_set() {
+        // WOR-2478: `audit.config_path`, `audit.key_path`, and
+        // `audit.admin_path` each opt a further chain into the same boot
+        // call that opens the security chain, under the same signing
+        // identity. The four slots this claims
+        // (`sbproxy_observe::audit_chain::CHAIN`, `CONFIG_CHAIN`,
+        // `KEY_CHAIN`, `ADMIN_CHAIN`) are private and process-wide, so the
+        // only externally observable proof any one installed is that a
+        // second install of the same slot is refused.
         let dir = tempfile::tempdir().expect("temp dir");
         let security_path = dir.path().join("security-audit.jsonl");
         let config_path = dir.path().join("config-audit.jsonl");
+        let key_path = dir.path().join("key-audit.jsonl");
+        let admin_path = dir.path().join("admin-audit.jsonl");
         let signer = sbproxy_config::types::WebBotAuthConfig {
             key_id: "audit-test-kid".to_string(),
             ed25519_seed_hex: "cc".repeat(32),
@@ -6215,6 +6335,8 @@ mod event_egress_tests {
             path: Some(security_path.display().to_string()),
             sign_with: Some("web_bot_auth".to_string()),
             config_path: Some(config_path.display().to_string()),
+            key_path: Some(key_path.display().to_string()),
+            admin_path: Some(admin_path.display().to_string()),
         };
 
         match install_audit_chain(&audit, Some(&signer)) {
@@ -6226,6 +6348,14 @@ mod event_egress_tests {
                 assert!(
                     config_path.exists(),
                     "the config chain file is opened alongside it"
+                );
+                assert!(
+                    key_path.exists(),
+                    "the key chain file is opened alongside it"
+                );
+                assert!(
+                    admin_path.exists(),
+                    "the admin chain file is opened alongside it"
                 );
 
                 let redundant_seed = "dd".repeat(32);
@@ -6254,6 +6384,32 @@ mod event_egress_tests {
                     config_reinstall.is_err(),
                     "the config slot this boot call claimed is already taken"
                 );
+
+                let redundant_key = sbproxy_observe::audit_chain::KeyAuditChain::open(
+                    &dir.path().join("unused-key.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let key_reinstall =
+                    sbproxy_observe::audit_chain::install_key_audit_chain(redundant_key);
+                assert!(
+                    key_reinstall.is_err(),
+                    "the key slot this boot call claimed is already taken"
+                );
+
+                let redundant_admin = sbproxy_observe::audit_chain::AdminActionAuditChain::open(
+                    &dir.path().join("unused-admin.jsonl"),
+                    &redundant_seed,
+                    "unused",
+                )
+                .expect("chain opens");
+                let admin_reinstall =
+                    sbproxy_observe::audit_chain::install_admin_audit_chain(redundant_admin);
+                assert!(
+                    admin_reinstall.is_err(),
+                    "the admin slot this boot call claimed is already taken"
+                );
             }
             Err(error) if error.to_string().contains("already registered") => {
                 // Another test in this process claimed a slot first (the
@@ -6263,6 +6419,58 @@ mod event_egress_tests {
             }
             Err(error) => panic!("unexpected boot failure: {error}"),
         }
+    }
+
+    #[test]
+    fn arm_egress_gates_from_config_is_the_seam_run_calls_at_boot() {
+        // WOR-2476 regression: a prior version of this arming installed
+        // the registry from `reload_compiled_config_locked` only, and
+        // rebuilt `AI_CLIENT` as a second, separate call at that same
+        // site. `run` (boot) never called either, so a fresh process
+        // start served every purpose ungated until its first reload,
+        // even with a `deny_by_default` `egress:` section. Drives the
+        // shared seam directly, the exact way `run` calls it (not
+        // `install_configured_gate`, which only proves the registry
+        // slot, not that a live dispatch is actually gated), and checks
+        // both halves of what that one call has to do: arm the
+        // registry, and rebuild the process-wide `ai_client()` so a
+        // real dispatch through it is denied before any reload runs.
+        let yaml = r#"
+proxy: {}
+egress:
+  ai_providers:
+    mode: deny_by_default
+    hosts: ["api.openai.com"]
+"#;
+        let compiled = sbproxy_config::compile_config(yaml).expect("config compiles");
+
+        arm_egress_gates_from_config(&compiled);
+
+        assert!(
+            sbproxy_security::egress::configured_gate(
+                sbproxy_security::egress::EgressPurpose::AiProvider
+            )
+            .is_some(),
+            "the registry must carry the compiled AiProvider authorizer"
+        );
+
+        let client = crate::server::ai_client();
+        let err = client
+            .authorize_provider_url(
+                "https://attacker.test/v1/chat",
+                &sbproxy_security::egress::SystemHostResolver,
+            )
+            .expect_err("a host outside the configured allowlist must be denied");
+        assert_eq!(err, sbproxy_security::egress::EgressDenied::UnlistedHost);
+
+        // Restore the legacy ungated default so a later test in the same
+        // process (the `cargo test` fallback path only; nextest gives
+        // every test its own process) does not inherit this arming.
+        sbproxy_security::egress::install_configured_gate(
+            sbproxy_security::egress::EgressPurpose::AiProvider,
+            None,
+        );
+        reload_ai_client();
     }
 
     #[test]
@@ -6289,12 +6497,48 @@ mod event_egress_tests {
             path: Some(security_path.display().to_string()),
             sign_with: Some("web_bot_auth".to_string()),
             config_path: Some(config_path.display().to_string()),
+            key_path: None,
+            admin_path: None,
         };
 
         let error = install_audit_chain(&audit, Some(&signer))
             .expect_err("a config chain whose parent cannot be created must not boot quietly");
         assert!(
             error.to_string().contains("audit.config_path"),
+            "the failure names the key that turned the chain on: {error}"
+        );
+    }
+
+    #[test]
+    fn install_audit_chain_fails_boot_when_admin_paths_parent_cannot_be_created() {
+        // WOR-2478: the same loud-fail posture, proved for the admin
+        // channel specifically so the extension is known to be reachable
+        // rather than merely mirrored in shape from the config case above.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let security_path = dir.path().join("security-audit.jsonl");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"occupies the path a directory needs")
+            .expect("write blocker file");
+        let admin_path = blocker.join("admin-audit.jsonl");
+
+        let signer = sbproxy_config::types::WebBotAuthConfig {
+            key_id: "audit-test-kid-3".to_string(),
+            ed25519_seed_hex: "ff".repeat(32),
+            directory_url: None,
+        };
+        let audit = sbproxy_config::types::AuditConfig {
+            sink: sbproxy_config::types::AuditSinkKind::Chain,
+            path: Some(security_path.display().to_string()),
+            sign_with: Some("web_bot_auth".to_string()),
+            config_path: None,
+            key_path: None,
+            admin_path: Some(admin_path.display().to_string()),
+        };
+
+        let error = install_audit_chain(&audit, Some(&signer))
+            .expect_err("an admin chain whose parent cannot be created must not boot quietly");
+        assert!(
+            error.to_string().contains("audit.admin_path"),
             "the failure names the key that turned the chain on: {error}"
         );
     }

@@ -45,8 +45,27 @@ static AI_CLIENT: std::sync::LazyLock<arc_swap::ArcSwap<AiClient>> =
 /// edits providers picks up the new catalog without a process
 /// restart. In-flight requests are unaffected; the next request after
 /// the swap sees the new client.
+///
+/// WOR-2476: reads the `EgressPurpose::AiProvider` authorizer from
+/// `sbproxy_security::egress`'s process-wide configured-gate registry and
+/// attaches it via `with_egress` when one is installed. The registry is
+/// populated by `lifecycle::arm_egress_gates_from_config`, which calls
+/// this function itself (not a separate caller) immediately after
+/// installing the registry, so this always reads the authorizer the
+/// current config compiled (or `None`, preserving `AiClient`'s legacy
+/// ungated contract, when `egress:` omits `ai_providers` or was never
+/// configured at all). `arm_egress_gates_from_config` is the one seam
+/// both `lifecycle::run` (boot) and the reload path call, specifically
+/// so this function runs at boot and not only from the second config a
+/// process ever loads.
 pub fn reload_ai_client() {
-    AI_CLIENT.store(std::sync::Arc::new(AiClient::new()));
+    use sbproxy_security::egress::{configured_gate, EgressPurpose};
+
+    let mut client = AiClient::new();
+    if let Some(authorizer) = configured_gate(EgressPurpose::AiProvider) {
+        client = client.with_egress(authorizer);
+    }
+    AI_CLIENT.store(std::sync::Arc::new(client));
 }
 
 /// The current AI client, for surfaces outside the request pipeline
