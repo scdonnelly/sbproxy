@@ -122,8 +122,8 @@ Route AI, govern the AI that calls you, and run AI models yourself.
 
 ## Scripting and extensibility
 
-- [plugins.md](plugins.md) - the entry point for extending SBproxy: the four config-level surfaces (CEL, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
-- [scripting.md](scripting.md) - CEL, Lua, JavaScript, and WASM scripting reference.
+- [plugins.md](plugins.md) - the entry point for extending SBproxy: the five config-level surfaces (CEL, Rego, Lua, JavaScript, WASM), extension bundles, the four hook kinds, and the advanced linked-Rust-plugin path.
+- [scripting.md](scripting.md) - CEL, Rego, Lua, JavaScript, and WASM scripting reference, including the offline `sbproxy rego test` loop.
 - [extension-bundles.md](extension-bundles.md) - adding policies, transforms, actions, HTTP filters, and event hooks as loadable bundles, from a local directory or a verified git checkout, without linking a new proxy binary.
 - [wasm-development.md](wasm-development.md) - writing WebAssembly modules for the `wasm` transform against the WASI preview-1 contract.
 - [key-management.md](key-management.md) - dynamic virtual keys: mint, revoke, and rotate at runtime through the admin API, hashed at rest, with a fail-closed policy cache.
