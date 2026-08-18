@@ -27,14 +27,14 @@ function pinnedOf(p: PromptEntry): string {
 // ---- add version ----
 const showAdd = ref(false);
 const addTarget = ref<PromptEntry | null>(null);
-const addForm = reactive({ version: "", content: "" });
+const addForm = reactive({ version: "", template: "" });
 const addBusy = ref(false);
 const addError = ref<ApiError | null>(null);
 
 function openAdd(p: PromptEntry) {
   addTarget.value = p;
   addForm.version = "";
-  addForm.content = "";
+  addForm.template = "";
   addError.value = null;
   showAdd.value = true;
 }
@@ -46,7 +46,7 @@ async function submitAdd() {
   try {
     const body: Record<string, unknown> = {};
     if (addForm.version) body.version = addForm.version;
-    if (addForm.content) body.content = addForm.content;
+    if (addForm.template) body.template = addForm.template;
     await api.addPromptVersion(
       String(addTarget.value.host ?? ""),
       String(addTarget.value.name ?? ""),
@@ -154,7 +154,7 @@ async function submitPin() {
     </div>
     <div class="sb-field">
       <label class="sb-label">Prompt content</label>
-      <textarea class="sb-textarea" v-model="addForm.content" placeholder="Prompt text or template"></textarea>
+      <textarea class="sb-textarea" v-model="addForm.template" placeholder="Prompt text or template"></textarea>
     </div>
     <template #footer>
       <button class="sb-btn" @click="showAdd = false">Cancel</button>

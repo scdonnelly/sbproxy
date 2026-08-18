@@ -10,6 +10,15 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+### Fixed
+
+- **Prompts admin page "Add version" now sends the field the backend
+  expects.** The form built a `content` key while
+  `POST /admin/prompts/<host>/<name>/versions` deserializes into a
+  required `template` field with no alias, so every submission 400ed.
+  The form now sends `template`; the same operation already worked via
+  the raw admin API.
+
 ## [1.13.0] - 2026-08-18
 
 ### Security
