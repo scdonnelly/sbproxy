@@ -10,6 +10,23 @@ repository.
 Work that has merged to `main` since the latest tag and is queued for
 the next version cut.
 
+<<<<<<< HEAD
+### Changed, and worth checking before you upgrade
+
+- **`transport: stdio` MCP servers now run as one supervised
+  persistent child per configured server, not one process per
+  JSON-RPC exchange.** Server-side session state survives between
+  calls, and process startup is paid once per child rather than once
+  per call. The supervisor health-probes an idle child with an MCP
+  `ping`, restarts a crashed child under bounded exponential backoff,
+  replays the `initialize` handshake on the replacement child, fails
+  in-flight calls closed with a typed error on a crash or timeout
+  instead of hanging, and kills the child when its server leaves the
+  configuration. Legacy one-shot commands that answer a single
+  request and exit keep working: a child that dies after serving is
+  respawned on the next call. See the stdio section of
+  [docs/mcp-gateway-guardrails.md](docs/mcp-gateway-guardrails.md).
+=======
 ### Fixed
 
 - **The `websocket` action's `max_message_size` and `subprotocols` are
@@ -31,6 +48,7 @@ the next version cut.
   `502`. Routes with `request_modifiers` still validate at the
   post-modifier seam, since the modified request is the one the
   contract holds.
+>>>>>>> origin/main
 
 ## [1.13.0] - 2026-08-18
 
