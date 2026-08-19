@@ -44,9 +44,10 @@ async function submitAdd() {
   addBusy.value = true;
   addError.value = null;
   try {
-    const body: Record<string, unknown> = {};
-    if (addForm.version) body.version = addForm.version;
-    if (addForm.template) body.template = addForm.template;
+    // Both fields are required by the endpoint (serde rejects a missing
+    // one with an opaque 400), so the submit button stays disabled until
+    // both are non-empty and the body always carries both.
+    const body = { version: addForm.version, template: addForm.template };
     await api.addPromptVersion(
       String(addTarget.value.host ?? ""),
       String(addTarget.value.name ?? ""),
@@ -158,7 +159,11 @@ async function submitPin() {
     </div>
     <template #footer>
       <button class="sb-btn" @click="showAdd = false">Cancel</button>
-      <button class="sb-btn sb-btn--primary" :disabled="addBusy" @click="submitAdd">
+      <button
+        class="sb-btn sb-btn--primary"
+        :disabled="addBusy || !addForm.version || !addForm.template"
+        @click="submitAdd"
+      >
         {{ addBusy ? "Adding..." : "Add version" }}
       </button>
     </template>
