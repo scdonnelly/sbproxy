@@ -2293,11 +2293,41 @@ origins:
 
 ## Authentication
 
-The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships ten built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
+The `authentication` block is a sibling of `action`, not nested inside it. It controls who can access the origin. SBproxy ships twelve built-in auth providers: `api_key`, `basic_auth`, `bearer`, `jwt`, `digest`, `hmac_auth`, `ldap_auth`, `forward_auth`, `bot_auth`, `cap`, `oidc`, and `noop`.
 
 `bot_auth` verifies cryptographically-signed AI agents per RFC 9421 + the IETF Web Bot Auth draft. Full reference: [web-bot-auth.md](web-bot-auth.md).
 
 Anything else falls through to the inventory-based auth plugin registry, so a linked third-party crate can register additional types (`oauth`, `oauth_introspection`, `oauth_client_credentials`, `ext_authz`, `biscuit`, `saml`, ...) without patching the proxy. Plugins register on the typed `AuthPluginRegistration` channel and surface through the standard `authentication.type` config field.
+
+### Accepting more than one provider
+
+`authentication` also takes a list of two or more provider blocks. Providers run in declared order and the first one that accepts the request wins. This is the shape of a credential migration (keep accepting legacy API keys while callers move to JWTs on the same origin) and of mixed-client origins (services present tokens, crawlers present signatures).
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      - type: api_key
+        api_keys:
+          - ${LEGACY_API_KEY}
+      - type: jwt
+        jwks_url: https://auth.example.com/.well-known/jwks.json
+        issuer: https://auth.example.com
+```
+
+How the list behaves:
+
+- Order matters. Put the provider most callers use first; every request walks the list from the top and stops at the first success.
+- The winner binds the request. Audit events, decision records, and the auth metric name the provider that authenticated the request, and principal attribution (project, user, team, `key_id`) comes from the winning entry's own config. Nothing is merged across providers.
+- When every provider rejects, the response carries the first provider's status and message, with each provider's `WWW-Authenticate` challenge merged onto it ([RFC 7235](https://www.rfc-editor.org/rfc/rfc7235) permits several challenges on one response). A client that failed both then sees every scheme the origin accepts.
+- A provider that fails, whatever the reason, loses only its own slot. The next provider still runs, and a request no provider accepts is rejected.
+- A one-entry list is refused at config load; write a single provider as a plain mapping.
+- Three types are refused inside a list. `noop` would admit every request and make the other entries decorative. `forward_auth` runs as a separate subrequest and only works as an origin's sole provider. `oidc` needs the login-callback endpoint that only a sole `oidc` block wires up.
+
+See [examples/auth-composition/](../examples/auth-composition/) for a runnable two-provider config.
 
 ### api_key
 
@@ -2433,6 +2463,7 @@ origins:
 | `required_claims` | map | | Claims that must be present and equal to the configured value. |
 | `require_dpop` | bool | `false` | When `true`, the JWT MUST come with a valid RFC 9449 DPoP proof whose `jkt` matches the token's `cnf.jkt` claim. Tokens without a `cnf.jkt` claim fail closed. |
 | `require_mtls_bound` | bool | `false` | When `true`, the JWT's `cnf.x5t#S256` claim MUST match the SHA-256 thumbprint of the inbound TLS client cert (RFC 8705 mutual-TLS-bound tokens). |
+| `jwe.decryption_key` | string | | PEM private key for decrypting JWE (RFC 7516) encrypted tokens before the usual signature checks. See "Encrypted tokens" below. |
 
 The list must contain at least one entry; an empty list rejects all tokens. Bearer tokens must be supplied via `Authorization: Bearer <jwt>`.
 
@@ -2467,6 +2498,43 @@ authentication:
 Both flags default to `false` so existing JWT configurations
 keep their unbound semantics. Turn them on per-route as the
 issuer starts minting `cnf.jkt` / `cnf.x5t#S256` tokens.
+
+#### Encrypted tokens (RFC 7516 JWE)
+
+Some identity providers encrypt their tokens instead of only
+signing them: a signed JWT nested inside a JWE envelope. Set
+`jwe.decryption_key` to the PEM private key registered with the
+issuer and the proxy decrypts the envelope first, then verifies
+the recovered JWT with the same `secret` / `jwks_url` settings
+as a plain signed token (decrypt-then-verify per RFC 7519). A
+provider without a `jwe` block refuses encrypted tokens, so
+existing JWS-only configurations are unaffected.
+
+```yaml
+authentication:
+  type: jwt
+  jwks_url: https://auth.example.com/.well-known/jwks.json
+  issuer: https://auth.example.com
+  audience: my-api
+  jwe:
+    decryption_key: ${JWT_JWE_PRIVATE_KEY}
+```
+
+Supported algorithms are the set enterprise issuers actually
+use for encrypted tokens: `RSA-OAEP` and `RSA-OAEP-256` key
+unwrap with an RSA private key, and `ECDH-ES` direct key
+agreement with a P-256 EC private key, all with `A256GCM`
+content encryption. Anything else, including the deprecated
+`RSA1_5`, is refused (debug-level logs name the offending
+algorithm).
+
+Failure handling is deliberately uniform: wrong key, garbage
+ciphertext, an unsupported algorithm, or a tampered tag all
+produce the same 401 challenge as a bad signature, so a probing
+client learns nothing from the response shape. The decryption
+key is never echoed in logs or error messages. Interpolate it
+from the environment or a secret backend (as above) rather than
+committing key material to the config file.
 
 ### digest
 
@@ -2526,6 +2594,43 @@ authentication:
 
 The algorithm is negotiated, not merely declared. The challenge carries `algorithm=`, and a response that names a different algorithm, or omits the parameter on a SHA-256 realm, is rejected. A client cannot talk a SHA-256 realm down to MD5 by dropping the parameter. Only `SHA-256` and `MD5` are implemented; the `-sess` variants and `SHA-512-256` are refused at config compile rather than silently downgraded.
 
+### hmac_auth
+
+Signed-request authentication for machine callers. The client holds a shared secret and signs each request with RFC 9421 HTTP Message Signatures (`hmac-sha256`), so no static credential crosses the wire and a captured request cannot be replayed against a different method, path, or time window. The right pick for webhook senders and machine-to-machine API clients that want per-request integrity without a bearer token.
+
+```yaml
+origins:
+  "api.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: hmac_auth
+      clock_skew_seconds: 300
+      keys:
+        - key_id: svc-billing
+          secret: ${BILLING_HMAC_SECRET}
+          project: billing
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `hmac_auth`. |
+| `keys` | list | required | Accepted signing keys, at least one. Each entry needs a unique `key_id` (the RFC 9421 `keyid` the signer advertises) and a `secret`. Entries also accept the per-credential metadata fields (`project`, `user`, `team`, `tags`, `metadata`). |
+| `clock_skew_seconds` | int | 300 | Freshness window for the mandatory `created` signature parameter, applied in both directions. A `created` older than the window is refused as a replay; one further in the future is refused as skewed. |
+| `required_components` | list | `["@method", "@target-uri"]` | Components every accepted signature must cover. The default binds the verb and the path-and-query, so a captured signature cannot be replayed elsewhere. |
+
+The `secret` resolves through the secret resolver like every other signing-key field: an inline literal, `${VAR}`, `env:NAME`, `file:PATH`, or a backend URI such as `vault://...`. A reference nothing can resolve refuses to boot rather than becoming the key. Verification failures answer `401` with a `WWW-Authenticate: Signature` challenge that carries no key material, and the failure reason is logged, never returned to the client.
+
+Clients send the standard RFC 9421 header pair. The signature base covers the declared components plus the `@signature-params` line, `created` is required, and `alg` must be `hmac-sha256` (the only symmetric algorithm in the RFC 9421 registry; HMAC-SHA1 does not exist here to be negotiated down to):
+
+```text
+Signature-Input: sig1=("@method" "@target-uri");created=1723800000;keyid="svc-billing";alg="hmac-sha256"
+Signature: sig1=:BASE64_HMAC_SHA256_OF_SIGNATURE_BASE:
+```
+
+On a match the principal's `sub` is the `key_id`, `principal_kind` is `hmac_auth`, and the entry's metadata rides along for per-credential reporting. A signature that covers `content-digest` is checked against the request body available at the auth phase, which is empty, so body-covering signatures on body-bearing requests are refused rather than passed unverified; body-digest binding is a tracked follow-up. See [`examples/auth-hmac/`](../examples/auth-hmac/) for a complete working config with a signing script.
+
 ### forward_auth
 
 Delegate authentication to an external service. SBproxy sends a subrequest to the auth service and uses the response status to allow or deny the original request. The right choice when auth logic lives in its own service.
@@ -2555,6 +2660,44 @@ origins:
 | `headers_to_forward` | list | | Headers to copy from the original request. Alias: `forward_headers`. |
 | `trust_headers` | list | | Headers from the auth response to inject into the upstream request |
 | `success_status` | int \| list | 200 | Status code(s) that mean "authenticated". A list is accepted, but only the first element is used. |
+
+### ldap_auth
+
+Authenticate against an LDAP or Active Directory server with a directory bind. The client sends HTTP Basic credentials; the proxy composes a bind DN as `<uid_attribute>=<username>,<base_dn>` and attempts an LDAP simple bind with the supplied password. A successful bind authenticates the request and attributes it to the username. The password is used for the bind only: never stored, never forwarded upstream, never logged. `ldap` is accepted as an alias for the `type` value.
+
+```yaml
+origins:
+  "intranet.example.com":
+    action:
+      type: proxy
+      url: https://backend.internal:8080
+    authentication:
+      type: ldap_auth
+      url: ldaps://directory.internal:636
+      base_dn: ou=users,dc=example,dc=org
+      uid_attribute: uid
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `type` | string | required | Must be `ldap_auth` (alias: `ldap`) |
+| `url` | string | required | Directory URL: `ldap://host[:port]` or `ldaps://host[:port]` |
+| `base_dn` | string | required | Base DN the user RDN is appended to, e.g. `ou=users,dc=example,dc=org` |
+| `uid_attribute` | string | `cn` | Attribute the username is bound under when composing the DN |
+| `use_tls` | bool | `false` | Upgrade an `ldap://` connection with StartTLS before the bind |
+| `tls_verify` | bool | `true` | Verify the directory's TLS certificate. When verifying, the `url` host must match the certificate's host. |
+| `allow_insecure` | bool | `false` | Accept a plaintext `ldap://` connection with no StartTLS |
+| `timeout_secs` | int | 5 | Deadline in seconds for the connect + bind exchange |
+
+Three behaviors are deliberate:
+
+- **Plaintext is refused at config load.** An `ldap://` URL with neither `use_tls: true` nor `allow_insecure: true` fails config validation, because a simple bind sends the password in the clear. TLS (both `ldaps://` and StartTLS) runs on the same rustls stack as the rest of the proxy.
+- **Directory unreachable fails closed.** A dial failure, TLS failure, or timeout refuses the request with a `503`; wrong credentials get a `401`. An LDAP outage therefore reads as an outage, and requests are never admitted unchecked.
+- **Empty passwords are refused locally.** RFC 4513 defines a name-plus-empty-password simple bind as an *unauthenticated* bind, which many directories answer with success; the proxy refuses it without consulting the directory.
+
+Like `forward_auth`, and unlike the static-credential providers, this adds one network round-trip to the directory per request. Bind results are not cached: a cached bind would keep accepting a password the directory has already revoked or rotated. Budget `timeout_secs` for the directory's real latency.
+
+See [examples/auth-ldap/](../examples/auth-ldap/) for a runnable setup, including a local OpenLDAP fixture.
 
 ### bot_auth
 
@@ -2734,7 +2877,7 @@ authentication:
     team: platform
 ```
 
-The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
+The access log records the matched principal's source under the `principal_kind` column (`bearer`, `api_key`, `basic_auth`, `jwt`, `oidc`, `virtual_key`, `bot_auth`, `cap`, `forward_auth`, `ldap_auth`, `plugin`, or `none` when no provider is configured). See [access-log.md](access-log.md) for the full column reference.
 
 ---
 

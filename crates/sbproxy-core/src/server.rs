@@ -2489,6 +2489,21 @@ impl AuthTrustOutcome {
     fn is_suspicious(self) -> bool {
         matches!(self, Self::InvalidProof)
     }
+
+    /// Severity order for aggregating an OR composition's slots
+    /// (WOR-2517): an offered-and-rejected credential outranks a
+    /// backend failure, which outranks a neutral challenge, which
+    /// outranks nothing offered at all. `Allowed` never aggregates
+    /// because a success short-circuits the loop.
+    fn severity(self) -> u8 {
+        match self {
+            Self::Allowed => 0,
+            Self::Missing => 1,
+            Self::Challenge => 2,
+            Self::BackendFailure => 3,
+            Self::InvalidProof => 4,
+        }
+    }
 }
 
 fn plugin_denial_trust_outcome(
@@ -2980,6 +2995,105 @@ async fn check_auth_with_tls_outcome(
                 )
             }
         }
+        Auth::Hmac(h) => {
+            use sbproxy_modules::auth::HmacVerdict;
+            // Synthesize the request shape the RFC 9421 verifier reads
+            // method / target-uri / headers from, mirroring bot_auth.
+            // The body is empty because auth runs before the body is
+            // buffered; the provider verifies with the safe-by-default
+            // form, so a signature covering `content-digest` on a
+            // body-bearing request fails closed rather than passing
+            // unverified (body-digest binding is the WOR-2518
+            // follow-up).
+            let target_uri = match query {
+                Some(q) if !q.is_empty() => format!("{}?{}", path, q),
+                _ => path.to_string(),
+            };
+            let builder = http::Request::builder().method(method);
+            let mut req = match builder.uri(target_uri.as_str()).body(bytes::Bytes::new()) {
+                Ok(r) => r,
+                Err(_) => {
+                    return (
+                        AuthResult::Deny(500, "hmac_auth: bad request".to_string()),
+                        None,
+                        AuthTrustOutcome::BackendFailure,
+                    );
+                }
+            };
+            *req.headers_mut() = headers.clone();
+            // The challenge names the scheme and nothing else: no key
+            // id, no reason, and never any part of the credential.
+            let challenge_headers =
+                || vec![("WWW-Authenticate".to_string(), "Signature".to_string())];
+            match h.verify(&req) {
+                HmacVerdict::Verified { key_id } => {
+                    match h.principal_for(&key_id, tenant_id.clone()) {
+                        Some(principal) => {
+                            let sub = principal.sub.clone();
+                            (
+                                AuthResult::Allow {
+                                    sub: Some(sub),
+                                    source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                                },
+                                Some(principal),
+                                AuthTrustOutcome::Allowed,
+                            )
+                        }
+                        // Unreachable (a verified key_id is in the map),
+                        // but if the invariant ever breaks, fail closed.
+                        None => (
+                            AuthResult::DenyWithHeaders(
+                                401,
+                                "hmac_auth: verification failed".to_string(),
+                                challenge_headers(),
+                            ),
+                            None,
+                            AuthTrustOutcome::InvalidProof,
+                        ),
+                    }
+                }
+                HmacVerdict::Missing => (
+                    AuthResult::DenyWithHeaders(
+                        401,
+                        "hmac_auth: signature required".to_string(),
+                        challenge_headers(),
+                    ),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                HmacVerdict::UnknownKey { key_id } => {
+                    // The key id is an identifier the client itself
+                    // sent, safe to log; the client-facing message
+                    // stays generic so probes cannot enumerate the
+                    // configured key set.
+                    tracing::warn!(key_id = %key_id, "hmac_auth: unknown key id");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+                HmacVerdict::Failed { key_id, reason } => {
+                    // Log the failure, never the credential: `reason`
+                    // comes from the verifier's log-safe set and the
+                    // client sees only the generic message.
+                    tracing::warn!(key_id = %key_id, reason = %reason, "hmac_auth: verification failed");
+                    (
+                        AuthResult::DenyWithHeaders(
+                            401,
+                            "hmac_auth: verification failed".to_string(),
+                            challenge_headers(),
+                        ),
+                        None,
+                        AuthTrustOutcome::InvalidProof,
+                    )
+                }
+            }
+        }
         // ForwardAuth runs as a separate async subrequest in the
         // calling site; the result, including any trust headers
         // carrying the resolved user, lands on `ctx` after this
@@ -2991,6 +3105,50 @@ async fn check_auth_with_tls_outcome(
             Some(sbproxy_plugin::Principal::anonymous_for(tenant_id.clone())),
             AuthTrustOutcome::Allowed,
         ),
+        // WOR-2519: LDAP directory bind. Like forward_auth, this is an
+        // outbound dial on the inbound path, but the provider needs only
+        // the request headers, so it dispatches through this function
+        // like every non-forward-auth type. An unreachable directory
+        // fails closed with a 503 (mirroring forward_auth's
+        // "auth service unavailable") and stays trust-neutral: a backend
+        // failure is not evidence about the caller.
+        Auth::Ldap(a) => {
+            use sbproxy_modules::auth::ldap::LdapBindOutcome;
+            match a.authenticate(headers).await {
+                LdapBindOutcome::Allowed { username } => {
+                    let principal = sbproxy_plugin::Principal {
+                        tenant_id: tenant_id.clone(),
+                        sub: username.clone(),
+                        source: sbproxy_plugin::PrincipalSource::Ldap,
+                        virtual_key: None,
+                        attrs: sbproxy_plugin::PrincipalAttrs::default(),
+                    };
+                    (
+                        AuthResult::Allow {
+                            sub: Some(username),
+                            source: Some(sbproxy_plugin::AuthSubjectSource::Header),
+                        },
+                        Some(principal),
+                        AuthTrustOutcome::Allowed,
+                    )
+                }
+                LdapBindOutcome::NoCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::Missing,
+                ),
+                LdapBindOutcome::InvalidCredentials => (
+                    AuthResult::Deny(401, "unauthorized".to_string()),
+                    None,
+                    AuthTrustOutcome::InvalidProof,
+                ),
+                LdapBindOutcome::DirectoryUnavailable => (
+                    AuthResult::Deny(503, "auth directory unavailable".to_string()),
+                    None,
+                    AuthTrustOutcome::BackendFailure,
+                ),
+            }
+        }
         Auth::BotAuth(b) => {
             use sbproxy_modules::auth::BotAuthVerdict;
             // Synthesize a minimal http::Request the verifier can read
@@ -3226,6 +3384,24 @@ async fn check_auth_with_tls_outcome(
             };
             (result, principal, trust_outcome)
         }
+        Auth::AnyOf(providers) => {
+            // WOR-2517: OR composition. The winner's label is dropped
+            // here because this signature predates composition; the
+            // request phase calls `check_auth_decided` instead and
+            // keeps it for attribution.
+            let (result, principal, outcome, _provider) = check_any_of_auth(
+                providers,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await;
+            (result, principal, outcome)
+        }
         Auth::Plugin(provider) => {
             // Build a synthetic http::Request the provider can read
             // method / target-uri / headers from. We deliberately pass
@@ -3331,6 +3507,194 @@ async fn check_auth_with_tls_outcome(
             }
         }
     }
+}
+
+/// WOR-2517: the auth entry point the request phase calls. Same
+/// contract as [`check_auth_with_tls_outcome`] plus a fourth element:
+/// the auth type that decided the request. For a single provider that
+/// is its own type; for an [`Auth::AnyOf`] composition a success names
+/// the winning slot's provider (so audit and decision records
+/// attribute the request to the credential that actually
+/// authenticated it), and exhaustion names the composite `any_of`.
+#[allow(clippy::too_many_arguments)]
+async fn check_auth_decided(
+    auth: &Auth,
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+    String,
+) {
+    match auth {
+        Auth::AnyOf(providers) => {
+            check_any_of_auth(
+                providers,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await
+        }
+        single => {
+            let (result, principal, outcome) = check_auth_with_tls_outcome(
+                single,
+                headers,
+                query,
+                method,
+                path,
+                tenant_id,
+                tls_cert_thumbprint,
+                resolved_agent_id,
+            )
+            .await;
+            (result, principal, outcome, single.auth_type().to_string())
+        }
+    }
+}
+
+/// WOR-2517: evaluate an [`Auth::AnyOf`] composition.
+///
+/// Providers run in declared order through the same
+/// [`check_auth_with_tls_outcome`] a scalar config uses, so each slot
+/// behaves exactly as it would standing alone. The first `Allow` (or
+/// CAP `RateLimited`, which is a recognized credential over its
+/// budget) wins: its result, principal, and trust outcome return
+/// unchanged, and no later provider runs. A slot that fails, however
+/// it fails, loses only its own slot; evaluation continues.
+///
+/// Exhaustion follows the rule the WOR-2517 ticket argued from RFC
+/// 7235: the first provider's status and message win (the first slot
+/// is the origin's primary scheme by declaration), and every slot's
+/// `WWW-Authenticate` challenge is merged onto the response in
+/// declared order so a client learns every scheme the origin accepts.
+/// The aggregate trust outcome is the most severe slot's, so one
+/// offered-and-rejected credential marks the request suspicious even
+/// when the other slots merely saw nothing.
+#[allow(clippy::too_many_arguments)]
+async fn check_any_of_auth(
+    providers: &[Auth],
+    headers: &http::HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    path: &str,
+    tenant_id: sbproxy_plugin::TenantId,
+    tls_cert_thumbprint: Option<&str>,
+    resolved_agent_id: Option<&str>,
+) -> (
+    AuthResult,
+    Option<sbproxy_plugin::Principal>,
+    AuthTrustOutcome,
+    String,
+) {
+    // First provider's denial, kept whole: status, message, and its
+    // own headers (a digest challenge is folded into header form so it
+    // can merge with the other slots' challenges).
+    struct FirstDenial {
+        status: u16,
+        message: String,
+        headers: Vec<(String, String)>,
+    }
+    let mut first_denial: Option<FirstDenial> = None;
+    // Later slots' `WWW-Authenticate` values, in declared order.
+    let mut merged_challenges: Vec<(String, String)> = Vec::new();
+    let mut aggregate = AuthTrustOutcome::Missing;
+
+    for provider in providers {
+        // Boxed: async recursion (the composition evaluating its
+        // members through the same entry point) needs a pinned future.
+        let (result, principal, outcome) = Box::pin(check_auth_with_tls_outcome(
+            provider,
+            headers,
+            query,
+            method,
+            path,
+            tenant_id.clone(),
+            tls_cert_thumbprint,
+            resolved_agent_id,
+        ))
+        .await;
+
+        let denial_headers: Vec<(String, String)> = match &result {
+            // First success wins: bind the winning provider's
+            // principal and name it for attribution. RateLimited is a
+            // recognized credential (CAP over budget), so it decides
+            // the request the same way an Allow does.
+            AuthResult::Allow { .. } | AuthResult::RateLimited(_) => {
+                return (result, principal, outcome, provider.auth_type().to_string());
+            }
+            AuthResult::Deny(..) => Vec::new(),
+            AuthResult::DenyWithHeaders(_, _, headers) => headers.clone(),
+            AuthResult::DigestChallenge(challenge) => {
+                vec![("WWW-Authenticate".to_string(), challenge.clone())]
+            }
+        };
+
+        if outcome.severity() > aggregate.severity() {
+            aggregate = outcome;
+        }
+        if first_denial.is_none() {
+            let (status, message) = match &result {
+                AuthResult::Deny(status, message)
+                | AuthResult::DenyWithHeaders(status, message, _) => (*status, message.clone()),
+                AuthResult::DigestChallenge(_) => (401, "unauthorized".to_string()),
+                // Unreachable: Allow / RateLimited returned above.
+                AuthResult::Allow { .. } | AuthResult::RateLimited(_) => {
+                    (401, "unauthorized".to_string())
+                }
+            };
+            first_denial = Some(FirstDenial {
+                status,
+                message,
+                headers: denial_headers,
+            });
+        } else {
+            merged_challenges.extend(
+                denial_headers
+                    .into_iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate")),
+            );
+        }
+    }
+
+    // Construction guarantees at least two providers, so the loop ran
+    // and `first_denial` is set; the fallback denial only guards a
+    // hypothetical empty composition, and it fails closed.
+    let FirstDenial {
+        status,
+        message,
+        headers: mut response_headers,
+    } = first_denial.unwrap_or_else(|| FirstDenial {
+        status: 401,
+        message: "unauthorized".to_string(),
+        headers: Vec::new(),
+    });
+    for (name, value) in merged_challenges {
+        let duplicate = response_headers
+            .iter()
+            .any(|(existing_name, existing_value)| {
+                existing_name.eq_ignore_ascii_case(&name) && existing_value == &value
+            });
+        if !duplicate {
+            response_headers.push((name, value));
+        }
+    }
+    let result = if response_headers.is_empty() {
+        AuthResult::Deny(status, message)
+    } else {
+        AuthResult::DenyWithHeaders(status, message, response_headers)
+    };
+    (result, None, aggregate, "any_of".to_string())
 }
 
 /// Lazily-initialized HTTP client for forward-auth subrequests. A
