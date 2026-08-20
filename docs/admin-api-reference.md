@@ -1,11 +1,11 @@
 # Admin API reference
 
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 The embedded admin server publishes the full control-plane HTTP surface for
 operator tooling: liveness probes, session login, key and credential
 lifecycle, the running extension inventory, the request log and its live stream, recent sessions, alert
-operations, per-target health, spend and audit, config read/write and hot reload/drift, the local config-revision
+operations, per-target health, spend and audit, attested-metering summary/receipts/verify, config read/write and hot reload/drift, the local config-revision
 history ring, model-host catalog and deployment lifecycle, the
 response/semantic/key-policy caches, cluster status and the replicated-state
 substrate, prompts, the chat playground, and the emitted OpenAPI document.
@@ -25,7 +25,7 @@ built-in dashboard over this same API, see [admin-ui.md](admin-ui.md).
 - [Probe routes](#probe-routes-unauthenticated) (unauthenticated)
 - [Session routes](#session-routes) - login, logout, whoami
 - [API keys and credentials](#api-keys-and-credentials) - full virtual-key and upstream-credential lifecycle
-- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
+- [Read routes](#read-routes-authenticated) - request log + stream, extension inventory, alerts, health, spend, attested-metering, audit, egress inventory, rate-limit budget, UI settings, OpenAPI
 - [AI compression session state](#ai-compression-session-state)
 - [Config and control routes](#config-and-control-routes-authenticated) - reload, drift, config read/write, config history, log level, the owasp_api_top10 pack manifest
 - [Model host admin](#model-host-admin) - catalog, deployments, lifecycle, artifact cache
@@ -366,7 +366,7 @@ Mints a fresh secret, keeps the prior hash valid for `grace_secs`
 (both authenticate during the window), and returns:
 
 ```json
-{"token": "sk-key_9f2c...-<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
+{"token": "sbp_key_9f2c..._<new secret>", "grace_expires_at": "2026-07-01T01:00:00Z", "key": {"...": "..."}}
 ```
 
 ### `GET /admin/keys/{id}/usage`
@@ -622,8 +622,7 @@ diagnose why a load balancer is short on candidates.
           "circuit_breaker_state": "closed",
           "weight": 10,
           "backup": false,
-          "group": null,
-          "zone": "us-west-1a"
+          "group": null
         }
       ]
     }
@@ -645,7 +644,11 @@ diagnose why a load balancer is short on candidates.
 | `origins[].targets[].weight` | int | Authored weight. |
 | `origins[].targets[].backup` | bool | True when this is a backup target. |
 | `origins[].targets[].group` | string \| null | Authored group tag, if any. |
-| `origins[].targets[].zone` | string \| null | Authored zone tag, if any. |
+
+A `zone` field used to appear here, echoing the load balancer's
+`targets[].zone` label. That config key is refused at config compile
+now (target selection was never locality aware), so the response no
+longer carries it.
 
 Origins whose action is not `load_balancer` (e.g. `proxy`,
 `ai_proxy`, `static`, `redirect`) are omitted from `origins`.
@@ -818,6 +821,31 @@ the origin's bounded `properties.rollup_keys` list.
 
 An invalid `window` value is `400`; a valid windowed request when no
 rollup store is configured is `503` naming the config knob.
+
+### `GET /api/meter/summary`, `GET /api/meter/receipts`, `POST /api/meter/verify`
+
+The attested-metering operator surface (WOR-2131): units by tenant against
+the hash-chained receipt ledger `proxy.attestation` writes, a cursor-paged
+read of the chain itself, and a chain-integrity check. All three sit behind
+the same operator gate as the rest of this page and are read-only except
+`verify`, which reads the chain and never writes to it.
+
+`summary` and `receipts` always answer with a `state` of `off` (no
+`proxy.attestation`, or `role: off`), `idle` (configured, chain empty), or
+`reporting`, so an empty deployment and a stalled meter never look like the
+same zero. `summary`'s totals carry a `coverage` block naming which cluster
+nodes the figure includes, `null` when no mesh is configured. `verify`
+returns an `outcome` of `ok` or `broken`, and on `broken` the sequence
+number and reason the chain first fails to verify at.
+
+An operator scoped to a `tenant` under `admin.operators[]` is narrowed to
+that tenant on all three routes: an absent `tenant=` resolves to their own,
+and one naming another tenant is `403` rather than an empty result. Chain
+identity, coverage, and the verify verdict carry no tenant and are visible
+to every operator regardless of scope.
+
+Full field reference, the buyer-side verification recipe, and the
+tamper-response walkthrough live in [metering.md](metering.md#the-operator-surface).
 
 ### `GET /api/alerts`
 
@@ -2424,14 +2452,21 @@ so they require the `admin` role.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/admin/api/playground/endpoints` | List every AI origin the live pipeline serves, with each provider's declared models and default model. Read-only, sourced from the compiled pipeline, so a config reload updates it without a restart. |
-| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint by calling the AI client directly. Returns the upstream response plus token usage, cost, and latency. Bypasses the data-plane pipeline (see below). |
-| POST | `/admin/api/playground/dispatch` | Run a chat completion as a chosen virtual key by minting a single-use `sbpgtkt_` ticket and making a real loopback call to the data-plane listener, so the full request pipeline applies: the key's policy, governance, routing, guardrails, and transforms. |
+| POST | `/admin/api/playground/chat` | Run a chat completion against a chosen endpoint by calling the AI client directly. Returns the upstream response plus token usage, cost, and latency. Bypasses the data-plane pipeline, so it requires an explicit `bypass_governance: true` in the body and audits every completion (see below). |
+| POST | `/admin/api/playground/dispatch` | Run a chat completion as a chosen virtual key by minting a single-use `sbpgtkt_` ticket and making a real loopback call to the data-plane listener, so the full request pipeline applies: the key's policy, governance, routing, guardrails, and transforms. This is the route the dashboard's Playground page uses. |
 
 The two POST routes differ in what they exercise. `/chat` calls the AI
 client directly and does not traverse the data-plane pipeline:
 per-origin policies, guardrails, transforms, and the
 `x-sbproxy-debug-*` header stamping do not apply. Use it to check that
-an upstream and model answer at all.
+an upstream and model answer at all. Because that is a governance
+bypass, the route fails closed: a body without `"bypass_governance":
+true` returns `400` with an error naming `/dispatch`, so an operator
+debugging a blocked key cannot complete against a gated origin by
+accident. Every completion `/chat` does run emits an admin audit event
+(action `playground_chat_bypass`, visible on `/api/audit/events` and in
+the durable admin chain when one is installed) naming the operator,
+origin, model, and upstream status. The prompt is never logged.
 
 `/dispatch` is the governed path: it impersonates a virtual key through
 a single-use ticket and loops back through the data-plane listener, so

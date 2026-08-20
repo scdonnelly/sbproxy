@@ -1,9 +1,33 @@
 # Routing and traffic management
-*Last modified: 2026-08-18*
+*Last modified: 2026-08-19*
 
 How SBproxy decides which upstream serves a request: hostname matching, forward rules, load balancing, protocol-specific actions, failover, and the extension point for custom selection logic. This page is the hub; [configuration.md](configuration.md) is the field-by-field source of truth for every block below.
 
 ![The same hostname routed to different backends by request body content](assets/body-routing.gif)
+
+The sections below cover each stage in depth. The shape they compose into:
+
+```mermaid
+flowchart TD
+    A[Inbound request] --> B{Host header matches an origin?}
+    B -->|no match| Z["No origin: connection refused"]
+    B -->|yes| C{"forward_rules configured\n(first match wins)"}
+    C -->|rule matches| D[Route to the matched child origin]
+    C -->|no match, or none configured| E[Use the origin's own action]
+    D --> F
+    E --> F[["Origin action"]]
+    F -->|load_balancer| G["Health / circuit-breaker / outlier\nfilter, then RoutingStrategy or algorithm"]
+    F -->|ai_proxy| H["Model-based provider narrowing,\nthen an AI routing strategy"]
+    F -->|websocket, grpc, graphql| I[Protocol-specific handling]
+    F -->|proxy, static, redirect, ...| J[Direct dispatch]
+    G --> K{"Response matches fallback_origin's\non_error / on_status trigger?"}
+    H --> K
+    I --> K
+    J --> K
+    K -->|yes| L["Run fallback_origin's action only\n(auth/policies/transforms are skipped)"]
+    K -->|no| M[Return the response]
+    L --> M
+```
 
 ## How a request finds an origin
 
@@ -53,7 +77,7 @@ Runnable: [`examples/forward-rules/`](../examples/forward-rules/), [`examples/bo
 | `ip_hash` / `uri_hash` / `header_hash` / `cookie_hash` | Sticky by client IP, path, a named header, or a named cookie. |
 | `ring_hash` | Ketama-style consistent hashing; removing one of N targets remaps roughly 1/N of keys instead of reshuffling most of them. |
 
-The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead.
+The `sticky:` block from older configs was removed (it never issued an affinity cookie); use `ring_hash` keyed on a cookie your application already sets instead. Zone-aware routing is not implemented: `targets[].zone` never influenced selection and is refused at config compile rather than accepted as an inert label.
 
 **Health, failure, and resilience signals** apply per target and compose:
 
@@ -79,7 +103,7 @@ Registering a new strategy is a Rust `inventory::submit!` call in an out-of-tree
 
 Beyond plain HTTP `proxy`, dedicated actions route other transports through the same origin/policy/transform pipeline:
 
-- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. The `subprotocols` and `max_message_size` fields are accepted by config but not currently enforced; see [websocket.md](websocket.md) for what actually runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
+- **WebSocket** (`type: websocket`): proxies `ws://`/`wss://`. `max_message_size` closes the tunnel on an oversized message in either direction, and `subprotocols` allowlists `Sec-WebSocket-Protocol` negotiation; see [websocket.md](websocket.md) for what runs before and after the upgrade. Runnable at [`examples/websocket-proxy/`](../examples/websocket-proxy/).
 - **gRPC** (`type: grpc`): proxies `grpc://`/`grpcs://`, with `grpc_web: true` letting browser gRPC-Web clients reach a native gRPC upstream, and optional REST-to-gRPC `transcode` bindings from an OpenAPI-style HTTP route to a unary gRPC call. Runnable at [`examples/grpc-h2c/`](../examples/grpc-h2c/).
 - **GraphQL** (`type: graphql`): transparent by default; setting `max_depth`, `allow_introspection: false`, or `validate_queries: true` turns on fail-closed parsing (syntax only, not schema-aware) ahead of the upstream, including a 64 KiB validated-body limit and whole-batch rejection. Runnable at [`examples/graphql-gateway/`](../examples/graphql-gateway/).
 

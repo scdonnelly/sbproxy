@@ -1,6 +1,6 @@
 # Admin UI
 
-*Last modified: 2026-08-16*
+*Last modified: 2026-08-19*
 
 The built-in admin UI is a Vue 3 + Vite single-page app that drives the
 same [admin API](admin-api-reference.md) any curl script can call. It
@@ -276,6 +276,26 @@ before.
   with no remote layers the Configuration source panel still renders,
   reading "This node owns its configuration," because the affirmative
   answer is what tells an operator the editor is trustworthy.
+
+### Config history
+
+A read-only timeline of every revision this node has applied, present when
+[`proxy.config_history.enabled`](configuration.md#config_history) is
+turned on. It is off by default, and the panel says so with an empty-state
+message naming the config key rather than rendering an error.
+
+- **Shows:** `GET /admin/config/history` as a table (revision, state --
+  `applied`, `good`, `failed`, or `reverted` -- blast radius, provenance,
+  when it applied, and the actor), with the ring's `lineage` id and the
+  `lkg_revision` pointer in the section header. Clicking a row fetches
+  `GET /admin/config/history/{digest}` and expands a detail row showing
+  the `plan_text` diff between that revision and the config running now.
+- **No mutations.** There is no button here to promote a revision to
+  last-known-good or to roll one back; `mark_good` is storage with no
+  caller yet, so the panel is a diagnostic and audit trail, not a rollback
+  control. See [configuration.md](configuration.md#config_history) and
+  [admin-api-reference.md](admin-api-reference.md#get-adminconfighistory)
+  for what the ring records today and what it does not do yet.
 
 ## Extensions (`/extensions`)
 
@@ -568,14 +588,21 @@ with, and see the response, token usage, cost, and latency.
 
 - **Shows:** `GET /admin/api/playground/endpoints` (every AI origin
   the live pipeline serves, with each provider's declared models).
-- **Mutations:** `POST /admin/api/playground/chat`, which requires the
-  `admin` role (a `read_only` operator gets `403` here even though the
-  endpoint list is read-only). Calls the same AI client the data plane
-  uses, so usage, cost, and latency are real, but it does **not**
-  traverse the data-plane pipeline: per-origin guardrails, transforms,
-  and routing policy do not apply here. A debug toggle adds a
-  `request_id` and the config revision to the response for
-  server-log correlation.
+- **Mutations:** `POST /admin/api/playground/dispatch`, which requires
+  the `admin` role (a `read_only` operator gets `403` here even though
+  the endpoint list is read-only). The page has you pick an active
+  virtual key, and the request then runs through the real data-plane
+  pipeline as that key: key policy, governance, routing, and
+  guardrails all apply exactly as they would for the key's own
+  traffic. Plain-HTTP AI origins only; an origin with `force_ssl`
+  answers `501`. A debug toggle adds a `request_id` and the config
+  revision to the response for server-log correlation.
+- **Not used by the UI:** `POST /admin/api/playground/chat`, the
+  direct engine call that skips the pipeline entirely. It refuses to
+  run unless the body carries `bypass_governance: true`, and every
+  completion it does run is audited. See
+  [admin-api-reference.md](admin-api-reference.md#chat-playground)
+  before scripting against it.
 - **Empty/error notes:** no AI origins configured is an empty state
   ("nothing to talk to yet"); an upstream failure surfaces the
   provider's error, not a generic one.
@@ -762,27 +789,32 @@ For a runnable example that lights this page up, see
 
 The Cluster page (and the node count in the top bar) come alive with
 a real mesh. `examples/model-cluster-symmetric/` runs the same config
-file once per node with per-node environment, so three terminals give
-you a three-node local cluster:
+file once per node with per-node environment. The example's own
+README walks through two nodes; a third follows the identical
+pattern (its own id, ports, state dir, and a seed pointing at an
+existing node), which is what the roster below shows:
 
 ```bash
 # Terminal 1 (node a, also the seed)
+SB_ADMIN_PASSWORD=local-admin \
 SB_NODE_ID=node-a SB_HTTP_PORT=8081 SB_ADMIN_PORT=9091 \
 SB_GOSSIP_PORT=17946 SB_TRANSPORT_PORT=18946 SB_MODEL_PORT=19443 \
-SB_STATE_DIR=./state/node-a SB_SEED=127.0.0.1:17946 \
-sbproxy examples/model-cluster-symmetric/sb.yml
+SB_STATE_DIR=./state/node-a SB_SEED=127.0.0.1:17947 \
+sbproxy -f examples/model-cluster-symmetric/sb.yml
 
 # Terminal 2 (node b)
+SB_ADMIN_PASSWORD=local-admin \
 SB_NODE_ID=node-b SB_HTTP_PORT=8082 SB_ADMIN_PORT=9092 \
 SB_GOSSIP_PORT=17947 SB_TRANSPORT_PORT=18947 SB_MODEL_PORT=19444 \
 SB_STATE_DIR=./state/node-b SB_SEED=127.0.0.1:17946 \
-sbproxy examples/model-cluster-symmetric/sb.yml
+sbproxy -f examples/model-cluster-symmetric/sb.yml
 
 # Terminal 3 (node c)
+SB_ADMIN_PASSWORD=local-admin \
 SB_NODE_ID=node-c SB_HTTP_PORT=8083 SB_ADMIN_PORT=9093 \
 SB_GOSSIP_PORT=17948 SB_TRANSPORT_PORT=18948 SB_MODEL_PORT=19445 \
 SB_STATE_DIR=./state/node-c SB_SEED=127.0.0.1:17946 \
-sbproxy examples/model-cluster-symmetric/sb.yml
+sbproxy -f examples/model-cluster-symmetric/sb.yml
 ```
 
 Open any node's admin UI (they each run their own admin server; node
