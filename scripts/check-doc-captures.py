@@ -277,6 +277,20 @@ MANIFEST: dict[str, dict] = {
 #     three copy-paste blocks: a build recipe, a URL template, and a
 #     three-terminal mesh launch. None of the three shows output.
 
+#
+# The two whole-page exemptions above are machine-checked below, so a
+# marker landing on one of them is refused rather than quietly ignored.
+# The block-level notes stay prose: they name blocks, not pages.
+EXEMPT_DOCS: dict[str, str] = {
+    "docs/admin-ui.md": (
+        "nothing on the page is command output: prose, screenshots, and "
+        "copy-paste blocks, plus one response keyed by a run-time request id"
+    ),
+    "examples/health-and-budget-gauges/README.md": (
+        "timing-dependent: the walkthrough scrapes inside the window before a "
+        "probe's third consecutive failure, which no replay can hold open"
+    ),
+}
 
 
 @dataclass
@@ -857,6 +871,35 @@ STACK_PORTS: dict[str, tuple[int, ...]] = {
 }
 
 
+def check_exemptions() -> list[str]:
+    """Hold the exemption list to the same standard as the manifest.
+
+    An exemption is a claim about a document, and a claim nothing checks
+    rots the same way a number in a doc does. Two ways it can go wrong,
+    both silent otherwise: the document is renamed or deleted and the
+    note now describes nothing, or somebody adds a marker to an exempt
+    page, at which point the file says two contradictory things and the
+    reader has to guess which is current.
+    """
+    errors: list[str] = []
+    for rel, reason in sorted(EXEMPT_DOCS.items()):
+        path = ROOT / rel
+        if not path.exists():
+            errors.append(f"{rel} is exempt but does not exist; drop the entry")
+            continue
+        if not reason.strip():
+            errors.append(f"{rel} is exempt with no reason given")
+        if _has_marker(path):
+            errors.append(
+                f"{rel} is exempt but carries a CAPTURE marker; "
+                "put it in MANIFEST or drop the marker"
+            )
+    for rel in MANIFEST:
+        if rel in EXEMPT_DOCS:
+            errors.append(f"{rel} is in both MANIFEST and EXEMPT_DOCS")
+    return errors
+
+
 def section_for(capture: Capture, doc_config: dict) -> dict:
     """The manifest section governing one capture.
 
@@ -1063,6 +1106,10 @@ def main() -> int:
             )
         return 2
 
+    exempt_errors = check_exemptions()
+    for error in exempt_errors:
+        print(f"capture exemption: {error}", file=sys.stderr)
+
     if args.list:
         total = 0
         for path in docs:
@@ -1071,7 +1118,9 @@ def main() -> int:
                 rel = display_path(path)
                 print(f"{rel}:{capture.line}: {capture.command}")
         print(f"\n{total} capture(s) in {len(docs)} document(s)")
-        return 0
+        for rel, reason in sorted(EXEMPT_DOCS.items()):
+            print(f"exempt: {rel}: {reason}")
+        return 1 if exempt_errors else 0
 
     raw_binary = args.binary or os.environ.get("SBPROXY_CAPTURE_BIN")
     binary: Path | None
@@ -1139,8 +1188,8 @@ def main() -> int:
         )
 
     if args.update:
-        return 0
-    return 1 if failures else 0
+        return 1 if exempt_errors else 0
+    return 1 if (failures or exempt_errors) else 0
 
 
 if __name__ == "__main__":
