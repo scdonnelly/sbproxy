@@ -4189,6 +4189,114 @@ pub fn record_audit_emit_duration(channel: &str, outcome: &str, duration_secs: f
     );
 }
 
+/// Count one completed admin request-log export on
+/// `sbproxy_admin_request_exports_total{format}` and the rows it wrote
+/// on `sbproxy_admin_request_export_rows_total{format}` (WOR-2578).
+///
+/// `format` is the closed enum `csv|jsonl`, selected from a static
+/// match in the admin route; no caller string becomes a label.
+///
+/// Why an export needs a counter from day one: `GET
+/// /api/requests/export` is the one admin route that hands back the
+/// operational log in bulk, which makes it the exfiltration shape of
+/// the admin surface. The audit chain records that an export happened;
+/// this pair is what an operator alerts on, because "exports per hour
+/// tripled" and "one export wrote the whole ring" are rate questions
+/// an audit ring cannot answer. Two families rather than one so a
+/// dashboard can read rows-per-export without inventing a histogram
+/// over a low-frequency event.
+/// A registration failure warns once and leaves the family unscraped
+/// rather than ending the admin request: an operator who cannot see the
+/// export counter still gets the export, and still gets the audit
+/// record, which is the load-bearing half.
+pub fn record_admin_request_export(format: &'static str, rows: u64) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static EXPORTS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    static ROWS: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let warn_failed = |name: &'static str, error: &prometheus::Error| {
+        tracing::warn!(
+            metric = name,
+            %error,
+            "admin export counter failed to register; export volume is not scrapeable"
+        );
+    };
+    let exports = EXPORTS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_exports_total",
+            "Admin request-log exports served, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_exports_total", error))
+        .ok()
+    });
+    if let Some(counter) = exports {
+        counter.with_label_values(&[format]).inc();
+    }
+    let row_counter = ROWS.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_admin_request_export_rows_total",
+            "Rows written by admin request-log exports, by format",
+            &["format"],
+        )
+        .inspect_err(|error| warn_failed("sbproxy_admin_request_export_rows_total", error))
+        .ok()
+    });
+    if let Some(counter) = row_counter {
+        counter.with_label_values(&[format]).inc_by(rows);
+    }
+}
+
+/// Count one audit-chain read attempt on
+/// `sbproxy_audit_chain_read_total{channel, outcome}` (WOR-2579).
+///
+/// `channel` is one of `security`, `config`, `key`, `admin`. `outcome` is
+/// `verified` when every link and signature held, `broken` when the walk
+/// stopped at a bad record, `unreadable` when the file could not be
+/// walked at all, and `denied` when the viewer refused the read before
+/// walking anything. A refusal increments all four channels, because it
+/// refuses all four.
+///
+/// The reason this exists rather than leaving the verdict on the page: a
+/// broken chain that only a person looking at the console can see is a
+/// finding nobody is on call for. `broken`, `unreadable` and `denied`
+/// are all alertable from the moment this ships, and
+/// `increase(...{outcome!="verified"}[15m]) > 0` is the rule an operator
+/// wants. Both label values are closed vocabularies from this crate,
+/// never caller input, and both parameters are `&'static str` so that
+/// stays true by construction: a caller-supplied `String` cannot be
+/// passed here at all, which is what keeps this family off the
+/// cardinality limiter honestly rather than by assertion.
+///
+/// What that rule does **not** cover, so nobody sizes their response
+/// wrong: the shortfall comparison behind `broken` counts what *this
+/// process* wrote. A chain file truncated at the tail and then read
+/// after a restart re-baselines on boot, links and signs perfectly, and
+/// reports `verified`. Records written before the last restart are
+/// covered by `sbproxy audit verify` against an offsite copy, not by
+/// this counter.
+pub fn record_audit_chain_read(channel: &'static str, outcome: &'static str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    // `.ok()` rather than `.expect(...)`, the same shape
+    // [`record_key_store_outage`] uses: registration can only fail on a
+    // duplicate name, which the metric-registry guard catches at build
+    // time, and a counter is not worth ending the process over on a path
+    // whose whole job is to report on somebody else's failure.
+    static C: OnceLock<Option<IntCounterVec>> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_audit_chain_read_total",
+            "Audit-chain reads served by the console viewer, by verification outcome",
+            &["channel", "outcome"],
+        )
+        .ok()
+    });
+    if let Some(counter) = counter {
+        counter.with_label_values(&[channel, outcome]).inc();
+    }
+}
+
 // --- script-engine metrics (CEL / Lua / JS / WASM) -----------------------
 //
 // Four counters / histograms cover the script-engine lifecycle so an
