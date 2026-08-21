@@ -37,7 +37,7 @@ all.
 | `request_completed` | The request finished without an error. | Yes |
 | `request_error` | The request terminated with an error. | Yes |
 | `auth_denied` | Authentication rejected the request. | Yes |
-| `policy_denied` | A policy (rate limit, IP filter, WAF, request limit) blocked the request, or an HTTP framing violation was refused. | Yes |
+| `policy_denied` | A policy (rate limit, IP filter, WAF, request limit, AI data-posture routing) blocked the request, or an HTTP framing violation was refused. | Yes |
 | `egress_refused` | An outbound dial (AI provider, MCP OAuth token exchange, model artifact fetch, telemetry sink, ...) was refused by egress authorization. | Yes |
 | `provider_selected` | An AI request failed over to a different provider. | Yes, on the transition only |
 | `budget_exceeded` | An AI spend or quota budget was exhausted and the request was blocked. | Yes, on the deny only |
