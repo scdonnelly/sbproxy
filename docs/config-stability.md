@@ -113,6 +113,52 @@ module field does this today: `origins.*.action.sticky`, the one field that
 did, was removed in favor of the `ring_hash` load-balancer algorithm and is
 now refused at config compile with an error naming the replacement.
 
+#### Unknown keys inside an `authentication` block
+
+**Upgrade-affecting.** A configuration that carried a key the proxy did not
+recognize inside an `authentication:` block used to compile, boot, and serve.
+It now fails to compile, at `serve`, `validate`, and hot reload alike, with an
+error naming the key and the ones the provider accepts:
+
+```
+unknown field `require_dp0p`, expected `tokens` or `require_dpop`
+```
+
+What that changed. `authentication:` is an opaque value on the typed
+envelope, so neither of the two schema-level unknown-key passes reaches
+inside it, and each provider deserialized permissively: serde dropped a key
+it did not know and the setting that key was meant to be took its default.
+Every optional switch on an auth provider defaults to the permissive value,
+so a single mistyped character produced a config that read as though a
+control were on and ran with it off. `require_dp0p: true` on a `bearer` block
+served with DPoP proof-of-possession disabled; `require_mtls_bnd: true` on
+`jwt` served with RFC 8705 certificate binding disabled. The same shape
+applied to `tls_verify` on `ldap_auth`, `require_agent_binding` on `cap`,
+`nonce_policy` on `bot_auth`, and `clock_skew_seconds` on `hmac_auth`.
+
+The refusal rides the existing config-compile error path, so a rejected hot
+reload leaves the last-good configuration serving; only a boot on a rejected
+file stops the proxy.
+
+What to do on upgrade: run `sbproxy validate <path>` before rolling. Any key
+it names is one the proxy was already ignoring, so correcting the spelling
+gives you the control the file claimed, and deleting the line gives you the
+behavior you were actually running. Neither is a silent change.
+
+Two surfaces stay permissive on purpose. `noop` has no configuration to
+check. And the per-credential entries under `api_keys:`, `tokens:`, `users:`,
+and `hmac_auth`'s `keys:` fold free-form attribution metadata (`project`,
+`team`, `tags`, `metadata`) into the same mapping as the secret, so an
+unknown key there cannot be told apart from an intended one.
+
+The same change made `proxy.extensions.agent_detect` refuse unknown keys, and
+made a malformed block that sets `enabled: true` a hard compile error rather
+than a warning that left the scorer off. An absent `agent_detect` block is
+unchanged: detection stays off and nothing is logged. A malformed block that
+does not set `enabled: true` also keeps warning and disabling, since disabled
+is what it asked for. This matches `proxy.extensions.tls_fingerprint`, which
+already behaves this way.
+
 #### Module keys refused at config compile
 
 A module key that names behavior the runtime does not have is refused rather
@@ -278,6 +324,67 @@ is consulted again, and the grace period covers a re-resolution failure
 with the last-known-good value. Both are `stable` in the key registry; see
 [configuration.md](configuration.md#secret-rotation) for the current
 behavior.
+
+---
+
+## Upgrade-affecting behavior changes
+
+A field whose meaning did not change can still change what your proxy does,
+when a code path that was supposed to read it starts reading it. Nothing here
+is a schema change: the same file compiles before and after. What changes is
+which traffic the value you already wrote now refuses.
+
+### `egress.usage_sinks` now gates the `events:` webhook sink
+
+**Who this reaches.** Any config that has both `egress.usage_sinks` set to
+`mode: deny_by_default` and an `events:` block with `sink: webhook`. A config
+with no `egress:` section, or one whose `usage_sinks` is absent or left at the
+default `allow_by_default`, is unaffected: that sink stays `ungated` and
+delivers exactly as before.
+
+**What changes.** `usage_sinks` has always compiled its allowlist under two
+purposes, `usage_sink` and `webhook`, and the events sink has always
+authorized under `webhook`. The `webhook` half was never installed into the
+process registry, so the events sink read an empty slot and dialed with no
+allowlist whatever the block said. It is installed now, so the block applies:
+your collector's host has to be on `egress.usage_sinks.hosts`, on a scheme and
+port that list permits (`ports` defaults to `[80, 443]`, so a collector on
+`:8088` needs an explicit `ports:`), and resolving onto a private address needs
+`allow_private: true`.
+
+**What an operator sees when it bites.** The SIEM feed stops and every surface
+says why: a `warn` on the `events` target carrying the closed reason
+(`unlisted_host`, `disallowed_port`, `private_address`, and the rest of
+[the egress vocabulary](admin-api-reference.md#get-apiegress)), one
+`sbproxy_events_dropped_total{sink="webhook",reason="egress_denied"}` per event
+in each dropped batch, one
+`sbproxy_egress_refused_total{purpose="webhook",reason=...}`, and a `denied`
+row for the collector in `GET /api/egress`. Nothing is dropped silently, and
+no surface carries the URL.
+
+**What to do before upgrading.** Read `GET /api/egress` on the running proxy,
+find the `webhook` row for your collector, and add that host (and its port, if
+it is not 80 or 443) to `egress.usage_sinks.hosts`.
+
+### `egress.token_exchange` now gates the MCP run-as-user token exchange
+
+**Who this reaches.** Any config with `egress.token_exchange` set to
+`mode: deny_by_default` and an MCP server whose `upstream_auth` uses the
+token-exchange mode with `run_as_user_auth`.
+
+**What changes.** That exchange passed no authorizer at all, so it ran ungated
+regardless of this sub-block. It now reads the same slot the non-MCP
+outbound-credential resolver does, and a per-server `egress:` block does not
+substitute for it: a per-server block gates that server's upstream connects and
+OpenAPI tool calls, never its token endpoint.
+
+**What an operator sees when it bites.** The tool call fails with
+`token exchange egress denied`, plus
+`sbproxy_egress_refused_total{purpose="token_exchange",reason=...}` and a
+`denied` row in `GET /api/egress` naming the token endpoint's host.
+
+**What to do before upgrading.** Add every MCP token endpoint host to
+`egress.token_exchange.hosts` alongside the non-MCP ones already there.
 
 ---
 
