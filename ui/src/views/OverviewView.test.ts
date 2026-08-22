@@ -10,7 +10,7 @@ describe("Overview certificate store visibility", () => {
     // never appears.
     expect(overviewView).toContain("api.metrics()");
     expect(overviewView).toContain("certMetrics.run()");
-    expect(overviewView).toContain("onMounted(refresh)");
+    expect(overviewView).toMatch(/onMounted\([\s\S]*?refresh/);
   });
 
   it("derives the state through the shared reader, not a sum", () => {

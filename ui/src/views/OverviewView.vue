@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted } from "vue";
+import { computed, onMounted, ref, onUnmounted } from "vue";
 import { api, asList, type HealthComponent, type ResidentModel } from "../api";
 import { useAsync } from "../composables/useAsync";
 import { formatBytes, formatDuration, formatNumber } from "../lib/format";
@@ -42,7 +42,34 @@ function refresh() {
   clusterVram.run();
   certMetrics.run();
 }
-onMounted(refresh);
+
+const liveRps = ref(0);
+let rpsInterval: ReturnType<typeof setInterval> | null = null;
+let eventCount = 0;
+let source: EventSource | null = null;
+
+onMounted(() => {
+  refresh();
+  
+  // Real-time RPS counter using the existing SSE stream
+  source = new EventSource(api.requestsStreamUrl());
+  source.onmessage = () => {
+    eventCount++;
+  };
+  rpsInterval = setInterval(() => {
+    liveRps.value = eventCount;
+    eventCount = 0;
+  }, 1000);
+});
+
+onUnmounted(() => {
+  if (source) {
+    source.close();
+  }
+  if (rpsInterval) {
+    clearInterval(rpsInterval);
+  }
+});
 
 // Four states, and the reason this reads the family rather than summing it:
 // an absent gauge means no certificate store was opened at all, which is the
@@ -215,6 +242,7 @@ function optionalNumber(v: unknown): number | undefined {
     <ErrorState v-if="stats.error.value" :error="stats.error.value" @retry="stats.run" />
     <EmptyState v-else-if="!statTiles.length" message="No stats reported by /api/stats." />
     <div v-else class="grid">
+      <StatCard label="Live RPS" :value="liveRps" />
       <StatCard v-for="t in statTiles" :key="t.label" :label="t.label" :value="t.value" />
     </div>
   </section>

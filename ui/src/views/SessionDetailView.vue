@@ -18,6 +18,7 @@ import StatCard from "../components/StatCard.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import ErrorState from "../components/ErrorState.vue";
 import EmptyState from "../components/EmptyState.vue";
+import ClickToCopy from "../components/ClickToCopy.vue";
 
 const route = useRoute();
 const req = useAsync(() => api.requests());
@@ -59,6 +60,7 @@ function statusTone(
     subtitle="An oldest-first call chain reconstructed from the requests still present in the in-memory ring."
   >
     <template #actions>
+      <RouterLink class="sb-btn" to="/sessions">Back to Sessions</RouterLink>
       <RouterLink
         class="sb-btn"
         :to="{ path: '/logs', query: { session_id: sessionId } }"
@@ -81,7 +83,9 @@ function statusTone(
   <template v-else-if="session">
     <section class="identity-panel">
       <span class="identity-panel__eyebrow sb-mono">session</span>
-      <strong class="identity-panel__id sb-mono">{{ session.sessionId }}</strong>
+      <strong class="identity-panel__id sb-mono">
+        <ClickToCopy :value="session.sessionId" label="Session ID" />
+      </strong>
       <div class="relations">
         <span v-if="session.parentSessionId">
           Parent:
@@ -175,11 +179,15 @@ function statusTone(
               </div>
               <div v-if="request.request_id">
                 <dt>Request</dt>
-                <dd class="sb-mono">{{ request.request_id }}</dd>
+                <dd class="sb-mono">
+                  <ClickToCopy :value="request.request_id" label="Request ID" />
+                </dd>
               </div>
               <div v-if="request.trace_id">
                 <dt>Trace</dt>
-                <dd class="sb-mono">{{ request.trace_id }}</dd>
+                <dd class="sb-mono">
+                  <ClickToCopy :value="request.trace_id" label="Trace ID" />
+                </dd>
               </div>
               <div v-if="request.provider || request.model">
                 <dt>AI route</dt>
