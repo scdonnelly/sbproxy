@@ -166,6 +166,34 @@
         }
       ]
     },
+    "service_tier": {
+      "description": "Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field at all and the vendor serves on its own default.\n\nThis is the operator's decision, not the caller's. A caller that sets a tier on the request body has it replaced by this value, or removed when this is unset, because raising the tier raises the bill and the operator pays it.\n\nThe tier is a property of this entry, not of a request. To run two tiers of one vendor, declare two `providers[]` entries with the same `provider_type` and different tiers; the router then treats them as two candidates with independent weights, health, and realized latency.\n\nA tier the provider catalog does not record for this vendor is refused at config load rather than dropped at request time, so an entry that can never serve the tier you asked for never boots.",
+      "default": null,
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ServiceTier"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "on_key_failure": {
+      "description": "What happens when this provider rejects the request's own credential with a `401` or `403`.\n\n`fallback` (the default) retries this same provider once with `fallback_credential_id`, if one is configured. `fail_closed` returns the provider's rejection to the caller untouched, which is what you want when the tenant's own key is the authorization boundary and serving them on a house credential would let a revoked tenant keep working.\n\nThis only ever applies to this entry's own `api_key`. A request carrying a caller-owned native credential never falls back to an operator credential: the caller presented their own key and the provider refused it, so spending yours would bill you for their authorization failure.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/KeyFailurePosture"
+        }
+      ]
+    },
+    "fallback_credential_id": {
+      "description": "Id of the operator-held credential to retry with when this entry's own `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here.\n\nThe record is resolved per request through the key plane, so it picks up a rotation without a config reload, and it is refused if it belongs to a different tenant than the request. Unset means there is nothing to fall back to, and `on_key_failure: fallback` then behaves exactly like `fail_closed`.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "serve": {
       "description": "WOR-1652: optional local model-serving block. When set, the gateway itself hosts the models (pull weights, fit an engine to the GPU, supervise it) and registers them as local providers ahead of any cloud fallback, instead of proxying `base_url` to an already-running server. `None` keeps the proxy-only behavior. The lifecycle half (spawn/evict) ships in phases of the model-host epic; this field is the config surface it reads.",
       "anyOf": [
@@ -182,6 +210,17 @@
       "anyOf": [
         {
           "$ref": "#/definitions/AwsSigV4Config"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "bedrock_guardrail": {
+      "description": "Amazon Bedrock guardrail applied inline by the Converse call itself.\n\nSet this to have Bedrock evaluate the prompt and the completion inside the same request that generates them, rather than as a separate `ApplyGuardrail` call. An intervention comes back on a 200 response as `stopReason: guardrail_intervened`; SBproxy turns that into a 403 `guardrail_violation`, records it on the output guardrail decision feed under the name `bedrock_guardrail`, and never admits the response to any cache.\n\nValid only when this provider entry resolves to the Bedrock wire format. Configuring it on any other provider is refused at config load.\n\nThis is a different control from `guardrails.external[]` with `provider: bedrock`, which is an out-of-band `ApplyGuardrail` call against the same AWS guardrail object. Both may be configured; the account is then charged for two evaluations.\n\nThere is no failure posture for this block. The guardrail runs inside the generation call, so a rejected or unauthorized guardrail configuration fails the whole call before any tokens are produced and is handled by the ordinary provider-failure path.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BedrockGuardrailPassthrough"
         },
         {
           "type": "null"
@@ -212,6 +251,33 @@
         }
       },
       "additionalProperties": false
+    },
+    "ServiceTier": {
+      "type": "string",
+      "enum": [
+        "flex",
+        "standard",
+        "priority"
+      ]
+    },
+    "KeyFailurePosture": {
+      "description": "What the gateway does when one provider entry's credential is rejected upstream.\n\nThe rejection this decides is a `401` or `403` from the provider, which is a statement about the credential rather than about the provider's health. A `429`, a `5xx`, or a timeout stays with the provider failover and `cooldown_policy`, because a different key against a rate-limited provider is still rate limited.",
+      "oneOf": [
+        {
+          "description": "Retry this provider once with `fallback_credential_id`. The default, and inert on an entry that names no fallback credential.",
+          "type": "string",
+          "enum": [
+            "fallback"
+          ]
+        },
+        {
+          "description": "Return the provider's rejection to the caller unchanged.",
+          "type": "string",
+          "enum": [
+            "fail_closed"
+          ]
+        }
+      ]
     },
     "ModelHostConfig": {
       "description": "The `serve:` block: the local models plus host-wide policy.",
@@ -1085,6 +1151,30 @@
           ]
         }
       ]
+    },
+    "BedrockGuardrailPassthrough": {
+      "description": "Inline Bedrock Converse guardrail settings.",
+      "type": "object",
+      "required": [
+        "identifier",
+        "version"
+      ],
+      "properties": {
+        "identifier": {
+          "description": "Bedrock guardrail identifier, sent as `guardrailIdentifier`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Bedrock guardrail version, sent as `guardrailVersion`. Use `DRAFT` for the working version.",
+          "type": "string"
+        },
+        "trace": {
+          "description": "Ask Bedrock for the guardrail assessment trace. The trace is used to name the policies that fired in the block reason and is never relayed to the caller. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

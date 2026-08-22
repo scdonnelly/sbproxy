@@ -8337,6 +8337,9 @@ fn emit_mcp_tool_attribution(
         // not a model any lane could have served (WOR-2223).
         logical_model: None,
         served_model: None,
+        finish_reason: None,
+        shadow_of: None,
+        credential_source: None,
     };
     for sink in mcp.usage_sinks() {
         sink.record(&event);

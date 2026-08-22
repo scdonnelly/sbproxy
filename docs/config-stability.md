@@ -841,6 +841,43 @@ carve-out, declare it on the entry with `data_posture: {retains_data: false}`
 and the previous behavior returns. That declaration is the operator saying
 something about their own account that the catalog cannot know.
 
+### A Bedrock `guardrail_intervened` response is now a 403
+
+**Who this reaches.** Any route with a `bedrock`-format provider entry whose
+AWS guardrail can intervene, whether that guardrail is attached through the
+new `providers[].bedrock_guardrail` key or through the model, inference
+profile, or agent configuration in your AWS account. A Bedrock route whose
+guardrails never intervene is unaffected, and no other provider format is
+read for this at all.
+
+**What changes.** Bedrock does not answer a guardrail block with an error
+status. `Converse` returns 200 with `stopReason: guardrail_intervened` and an
+empty completion. SBproxy read neither: `body_refinable_client_status`
+classifies only 400 and 422, and the failure-cause matcher has no `guardrail`
+substring, so the intervention relayed to the caller as a successful, empty
+completion, was admitted to the semantic cache and the idempotency store, and
+produced no decision record and no metric. That response is now a 403
+`guardrail_violation` under the guardrail name `bedrock_guardrail`, with an
+`ai.guardrail.output` deny record and a
+`sbproxy_ai_external_guardrail_verdicts_total{provider="bedrock_inline"}`
+increment. The detection is per response, not per config key, so it applies
+whether or not the route sets `bedrock_guardrail`.
+
+**What an operator sees when it bites.** A call that previously returned 200
+with empty content now returns 403 with `type: guardrail_violation` and a
+reason naming the policy types that fired. Client code that treated the empty
+completion as a valid answer sees an error instead, which is the direction a
+refusal is supposed to fail in. The consumed tokens are still billed by AWS
+and are now recorded as `validation_failed` waste rather than as served
+spend.
+
+**What to do before upgrading.** If you route to Bedrock, check whether any
+guardrail is attached to the models you serve, and confirm your clients
+handle a 403 `guardrail_violation`. There is no key that restores the
+previous relay-as-200 behavior, because that behavior served a refusal as an
+answer.
+
+
 ### A transcoded gRPC error now sets the HTTP status, not just the body
 
 **Who this reaches.** Any origin with `action: {type: grpc, transcode: {...}}`
@@ -1154,6 +1191,41 @@ to gain fields is `credentials`, where AWS keeps adding provider kinds. Every
 field a source does not read is refused rather than ignored, so a rename would
 surface as a config error rather than as a silently unsigned request.
 `api_key` and `aws_sigv4` on one provider entry are refused together.
+
+### `providers[].bedrock_guardrail` - inline Converse guardrail
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `identifier` | string | required | **beta** | Sent as `guardrailIdentifier`. Refused when blank. |
+| `version` | string | required | **beta** | Sent as `guardrailVersion`. `DRAFT` selects the working version. Refused when blank. |
+| `trace` | bool | `false` | **beta** | Sent as `trace: enabled`/`disabled`. Enables the assessment SBproxy reads to name the policies in the block reason; the trace is never relayed to the caller. |
+
+The whole block is **beta** for its first release. Unknown keys inside it are
+refused rather than ignored, and the block itself is refused on any provider
+entry that does not resolve to the Bedrock wire format. There is deliberately
+no failure-posture key: the guardrail runs inside the generation call, so a
+bad reference fails the `Converse` request on the ordinary provider-failure
+path. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call).
+
+### `providers[]` - provider-key failure fallback
+
+| Field | Type | Default | Stability | Notes |
+|---|---|---|---|---|
+| `on_key_failure` | enum | `fallback` | **beta** | `fallback` or `fail_closed`. Decides what a `401`/`403` from this provider does to the request. |
+| `fallback_credential_id` | string | - | **beta** | Names a `key_management.seed.credentials[]` record. Never a secret; resolved per request through the key plane. |
+
+Both are **beta** for their first release. The pair is inert on a config that
+sets neither, and the default's *name* says `fallback` while its *behavior*
+without a credential id is identical to `fail_closed`, which is what makes it
+safe on an existing config. The two are refused together when the posture is
+`fail_closed`, and `fallback_credential_id` is refused on a `serve:`,
+`managed_model`, or `aws_sigv4` entry, because none of those presents a static
+upstream key for it to replace.
+
+The trigger set is the part most likely to move, and it is deliberately the
+narrowest it can be: `401` and `403` only. Widening it would need a precedence
+ruling against the availability failover, which already owns every other
+failure class.
 
 ### Body Modifier (request)
 

@@ -1637,6 +1637,7 @@ origins:
 | `context_window_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a prompt overflows the model's context window. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `content_policy_fallbacks` | list | empty (trigger off) | Provider names to reroute to when a provider refuses on content-policy grounds. Names must match `providers[].name`. See [Typed fallback triggers](ai-llm-aware-resilience.md#typed-fallback-triggers). |
 | `max_price_per_request` | number | unset (gate off) | Hard per-request price ceiling in USD. Each routing candidate on a token-priced chat surface (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`) is priced before selection; candidates over the ceiling are dropped, and a fully excluded set refuses with `402`. Must be positive when set; a value at or below zero is refused at config load. The `x-sbproxy-max-price` request header tightens the ceiling for one request but can never raise it, and sending that header to a surface the estimate does not model returns `400`. See [Per-request price ceiling](ai-gateway.md#per-request-price-ceiling). |
+| `model_groups` | list | `[]` | Named model groups. Each entry binds one public name callers send as `model` to a list of members, each naming a provider on this action, the upstream model id it serves, and its `weight` under `routing: weighted`. A group carries its own `routing:`, independent of the action's, and its members may serve different model ids. The group resolves before every model gate, so `blocked_models`, the credential's allowlist, the per-model rate limits, and the budget scope all judge the member's real model id. Six strategies are refused per group. See [Model groups](ai-gateway.md#model-groups). |
 | `allowed_models` | list | empty (allow all) | Allow-list of model names. |
 | `blocked_models` | list | | Block-list of model names. Takes precedence over allow-list. |
 | `data_posture` | object | unset | Data-handling posture requirement: `require_zdr` (default `false`) and `allow_data_collection` (default `true`). A hard provider-eligibility filter applied before any routing strategy runs, composed with the per-request `x-sbproxy-require-zdr` / `x-sbproxy-disallow-data-collection` headers (most restrictive wins). A request left with no eligible provider fails closed naming the constraint and the excluded providers; a block that excludes every configured provider is refused at config load. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
@@ -1646,14 +1647,17 @@ origins:
 | `model_rate_limits` | map | | Per-model rate limit overrides keyed by model name. |
 | `per_surface_rate_limits` | map | | Per-surface rate limit overrides keyed by AI surface label (`chat_completions`, `assistants`, `image_generation`, ...). |
 | `max_concurrent` | map | | Maximum concurrent in-flight requests per provider. |
-| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`); see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `resilience` | object | | Per-provider circuit breaker, outlier detection, and active health probes. Also hosts the LLM-aware knobs (`retry_policy`, `cooldown_policy`, `llm_aware`, `content_policy_fallback`) and the streaming `pre_header_timeout_ms` budget; see [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md). |
+| `allow_request_timeout_override` | bool | `false` | Honor a caller's `x-sbproxy-timeout-ms` in place of the selected provider's `timeout_ms`. Off means the header is ignored rather than refused. Requires `max_request_timeout_ms`; the flag alone is refused at config load. Scope is the origin, so it applies to every caller and tenant routed here. |
+| `max_request_timeout_ms` | int | unset | Ceiling in milliseconds on a caller's `x-sbproxy-timeout-ms`. A header above it is refused with 400 naming the accepted range, not clamped. Must be above zero. Bounds one attempt, so `max_retries` multiplies it. An honored header replaces the gateway's 30-second HTTP client default too, so a ceiling above 30000 does lengthen an attempt. |
 | `compression` | object | unset | Ordered AI context-compression policy. See [AI context compression](#ai-context-compression) and [ai-context-compression.md](ai-context-compression.md). |
 | `reasoning` | string or object | `off` | Route policy for concise reasoning. Use `concise`, `off`, or `{budget: N}` with `N` greater than zero. |
-| `shadow` | object | | Side-by-side eval: mirror each request to a second provider and log metrics. |
+| `shadow` | object | | Side-by-side eval: mirror each request to one or more shadow targets and log metrics. |
 | `ai_policy` | object | | One sandboxed CEL expression over the AI decision pipeline (`expression`, `on_error`). See [ai-policy-cel.md](ai-policy-cel.md). |
+| `cache_affinity` | object | unset | Prefer the provider that already holds a caller's warm prompt cache. Sits beside `routing:`, not inside it, because it layers over whatever strategy is configured rather than replacing one (except `fallback_chain`, `cascade`, `cost_quality`, and `routing_policy`, which own their ordering and are left alone). Fields: `ttl_secs` (default `300`) and `max_keys_per_provider` (default `1024`); both are refused at zero. Keys on the caller's `prompt_cache_key`, or `user` when that is absent, scoped to the tenant, credential, origin, and API surface. A preference, never a pin: an ineligible holder or a changed resolved model leaves the strategy's pick in place. Process-local and bounded. See [ai-gateway.md](ai-gateway.md#prompt-cache-affinity). |
 | `usage_sinks` | list | `[]` | Destinations for completed-call usage records. The `ledger` sink (`path`, optional `signing_seed_hex`) writes a hash-chained, signable record. See [ai-usage-ledger.md](ai-usage-ledger.md). |
 
-Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky`, `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
+Routing strategies: `round_robin`, `weighted`, `fallback_chain`, `random`, `lowest_latency`, `least_connections`, `cost_optimized`, `least_token_usage`, `prefix_affinity`, `peak_ewma`, `sticky` (accepted, behaves as `round_robin`; see [ai-gateway.md](ai-gateway.md#sticky)), `race`, `headroom`, `reset_aware`, `cascade`, `cost_quality`, `outcome_aware`, `semantic_route`. See [ai-gateway.md](ai-gateway.md#routing-strategies) for each; `outcome_aware` has its own page in [ai-outcome-aware-routing.md](ai-outcome-aware-routing.md). `cascade`, `cost_quality`, and `semantic_route` carry required settings, so each needs the object form; `semantic_route` written as a flat string is refused with an error naming the `routes:` and embedding-source keys it needs, and its exemplars are capped at config load: 64 routes, 64 exemplars per route, and 256 exemplar texts across every route combined, since each one is an embedding call on the request that builds the index. `token_rate` is refused at config load: it scores headroom against a per-provider token limit that no field declares, which makes it `least_token_usage` under another name. See [ai-gateway.md#token_rate-refused](ai-gateway.md#token_rate-refused).
 
 Peak EWMA accepts the object form:
 
@@ -1682,12 +1686,16 @@ Peak EWMA accepts the object form:
 | `priority` | int | unset | Priority used by priority routing (lower runs first). |
 | `enabled` | bool | true | When false, this provider is skipped during routing. |
 | `max_retries` | int | unset | Maximum retries on transient upstream failures. |
-| `timeout_ms` | int | unset | Request timeout in milliseconds. |
+| `timeout_ms` | int | unset | Request timeout in milliseconds, measured from connect through the end of the response body, so it cuts a streaming completion mid-stream if the stream outlives it. To bound only how long a streaming request waits for the provider's response headers, and fail over when it elapses, set the action-level `resilience.pre_header_timeout_ms` instead. |
 | `organization` | string | | Organization identifier for providers that scope keys per org. |
 | `api_version` | string | | API version header value (e.g. for Anthropic and Azure OpenAI). |
 | `no_prompt_training` | bool | `false` | Marks the provider safe for training-sensitive prompts. Requests carrying the `x-sbproxy-disallow-prompt-training: true` header only route to providers with this flag; a request with the header and no marked provider in the chain gets a 400 `no_compliant_provider`. |
+| `service_tier` | string | unset | Upstream service tier this destination requests: `flex`, `standard`, or `priority`. Unset sends no tier field and the vendor serves on its own default. The operator's decision, not the caller's: a caller's `service_tier` is removed from every request and replaced by this value where it is set. To run two tiers of one vendor, declare two entries with the same `provider_type` and different tiers. A tier the provider catalog does not record for this vendor is refused at config load. See [ai-gateway.md](ai-gateway.md#service-tier). |
 | `data_posture` | object | unset | Operator override of this entry's declared data-handling posture, consulted by the action-level `data_posture:` filter: `zdr: true` declares this deployment holds a zero-data-retention arrangement (the only thing that makes a vendor which retains by default eligible for `require_zdr`), and `retains_data` overrides the catalog's retention declaration in either direction. Unset keeps the provider catalog's declaration. See [ai-gateway.md](ai-gateway.md#provider-data-posture). |
+| `on_key_failure` | enum | `fallback` | What happens when this provider rejects the request's own credential with a `401`/`403`. `fallback` retries the same provider once with `fallback_credential_id`; `fail_closed` returns the rejection to the caller untouched. Only ever applies to this entry's own `api_key`: a request carrying a caller-owned native credential never falls back. |
+| `fallback_credential_id` | string | unset | Id of the operator-held credential to retry with when this entry's `api_key` is rejected. Names a record under `key_management.seed.credentials[]` (or one minted through the admin key plane), never a secret written here, and it is resolved per request through the key plane so a rotation lands without a config reload and a cross-tenant record is refused. Unset means `on_key_failure: fallback` behaves as `fail_closed`. See [multi-tenant.md](multi-tenant.md#when-a-tenants-provider-key-is-refused). |
 | `aws_sigv4` | object | unset | Sign this provider's requests with AWS Signature Version 4, which is what Bedrock and SageMaker require in place of a bearer token. Presence of the block selects the signer. See [AWS SigV4 fields](#aws-sigv4-fields-providersaws_sigv4). |
+| `bedrock_guardrail` | object | unset | Run one of your Bedrock guardrails inside the `Converse` generation instead of as a separate `ApplyGuardrail` call. Keys: `identifier` and `version` (both required, sent as `guardrailIdentifier` / `guardrailVersion`), and `trace` (bool, default `false`, asks AWS which policies fired so the block reason can name them). Refused on any provider entry that is not Bedrock-format. See [guardrails.md](guardrails.md#bedrock-guardrails-inline-on-the-converse-call). |
 
 A `managed_model` provider must set a non-empty `deployment` and must not set
 `api_key`, `base_url`, or the legacy `serve` block. Conversely, `deployment` is
@@ -1700,6 +1708,11 @@ discarded. `accept_native_credentials_for` is refused with `aws_sigv4` for the
 same reason, since it substitutes a caller-owned key for an `api_key` a signed
 provider does not use, and `aws_sigv4` is refused on a `serve:` or
 `managed_model` entry because neither dials AWS.
+
+`fallback_credential_id` is refused alongside `on_key_failure: fail_closed`,
+and on a `serve:`, `managed_model`, or `aws_sigv4` entry: in each of those a
+credential is named that can never be presented, which is a config that reads
+as configured and does nothing.
 
 #### AWS SigV4 fields (`providers[].aws_sigv4`)
 
@@ -2185,26 +2198,55 @@ resilience:
     timeout_ms: 5000
     unhealthy_threshold: 3
     healthy_threshold: 2
+  pre_header_timeout_ms: 2000 # streaming: give up on a silent provider here
 ```
 
 `resilience` on its own does not add an attempt. A second attempt needs a routing plan that has somewhere to go: `routing.strategy: fallback_chain`, `resilience.content_policy_fallback: true`, or a typed fallback list. With one of those, the dispatch loop visits each configured provider at most once, so the attempt ceiling is the provider count and no separate key raises it. Circuit-broken, ejected, and cooling-down providers are skipped on the second and later attempts.
+
+Because each candidate is visited at most once, the worst case a caller waits is the per-attempt budget times the candidate count: `(timeout_ms + backoff) x (max_retries + 1) x providers`. `resilience.pre_header_timeout_ms` is what keeps that product small without shortening `timeout_ms` for the provider that does answer. It bounds connect through the upstream response headers on streaming requests only, fails over on elapse under `sbproxy_ai_failovers_total{reason="pre_header_timeout"}`, must be above zero, and only ever shortens an attempt, so a value above the attempt's own `timeout_ms` (or above the gateway's 30-second HTTP client default when `timeout_ms` is unset) never fires. Past the response headers the request is committed to that provider, so a later stall ends the stream and is counted on `sbproxy_ai_stream_post_commit_failures_total` instead. See [Pre-header streaming budget](ai-llm-aware-resilience.md#pre-header-streaming-budget).
 
 The block also accepts the LLM-aware keys: `retry_policy` (per-failure-class retry counts, e.g. `rate_limit: 3`), `cooldown_policy` (per-failure-class provider cooldown seconds), `llm_aware.context_compress` plus `llm_aware.completion_reserve_tokens` (fit an over-long prompt to the model's window before dispatch), and `content_policy_fallback` (route a content-policy refusal to the next provider in priority order). The typed reroute lists, `context_window_fallbacks` and `content_policy_fallbacks`, are siblings of `routing:` on the action rather than resilience keys. Semantics and the failure-cause table are in [ai-llm-aware-resilience.md](ai-llm-aware-resilience.md).
 
 #### Shadow (`shadow`)
 
-Mirrors a sampled set of non-streaming chat evaluation requests to a second provider after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
+Mirrors a sampled set of non-streaming chat evaluation requests to one or more shadow targets after request policy, guardrails, model rewrites, and context compression. V1 includes Chat Completions plus normalized Messages and Responses requests. Mutating and non-chat surfaces, including Assistants, Threads, Batches, Fine Tuning, Files, images, audio, embeddings, moderation, and reranking, are never copied. The primary's response is what the client sees. Shadow work uses fire-and-forget admission bounded by 16 in-flight tasks and a 64 MiB reservation budget per live AI client, so shadow failure, timeout, or saturation cannot delay or reject the primary. Streaming requests are intentionally skipped.
 
 The shadow body is drained while at most 1 MiB is retained for comparison metadata, which is logged at `target: sbproxy_ai_shadow` (status, latency, prompt/completion tokens, finish reason). Each configured usage sink receives a distinct shadow row tagged `shadow`; its request ID is freshly generated by the server and ends in `:shadow`. Shadow cost is estimated in that row but does not debit primary budgets. Set `enabled: false` on a shadow-only provider to keep it out of primary routing; the explicit shadow selection still uses it. Credential provider allow/block rules apply to the shadow target independently. A request carrying `x-sbproxy-disallow-prompt-training: true` is copied only when the shadow provider declares `no_prompt_training: true`. A hosting process that attaches a purpose-scoped egress authorizer to `AiClient` suppresses v1 shadow dispatch because the direct shadow transport cannot yet consume authorized DNS pins and redirect checks.
 
 ```yaml
 shadow:
-  provider: anthropic         # must also appear in `providers`
-  model: claude-haiku-4-5     # optional override; defaults to client's model
-  sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
-  timeout_ms: 30000           # upstream HTTP timeout
-  task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+  targets:
+    - provider: anthropic         # must also appear in `providers`
+      model: claude-haiku-4-5     # optional override; defaults to client's model
+      sample_rate: 0.1            # mirror 10% of traffic; 1.0 mirrors all
+      timeout_ms: 30000           # upstream HTTP timeout
+      task_timeout_ms: 30000      # hard wall-clock supervisor timeout
+    - provider: gemini
+      sample_rate: 0.5
 ```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `targets` | list | required | One entry per provider to shadow against. An empty list is refused, and so are two entries naming the same provider: the provider name identifies the target on every metric label and every ledger row. |
+| `targets[].provider` | string | required | Must also appear in `providers`. |
+| `targets[].model` | string | client's model | Model override for this target. |
+| `targets[].sample_rate` | float | `1.0` | Fraction of requests this target sees. |
+| `targets[].timeout_ms` | int | `30000` | Upstream HTTP timeout for this target's call. |
+| `targets[].task_timeout_ms` | int | `30000` | Hard wall-clock supervisor timeout for this target's task. |
+
+The single-target form, five sibling keys directly under `shadow:` with no
+`targets:`, still parses and means a one-entry list. Writing both `targets:`
+and a sibling key is refused rather than silently resolved.
+
+Admission runs once per target, so three targets take three slots out of the
+same 16-task and 64 MiB ceiling and a target that cannot get one is dropped as
+`saturated` while the others run. Sampling draws once per request and every
+target compares against that same draw, so target populations nest rather than
+diverge: everything a `0.1` target saw, a `0.5` target on the same route also
+saw. Each target's usage row carries `shadow_of`, the primary request's id, as
+the join key, and `finish_reason`; per-target outcomes are also counted on
+`sbproxy_ai_shadow_calls_total{target, status_class, finish_reason}` and
+`sbproxy_ai_shadow_latency_seconds{target}`.
 
 `sbproxy_ai_shadow_dropped_total{reason=...}` uses the closed reasons `streaming`, `provider_not_found`, `provider_not_allowed`, `prompt_training_disallowed`, `egress_denied`, and `saturated`. Sampling out is expected behavior and does not increment the counter.
 

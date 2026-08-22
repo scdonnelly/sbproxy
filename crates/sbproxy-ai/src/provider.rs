@@ -101,6 +101,55 @@ pub struct ProviderConfig {
     /// declaration. See `sbproxy_ai::data_posture`.
     #[serde(default)]
     pub data_posture: Option<crate::data_posture::DataPostureOverride>,
+    /// Upstream service tier this destination requests: `flex`,
+    /// `standard`, or `priority`. Unset sends no tier field at all and
+    /// the vendor serves on its own default.
+    ///
+    /// This is the operator's decision, not the caller's. A caller that
+    /// sets a tier on the request body has it replaced by this value, or
+    /// removed when this is unset, because raising the tier raises the
+    /// bill and the operator pays it.
+    ///
+    /// The tier is a property of this entry, not of a request. To run two
+    /// tiers of one vendor, declare two `providers[]` entries with the
+    /// same `provider_type` and different tiers; the router then treats
+    /// them as two candidates with independent weights, health, and
+    /// realized latency.
+    ///
+    /// A tier the provider catalog does not record for this vendor is
+    /// refused at config load rather than dropped at request time, so an
+    /// entry that can never serve the tier you asked for never boots.
+    #[serde(default)]
+    pub service_tier: Option<crate::service_tier::ServiceTier>,
+    /// What happens when this provider rejects the request's own
+    /// credential with a `401` or `403`.
+    ///
+    /// `fallback` (the default) retries this same provider once with
+    /// `fallback_credential_id`, if one is configured. `fail_closed`
+    /// returns the provider's rejection to the caller untouched, which
+    /// is what you want when the tenant's own key is the authorization
+    /// boundary and serving them on a house credential would let a
+    /// revoked tenant keep working.
+    ///
+    /// This only ever applies to this entry's own `api_key`. A request
+    /// carrying a caller-owned native credential never falls back to an
+    /// operator credential: the caller presented their own key and the
+    /// provider refused it, so spending yours would bill you for their
+    /// authorization failure.
+    #[serde(default)]
+    pub on_key_failure: KeyFailurePosture,
+    /// Id of the operator-held credential to retry with when this
+    /// entry's own `api_key` is rejected. Names a record under
+    /// `key_management.seed.credentials[]` (or one minted through the
+    /// admin key plane), never a secret written here.
+    ///
+    /// The record is resolved per request through the key plane, so it
+    /// picks up a rotation without a config reload, and it is refused
+    /// if it belongs to a different tenant than the request. Unset
+    /// means there is nothing to fall back to, and `on_key_failure:
+    /// fallback` then behaves exactly like `fail_closed`.
+    #[serde(default)]
+    pub fallback_credential_id: Option<String>,
     /// WOR-1652: optional local model-serving block. When set, the
     /// gateway itself hosts the models (pull weights, fit an engine to
     /// the GPU, supervise it) and registers them as local providers
@@ -131,6 +180,75 @@ pub struct ProviderConfig {
     // That was enough to overflow the Pingora worker thread's stack on
     // the AI request path.
     pub aws_sigv4: Option<Box<crate::aws_sigv4::AwsSigV4Config>>,
+    /// Amazon Bedrock guardrail applied inline by the Converse call
+    /// itself.
+    ///
+    /// Set this to have Bedrock evaluate the prompt and the completion
+    /// inside the same request that generates them, rather than as a
+    /// separate `ApplyGuardrail` call. An intervention comes back on a
+    /// 200 response as `stopReason: guardrail_intervened`; SBproxy
+    /// turns that into a 403 `guardrail_violation`, records it on the
+    /// output guardrail decision feed under the name
+    /// `bedrock_guardrail`, and never admits the response to any
+    /// cache.
+    ///
+    /// Valid only when this provider entry resolves to the Bedrock
+    /// wire format. Configuring it on any other provider is refused at
+    /// config load.
+    ///
+    /// This is a different control from `guardrails.external[]` with
+    /// `provider: bedrock`, which is an out-of-band `ApplyGuardrail`
+    /// call against the same AWS guardrail object. Both may be
+    /// configured; the account is then charged for two evaluations.
+    ///
+    /// There is no failure posture for this block. The guardrail runs
+    /// inside the generation call, so a rejected or unauthorized
+    /// guardrail configuration fails the whole call before any tokens
+    /// are produced and is handled by the ordinary provider-failure
+    /// path.
+    #[serde(default)]
+    // Boxed for the same reason `aws_sigv4` is, and with the same
+    // plain-comment treatment because the rustdoc above ships as the
+    // operator-facing schema description: almost every provider entry
+    // leaves this unset, and `ProviderConfig` is held across awaits on
+    // the AI request path where the Pingora worker stack is already at
+    // its 2MB ceiling.
+    pub bedrock_guardrail: Option<Box<BedrockGuardrailPassthrough>>,
+}
+
+/// Inline Bedrock Converse guardrail settings.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BedrockGuardrailPassthrough {
+    /// Bedrock guardrail identifier, sent as `guardrailIdentifier`.
+    pub identifier: String,
+    /// Bedrock guardrail version, sent as `guardrailVersion`. Use
+    /// `DRAFT` for the working version.
+    pub version: String,
+    /// Ask Bedrock for the guardrail assessment trace. The trace is
+    /// used to name the policies that fired in the block reason and is
+    /// never relayed to the caller. Defaults to `false`.
+    #[serde(default)]
+    pub trace: bool,
+}
+
+/// What the gateway does when one provider entry's credential is
+/// rejected upstream.
+///
+/// The rejection this decides is a `401` or `403` from the provider,
+/// which is a statement about the credential rather than about the
+/// provider's health. A `429`, a `5xx`, or a timeout stays with the
+/// provider failover and `cooldown_policy`, because a different key
+/// against a rate-limited provider is still rate limited.
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyFailurePosture {
+    /// Retry this provider once with `fallback_credential_id`. The
+    /// default, and inert on an entry that names no fallback credential.
+    #[default]
+    Fallback,
+    /// Return the provider's rejection to the caller unchanged.
+    FailClosed,
 }
 
 fn default_weight() -> u32 {
@@ -195,6 +313,47 @@ impl ProviderConfig {
         Ok(())
     }
 
+    /// Validate the credential-failure posture and its fallback credential.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a `fallback_credential_id` that can never be presented:
+    /// paired with `on_key_failure: fail_closed`, or set on an entry
+    /// that has no static upstream credential to replace (a `serve:`
+    /// entry, a `managed_model` entry, or one that signs with AWS
+    /// SigV4). Each of those is a config that reads as configured and
+    /// does nothing at request time.
+    pub fn validate_key_failure_posture(&self) -> Result<(), String> {
+        let Some(id) = self.fallback_credential_id.as_deref() else {
+            return Ok(());
+        };
+        if id.trim().is_empty() {
+            return Err("fallback_credential_id must not be empty".to_string());
+        }
+        if self.on_key_failure == KeyFailurePosture::FailClosed {
+            return Err(
+                "fallback_credential_id is set but on_key_failure is fail_closed, so the \
+                 credential can never be presented; drop one of the two"
+                    .to_string(),
+            );
+        }
+        if self.is_managed_model() || self.serve.is_some() {
+            return Err(
+                "managed or locally served providers present no upstream credential, so \
+                 fallback_credential_id has nothing to replace"
+                    .to_string(),
+            );
+        }
+        if self.aws_sigv4.is_some() {
+            return Err(
+                "an aws_sigv4 provider signs each request instead of presenting a static \
+                 key, so fallback_credential_id has nothing to replace"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Whether this provider routes to an SBproxy-managed deployment.
     pub fn is_managed_model(&self) -> bool {
         self.provider_type.as_deref() == Some("managed_model")
@@ -226,6 +385,34 @@ impl ProviderConfig {
         }
         if self.api_key.is_some() {
             return Err("managed_model provider must not set api_key".to_string());
+        }
+        Ok(())
+    }
+
+    /// Validate the inline Bedrock Converse guardrail block.
+    ///
+    /// `bedrock_guardrail` writes `guardrailConfig` into a Converse
+    /// request body. No other wire format has that field, so an entry
+    /// that is not Bedrock would silently drop the block and claim a
+    /// guardrail it never applied.
+    pub fn validate_bedrock_guardrail(&self) -> Result<(), String> {
+        let Some(guardrail) = self.bedrock_guardrail.as_deref() else {
+            return Ok(());
+        };
+        let format = crate::client::provider_format(self);
+        if format != crate::providers::ProviderFormat::Bedrock {
+            return Err(format!(
+                "bedrock_guardrail is only valid on a Bedrock provider; \
+                 provider_type {:?} resolves to the {format:?} wire format, \
+                 which has no guardrailConfig field",
+                self.effective_provider_type()
+            ));
+        }
+        if guardrail.identifier.trim().is_empty() {
+            return Err("bedrock_guardrail.identifier must not be empty".to_string());
+        }
+        if guardrail.version.trim().is_empty() {
+            return Err("bedrock_guardrail.version must not be empty".to_string());
         }
         Ok(())
     }
@@ -426,8 +613,12 @@ mod tests {
             allow_private_base_url: false,
             no_prompt_training: false,
             data_posture: None,
+            service_tier: None,
+            on_key_failure: KeyFailurePosture::Fallback,
+            fallback_credential_id: None,
             serve: None,
             aws_sigv4: None,
+            bedrock_guardrail: None,
         }
     }
 
@@ -828,6 +1019,82 @@ mod tests {
     }
 
     #[test]
+    fn bedrock_guardrail_on_a_non_bedrock_provider_is_refused() {
+        // `guardrailConfig` is a Converse request field. On any other
+        // wire format the translator has nowhere to put it, so the
+        // provider entry would claim a guardrail it silently never
+        // applies.
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai",
+            "api_key": "sk-test",
+            "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+        }))
+        .expect("fixture provider parses");
+        let error = provider
+            .validate_bedrock_guardrail()
+            .expect_err("an OpenAI-format provider cannot carry guardrailConfig");
+        assert!(error.contains("bedrock_guardrail"), "{error}");
+        assert!(error.contains("provider_type"), "{error}");
+        assert!(error.contains("openai"), "{error}");
+
+        let bedrock: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "bedrock_guardrail": {"identifier": "gr-1", "version": "DRAFT"},
+        }))
+        .expect("fixture provider parses");
+        bedrock
+            .validate_bedrock_guardrail()
+            .expect("a Bedrock provider accepts the block");
+    }
+
+    #[test]
+    fn an_empty_bedrock_guardrail_identifier_or_version_is_refused() {
+        for (field, body) in [
+            (
+                "identifier",
+                serde_json::json!({"identifier": "  ", "version": "DRAFT"}),
+            ),
+            (
+                "version",
+                serde_json::json!({"identifier": "gr-1", "version": ""}),
+            ),
+        ] {
+            let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+                "name": "bedrock",
+                "aws_sigv4": {"region": "us-east-1"},
+                "bedrock_guardrail": body,
+            }))
+            .expect("fixture provider parses");
+            let error = provider
+                .validate_bedrock_guardrail()
+                .expect_err("a blank {field} is not a guardrail reference");
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn json_schema_carries_the_bedrock_guardrail_surface() {
+        // This rustdoc ships verbatim as the operator-facing schema
+        // description, so the schema is the doc.
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        for needle in [
+            "\"bedrock_guardrail\"",
+            "BedrockGuardrailPassthrough",
+            "\"identifier\"",
+            "guardrailIdentifier",
+        ] {
+            assert!(json.contains(needle), "schema is missing {needle}");
+        }
+        assert!(
+            !json.contains("Boxed"),
+            "the boxing rationale must stay a plain comment; it ships as \
+             the operator-facing schema description otherwise"
+        );
+    }
+
+    #[test]
     fn json_schema_carries_the_aws_sigv4_surface() {
         // The committed ai-proxy-provider schema is what an editor
         // autocompletes against, and a security-relevant block that is
@@ -841,6 +1108,104 @@ mod tests {
             "AwsCredentialSource",
             "\"secret_access_key\"",
             "\"assume_role\"",
+        ] {
+            assert!(json.contains(needle), "schema is missing {needle}");
+        }
+    }
+
+    /// WOR-2655: the posture defaults to `fallback` and is inert
+    /// without a credential to fall back to, so an existing config
+    /// deserializes with no behavior change at all. This is the claim
+    /// the rustdoc, and therefore the operator-facing schema, makes.
+    #[test]
+    fn key_failure_posture_defaults_to_an_inert_fallback() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant"
+        }))
+        .expect("an entry that names neither key still parses");
+        assert_eq!(provider.on_key_failure, KeyFailurePosture::Fallback);
+        assert_eq!(provider.fallback_credential_id, None);
+        provider
+            .validate_key_failure_posture()
+            .expect("the default pair is valid");
+    }
+
+    #[test]
+    fn fail_closed_parses_from_snake_case() {
+        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "on_key_failure": "fail_closed"
+        }))
+        .expect("the opt-out spelling parses");
+        assert_eq!(provider.on_key_failure, KeyFailurePosture::FailClosed);
+        provider
+            .validate_key_failure_posture()
+            .expect("an opt-out with no fallback credential is coherent");
+    }
+
+    /// A `fallback_credential_id` that can never be presented is a
+    /// config that reads as configured and does nothing, which is the
+    /// failure mode this validation exists to make loud.
+    #[test]
+    fn a_fallback_credential_that_can_never_be_presented_is_refused() {
+        let opted_out: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "on_key_failure": "fail_closed",
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses; the refusal is a validation, not a parse error");
+        let error = opted_out
+            .validate_key_failure_posture()
+            .expect_err("fail_closed plus a fallback credential is refused");
+        assert!(error.contains("fail_closed"), "{error}");
+
+        let managed: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "house-llama",
+            "provider_type": "managed_model",
+            "deployment": "llama-3-8b",
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses");
+        assert!(
+            managed.validate_key_failure_posture().is_err(),
+            "a managed deployment presents no upstream credential"
+        );
+
+        let signed: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "bedrock",
+            "provider_type": "bedrock",
+            "aws_sigv4": {"region": "us-east-1"},
+            "fallback_credential_id": "house-openai"
+        }))
+        .expect("parses");
+        assert!(
+            signed.validate_key_failure_posture().is_err(),
+            "a SigV4 entry signs each request and has no static key to replace"
+        );
+
+        let empty: ProviderConfig = serde_json::from_value(serde_json::json!({
+            "name": "openai-acme",
+            "api_key": "sk-tenant",
+            "fallback_credential_id": "   "
+        }))
+        .expect("parses");
+        assert!(empty.validate_key_failure_posture().is_err());
+    }
+
+    /// The two keys ship as the operator-facing JSON schema, so an
+    /// entry missing from it is one an operator mistypes in silence.
+    #[test]
+    fn json_schema_carries_the_key_failure_surface() {
+        let schema = schemars::schema_for!(ProviderConfig);
+        let json = serde_json::to_string(&schema).expect("schema serializes");
+        for needle in [
+            "\"on_key_failure\"",
+            "\"fallback_credential_id\"",
+            "fail_closed",
+            "KeyFailurePosture",
         ] {
             assert!(json.contains(needle), "schema is missing {needle}");
         }

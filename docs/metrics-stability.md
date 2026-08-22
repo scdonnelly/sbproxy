@@ -123,9 +123,14 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_safety_guardrail_verdicts_total` | Counter | `stable` | `beta` | `guardrail`, `class`, `backend`, `verdict` | Built-in safety guardrail evaluations by class, backend, and verdict. |
 | `sbproxy_ai_external_guardrail_verdicts_total` | Counter | `stable` | `beta` | `provider`, `phase`, `outcome` | External guardrail evaluations by provider, phase, and outcome. |
 | `sbproxy_ai_inter_token_latency_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI streaming average inter-token latency (TPOT). |
+| `sbproxy_ai_key_fallbacks_total` | Counter | `stable` | `beta` | `provider`, `outcome` | AI provider-key fallback decisions, by the provider entry whose own key was refused and the outcome (`engaged` when the operator's `fallback_credential_id` resolved and the retry was queued, `unavailable` when it did not and the provider's rejection stands). `unavailable` is the alertable one: it means the house credential is broken and the only other evidence is a `401` that reads like the tenant's fault. |
 | `sbproxy_ai_lb_decisions_total` | Counter | `stable` | `beta` | `strategy`, `provider` | AI router provider selections by strategy. |
+| `sbproxy_ai_model_group_selections_total` | Counter | `stable` | `alpha` | `group`, `provider` | Named model group member selections: which group a request addressed and which provider's deployment served it. Both labels are operator-declared config names. |
 | `sbproxy_ai_prefix_affinity_decisions_total` | Counter | `stable` | `beta` | `outcome` | Prefix-affinity selections by cache-location outcome. |
 | `sbproxy_ai_prefix_affinity_evictions_total` | Counter | `stable` | `beta` | `reason` | Entries evicted from the bounded prefix-affinity table. |
+| `sbproxy_ai_cache_affinity_decisions_total` | Counter | `stable` | `beta` | `outcome` | Caller-keyed prompt-cache affinity selections by lease outcome. |
+| `sbproxy_ai_cache_affinity_evictions_total` | Counter | `stable` | `beta` | `reason` | Leases removed from the bounded prompt-cache affinity table. |
+| `sbproxy_ai_service_tier_decisions_total` | Counter | `stable` | `beta` | `disposition` | Upstream attempts whose service tier the operator's provider entry decided. |
 | `sbproxy_ai_quota_pool_fail_open_total` | Counter | `stable` | `beta` | `pool` | Quota-pool admissions allowed while the shared backend was unavailable. |
 | `sbproxy_ai_quota_pool_overshare_total` | Counter | `stable` | `beta` | `pool` | Soft quota-pool admissions beyond a member entitlement. |
 | `sbproxy_ai_routing_fallbacks_total` | Counter | `stable` | `beta` | `strategy`, `reason` | AI routing selections that used an explicit fallback path. |
@@ -151,17 +156,21 @@ The set of `stable` names, and the label prefix each one carried at promotion, i
 | `sbproxy_ai_replica_selection_excluded_total` | Counter | `stable` | `alpha` | `stage` | Managed-replica candidates excluded before rendezvous ranking, by stage. |
 | `sbproxy_ai_request_duration_attributed_seconds` | Histogram | `stable` | `beta` | `provider`, `model`, `surface`, `tenant_id`, `api_key_id` | AI upstream request latency, partitioned by surface + tenant + credential. |
 | `sbproxy_ai_request_duration_seconds` | Histogram | `stable` | `beta` | `provider`, `model` | AI request latency. |
+| `sbproxy_ai_request_timeout_override_total` | Counter | `stable` | `alpha` | `outcome` | Per-request `x-sbproxy-timeout-ms` outcomes: `applied` (honored, replacing the provider's `timeout_ms`), `ignored_override_disabled` (the origin has not opted in, so the header was dropped), `over_ceiling` (above `max_request_timeout_ms`, refused with 400 rather than clamped), `invalid_header` (not a positive integer, refused with 400). |
 | `sbproxy_ai_requests_attributed_total` | Counter | `stable` | `beta` | `origin`, `provider`, `model`, `surface`, `tenant_id`, `api_key_id`, `outcome` | AI requests partitioned by attribution + outcome. |
 | `sbproxy_ai_reversible_redaction_miss_total` | Counter | `stable` | `beta` | `rule` | Reversible PII placeholders that appeared in the upstream response but did not match a request-side capture entry. |
 | `sbproxy_ai_semantic_cache_similarity` | Histogram | `stable` | `beta` | `provider` | Cosine similarity of semantic-cache hits. |
 | `sbproxy_ai_semantic_route_decisions_total` | Counter | `stable` | `beta` | `outcome` | Semantic-route selections by decision outcome. |
 | `sbproxy_ai_semantic_route_similarity` | Histogram | `stable` | `beta` | `provider` | Best exemplar cosine similarity of scored semantic-route requests. |
 | `sbproxy_ai_shadow_dropped_total` | Counter | `stable` | `beta` | `reason` | Configured shadow requests skipped or dropped before dispatch, by closed reason. |
+| `sbproxy_ai_shadow_calls_total` | Counter | `stable` | `beta` | `target`, `status_class`, `finish_reason` | Completed shadow evaluation calls by target, status class, and finish reason. |
+| `sbproxy_ai_shadow_latency_seconds` | Histogram | `stable` | `beta` | `target` | Shadow evaluation call latency by target, in seconds. |
 | `sbproxy_ai_shadow_inflight` | Gauge | `stable` | `beta` | none | Currently in-flight shadow request tasks supervised by the AI client. |
 | `sbproxy_ai_shadow_timeout_total` | Counter | `stable` | `beta` | none | Shadow tasks canceled after their wall-clock supervisor timeout. |
 | `sbproxy_ai_stream_guardrail_skipped_total` | Counter | `stable` | `beta` | `guardrail` | Output guardrails skipped on streaming responses via stream_policy: off. |
 | `sbproxy_ai_stream_guardrail_violations_total` | Counter | `stable` | `beta` | `guardrail` | Streaming output guardrail violations, by guardrail type. |
 | `sbproxy_ai_stream_guardrail_decode_fallback_total` | Counter | `stable` | `beta` | none | Streaming chunks where guardrails fell back to raw-frame matching because delta decoding failed. |
+| `sbproxy_ai_stream_post_commit_failures_total` | Counter | `stable` | `alpha` | `provider`, `cause` | Streaming responses that failed after the gateway committed to a provider, by cause: `upstream_timeout` (a transport budget cut a running generation), `upstream_error` (a reset or truncated provider stream), `guardrail` (the gateway ended the stream on an output guardrail or stream-safety verdict). Failover is impossible past the commit point, so these are the failures `sbproxy_ai_failovers_total` can never carry. A caller that disconnects mid-stream is not counted: the failed downstream write aborts the relay before the counter is reached. |
 | `sbproxy_ai_surface_request_duration_seconds` | Histogram | `stable` | `stable` | `surface`, `method` | AI request latency partitioned by classified surface. |
 | `sbproxy_ai_surface_requests_total` | Counter | `stable` | `stable` | `surface`, `method` | AI gateway requests partitioned by classified surface. |
 | `sbproxy_ai_token_estimate_error_ratio` | Histogram | `stable` | `beta` | `model` | Relative error of pre-request token estimate vs upstream usage.prompt_tokens. |
