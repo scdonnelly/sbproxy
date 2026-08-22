@@ -120,16 +120,48 @@ for the full login/CSRF contract this drives.
 ![The Overview page: health ok, per-component checks, a request-log count, and the model host section](assets/admin-overview.png)
 
 Live health with per-component checks, version and uptime, a
-request-log count, and the local model host at a glance.
+request-log count, the certificate store this node opened, and the
+local model host at a glance.
 
 - **Shows:** `GET /health` (status, version, build, uptime,
   per-component checks), `GET /api/stats` (request-log entry count),
-  `GET /admin/model-host/status` (serving summary).
+  `GET /admin/model-host/status` (serving summary), and `GET /metrics`
+  for the `sbproxy_cert_store_degraded{backend}` gauge.
 - **Mutations:** none.
 - **Empty/error notes:** a component reporting `not_configured` is
   expected on a minimal config and renders as informational, not an
   error; only an `unhealthy` component or a fetch failure renders the
   error state.
+
+### The certificate store row
+
+`/health` does not carry the certificate store, so this page reads the
+scrape for one gauge. It has four states, and only one of them is the
+plain reading of the number:
+
+| Gauge | Row reads | What it means |
+|---|---|---|
+| absent | `not reported` | No certificate store was opened. Normal for a node with no ACME configuration. |
+| `0`, backend not `memory` | `ok` | The backend named in `acme.storage_backend` opened, and certificates persist. |
+| `0`, backend `memory` | `in memory` | The store opened and persists nothing. Certificates are lost on restart and re-issued on every boot. |
+| `1` | `degraded` | The backend could not be opened and the node is serving from an in-memory store. |
+| scrape failed | `unavailable` | `GET /metrics` did not answer, so the state is unknown. Not a report that no store was opened. |
+
+The last two rows of the gauge both raise a warning block above the
+component list, because neither has any other symptom until the CA
+rate-limits the hostname. Certificates do not survive a restart and are
+issued again on every boot.
+
+A `1` is always a pod-local backend (`redb`, `sqlite`, `memory`); a
+shared backend that cannot be opened refuses to start rather than
+degrade, since an in-memory fallback inherits the single-node locking
+defaults and would hand every replica its own ACME issuance lease.
+
+Two readings would be wrong and the page avoids both. Summing the gauge
+erases the absent state, since an absent family sums to zero and would
+render as healthy. Reading the value alone erases
+`acme.storage_backend: memory`, which opens cleanly, reports a truthful
+`0`, and still costs a fresh certificate on every boot.
 
 ## Get started (`/get-started`)
 
@@ -739,39 +771,135 @@ per-user cut.
 Serving latency (time-to-first-token, inter-token latency, throughput)
 and provider health from the live counters.
 
-- **Shows:** `GET /metrics`, specifically the TTFT/TPOT/throughput
-  histograms, per-provider request/error counts and error rate,
-  gateway admission/rejection rate with rejection reasons, failover
-  reasons, cascade-tier outcomes, and router-strategy decisions. When
+- **Shows:** `GET /metrics`, specifically the pre-provider refusal
+  panel described below, the TTFT/TPOT/throughput histograms,
+  per-provider request/error counts and error rate, gateway
+  admission/rejection rate with rejection reasons, failover reasons,
+  cascade-tier outcomes, and router-strategy decisions. When
   context-compression policies are active, a
   compression section reports compressed requests, tokens and cost
   saved, per-lever savings, request outcomes, and the average
   compression ratio per lever.
 - **Mutations:** none.
-- **Empty/error notes:** no AI traffic renders an empty state
-  explaining that panels light up after the first request through an
-  `ai_proxy` origin; streaming-latency panels specifically need at
-  least one streamed completion (TPOT needs at least two tokens in
-  that stream) and say so rather than showing a misleading zero.
+- **Empty/error notes:** no AI traffic and no pre-provider refusal
+  renders an empty state explaining that panels light up after the
+  first request through an `ai_proxy` origin; streaming-latency panels
+  specifically need at least one streamed completion (TPOT needs at
+  least two tokens in that stream) and say so rather than showing a
+  misleading zero.
+
+### Refused before dispatch
+
+The refusals nothing else can show you. A request the AI gateway turns
+away at the inbound native-format shim, or at the shared stored-prompt
+resolver, never reaches a provider, so it leaves no trace in provider
+health here, in your provider's own console, or in any provider-side
+bill. The `Refused before dispatch` tile and the panel under it read
+`sbproxy_ai_admission_decisions_total{surface,reason,outcome}`, the
+counter the [`ai.admission` decision record](decision-records.md#aiadmission)
+increments in the same breath.
+
+The panel lists one row per `surface / reason` pair, with the bounded
+label values rendered as the phrase they mean and the raw code printed
+underneath so the row still joins the metric and the decision record.
+A refusal that arrived on more than one inbound surface also gets a
+per-surface breakdown.
+
+- **Coverage:** the three refusal arms of the inbound native-format
+  shim (the Anthropic Messages translate, the Responses stored-prompt
+  bridge, and the Responses translate) and the two of the shared
+  stored-prompt resolver. A request refused later by the model
+  allow/block gate, a virtual-key policy, a guardrail, a budget, a rate
+  limiter, or a CEL or Rego policy is that plane's decision and is not
+  counted here.
+- **Absent is not zero.** The counter is published on its first
+  increment, so a proxy that has never refused a request before
+  dispatch exports no family at all. The tile reads `not reported` for
+  that case rather than `0`, because a flat zero over a measurement
+  nobody has ever taken reads as a healthy signal.
+- **Not additive with the gateway rejection rate beside it.** A refusal
+  here is a 4xx on a classified AI surface, so it is also one of the
+  rejections in `sbproxy_ai_gateway_decisions_total{decision="rejected"}`,
+  filed under `client_error`. Reading the two tiles as separate
+  populations double counts. What this panel adds is which inbound
+  surface and which refusal, neither of which the `client_error` bucket
+  can say.
+- **`__other__` in a row is a lost label, not a reason.** The `reason`
+  label is capped at 8 accepted values by the cardinality limiter
+  against a 13-code vocabulary, so a proxy that sees a ninth distinct
+  refusal files every later one under the limiter's sentinel from then
+  on. The panel renders that row as `Beyond the label limit, reason not
+  recorded` rather than as a word that reads like a refusal. The count
+  is still real; only the code behind it is gone.
+
+Triage: a caller reports a 400 that their provider dashboard has no
+record of. Open AI performance. A `Refused before dispatch` count above
+zero with a row reading `OpenAI Responses / MCP tool block, which would
+reach an MCP server past this gateway` says the caller sent
+`tools: [{"type": "mcp", ...}]` on `/v1/responses`, asking the provider
+to reach an MCP server behind this gateway's MCP governance, and the
+gateway refused it before dispatch. Turn on
+`observability.log.decision_audit.events.ai.admission` to get the
+per-request `ai.admission` record with the request id, then find the
+caller in [Logs](#logs-logs).
 
 ## Guardrails (`/guardrails`)
 
 ![Guardrails: block counts by category and wasted-spend panels](assets/admin-guardrails.png)
 
-Governance outcomes: what the guardrail, WAF, and object-authz planes
-blocked, and what wasted spend the gateway flagged.
+Governance outcomes: what the guardrail, WAF, object-authz, and CORS
+planes refused, what wasted spend the gateway flagged, and whether any
+peer still signs on the deprecated RFC 9421 request-target base.
 
 - **Shows:** `GET /metrics`: guardrail blocks by category, streaming
   guardrail violations, context-poisoning findings, WAF/HTTP-framing/
-  object-authz blocks, and wasted tokens/cost by kind (duplicate
-  requests, abandoned streams, validation failures, context bloat,
-  failover losers).
+  object-authz blocks, CORS refusals by reason, RFC 9421 legacy
+  derivations by covered component, and wasted tokens/cost by kind
+  (duplicate requests, abandoned streams, validation failures, context
+  bloat, failover losers).
 - **Mutations:** none. A "Blocked requests in Logs" action link jumps
   to Logs pre-filtered by `guardrail_action=block`.
 - **Empty/error notes:** no guardrail activity since start renders an
   empty state pointing at the AI gateway guardrails config, not an
   error; this is the expected state for a config with no guardrails
   declared.
+
+### CORS headers withheld
+
+`sbproxy_cors_refusals_total{reason}` sits in the protocol-plane panel
+next to the WAF, framing, and object-authz blocks, because it is the
+same kind of thing: a refusal the edge made before the origin saw the
+response.
+
+Read the label, not just the total. The counter has one reason today,
+`wildcard_with_credentials`, which is an origin configured with
+`allowed_origins: ["*"]` and `allow_credentials: true` at once.
+Browsers reject that pair, so sbproxy withholds the CORS headers rather
+than appear to authorize something the browser will strip. An origin
+that is simply not on the allowlist is denied without incrementing this
+counter, so a low number here is not a statement that every
+cross-origin request was allowed.
+
+The panel is absent, not zero, when nothing has been refused: the
+counter registers on its first use.
+
+### RFC 9421 signature deprecation
+
+`sbproxy_signature_legacy_derivation_total{component}` counts signatures
+that verified only against the derivation sbproxy used before it became
+RFC 9421 conformant, broken down by the covered component
+(`@target-uri` or `@request-target`).
+
+This is the number that closes the deprecation window. Acceptance is
+otherwise announced in a single `warn` line per process, which tells you
+a signer somewhere has not moved and nothing about whether that is still
+true this week. Watch it stop climbing, then move the signing peers to a
+conformant RFC 9421 library before the fallback is removed.
+
+The panel does not appear when the counter is absent, and it does not
+claim the fallback can go: an origin with no signature verification
+configured produces exactly the same absent family as an origin whose
+signers have all moved.
 
 ## Alerts (`/alerts`)
 
@@ -1069,11 +1197,18 @@ pulls, and verification.
 ![Storage: the verified weight cache with per-artifact size, residency, and delete controls](assets/admin-storage.png)
 
 Verified model weights in the artifact cache: what is on disk, what is
-resident, and what can be reclaimed.
+resident, and what can be reclaimed. Below the inventory, whether the
+storage backend the gateway reads and writes through is answering.
 
 - **Shows:** `GET /admin/model-host/files` (cache root, total bytes,
   per-artifact size, last-accessed time, and whether it currently
-  backs a ready replica).
+  backs a ready replica), and `GET /metrics` for the **Storage backend
+  operations** panel: operations completed, operations that returned an
+  error, the p95 across every backend and operation, the slowest
+  `backend / op` pair, and failures broken out by error kind. Those come
+  from `sbproxy_storage_op_duration_seconds` and
+  `sbproxy_storage_op_errors_total`, which every backend call is wrapped
+  in.
 - **Mutations:** `DELETE /admin/model-host/artifacts/{digest}` (remove
   one artifact, blocked with a stated reason if it is configured,
   resident, pinned, leased, or file-locked), `POST /admin/model-host/gc`
@@ -1081,7 +1216,13 @@ resident, and what can be reclaimed.
 - **Empty/error notes:** no model host configured renders an empty
   inventory (`cache_root: null`), not an error; GC with no configured
   cache budget returns `409` and disables the control with a tooltip
-  explaining there is no target to collect toward.
+  explaining there is no target to collect toward. The backend panel
+  loads separately from the inventory, so a node with no model host
+  still shows backend health. Both storage families register on the
+  first backend operation, so a node where no backend has run publishes
+  neither and the panel says so in words rather than drawing a zero. A
+  present latency histogram with no error counter is the opposite case
+  and is a real zero: nothing has failed.
 
 ## Audit (`/audit`)
 
@@ -1158,7 +1299,8 @@ admin credential in the table.
 
 ## Cluster (`/cluster`)
 
-Membership, model placement, and rollout health across the fleet.
+Membership, model placement, and rollout health across the fleet, plus
+the inbound peer connections this node refused.
 For a runnable example that lights this page up, see
 [a three-node mesh on one machine](#example-a-three-node-mesh-on-one-machine).
 
@@ -1167,7 +1309,21 @@ For a runnable example that lights this page up, see
   look healthier, plus a health rail, prominent unhealthy-node alerts, and
   per-deployment placement/rollout detail), `GET /admin/cluster/metrics`
   (fleet-aggregated metrics, shown separately so a metrics-tier outage
-  never hides roster or rollout evidence).
+  never hides roster or rollout evidence), and `GET /metrics` for the
+  **Inbound peer admission** panel.
+
+  That panel reads `mesh_transport_inbound_rejected_total` off this
+  node's own scrape rather than the fleet aggregate, because the node a
+  refusal landed on is the actionable part of the reading. It counts
+  peers turned away, connections closed at the inbound ceiling, and
+  idle connections reclaimed, then lists every `reason` with what it
+  means. `idle_timeout` is kept out of the "turned away" total: the
+  client half re-evaluates its connection recycle lazily, so a quiet
+  cluster reclaims idle links as a matter of course and folding those
+  into the refusal count makes an idle fleet look under attack. Alert
+  on `reason!="idle_timeout"`. The peer address is deliberately not a
+  label (it is attacker-chosen and would mint one series per source);
+  it is in the node's log line instead.
 - **Mutations:** none on this page; publishing a signed deployment
   bundle happens from Model host. This page is read-only status and
   alerting.
@@ -1175,7 +1331,10 @@ For a runnable example that lights this page up, see
   single-node view rather than an error (there is a "fleet" of one).
   A metrics-endpoint `404` (mesh metrics tier not configured) renders
   "metrics not enabled" without blocking the roster/health sections,
-  which come from a separate call.
+  which come from a separate call. The admission counter registers on
+  its first increment, so a node that has refused nothing publishes no
+  family at all; the panel says the counter is not reported rather than
+  showing a zero over a signal that has never been observed.
 
 ## Example: a three-node mesh on one machine
 
