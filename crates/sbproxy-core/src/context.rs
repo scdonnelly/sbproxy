@@ -812,11 +812,15 @@ pub struct RequestContext {
     pub path_params: Option<HashMap<String, String>>,
 
     // --- Fallback state ---
-    /// Set to true when the primary upstream failed and a fallback response was served.
+    /// Set to true when the primary upstream failed (`on_error`) or
+    /// answered with a listed bad status (`on_status`) and a fallback
+    /// response was served instead. Both triggers write the fallback
+    /// response directly to the session (see `serve_fallback_action` and
+    /// its callers in `server/proxy_http.rs`), so this field is a pure
+    /// after-the-fact record for the access log and for
+    /// `response_body_filter`'s WOR-2686 guard that discards any real
+    /// upstream body still in flight once a fallback has fired.
     pub fallback_triggered: bool,
-    /// When on_status fallback triggers in response_filter, the replacement body is stored
-    /// here so response_body_filter can swap it in.
-    pub fallback_body: Option<bytes::Bytes>,
 
     // --- CSRF state ---
     /// CSRF token to set as a cookie on the response (for safe methods).
@@ -1878,7 +1882,6 @@ impl RequestContext {
             forward_rule_idx: None,
             path_params: None,
             fallback_triggered: false,
-            fallback_body: None,
             csrf_cookie: None,
             replacement_request_body: None,
             websocket_tunnel: None,

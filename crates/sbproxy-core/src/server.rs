@@ -2556,13 +2556,17 @@ fn match_accept_q(ranges: &[AcceptRange], content_type: &str) -> f32 {
 // --- Fallback action helper ---
 
 /// Serve a fallback action's response directly (for error/status fallback).
-/// Returns Ok(status_code) on success.
+/// Returns `Ok((status_code, body_len_bytes))` on success. The body
+/// length lets callers keep `ctx.response_body_bytes` (the access log's
+/// and the billing meter's `bytes_out`, per WOR-2686) honest for a
+/// fallback response that never goes through `response_body_filter`'s
+/// own accounting.
 async fn serve_fallback_action(
     session: &mut Session,
     action: &Action,
     add_debug_header: bool,
     trigger: &str,
-) -> Result<u16> {
+) -> Result<(u16, u64)> {
     match action {
         Action::Static(s) => {
             let ct = s.content_type.as_deref().unwrap_or("text/plain");
@@ -2595,7 +2599,7 @@ async fn serve_fallback_action(
             session
                 .write_response_body(Some(bytes::Bytes::copy_from_slice(s.body.as_bytes())), true)
                 .await?;
-            Ok(s.status)
+            Ok((s.status, s.body.len() as u64))
         }
         _ => {
             // For non-static fallback actions, serve a generic fallback error.
@@ -2622,7 +2626,7 @@ async fn serve_fallback_action(
             session
                 .write_response_body(Some(bytes::Bytes::copy_from_slice(body)), true)
                 .await?;
-            Ok(502)
+            Ok((502, body.len() as u64))
         }
     }
 }

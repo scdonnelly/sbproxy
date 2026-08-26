@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "fallback_origin's on_status trigger now serves a clean fallback response: it no longer leaks the discarded primary response's headers, and the fallback body is written directly instead of depending on a body chunk from the primary that a bodyless response never produces."
+}

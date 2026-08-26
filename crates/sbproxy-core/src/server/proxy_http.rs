@@ -944,14 +944,21 @@ fn oversized_body_refusal<'t>(
 /// buffering exists, and an earlier version gated on it missed exactly
 /// the single-chunk delivery that small caps see most.
 ///
-/// Exempt states: a pending fallback or replacement body discards the
-/// upstream body entirely, so nothing oversized remains to refuse; and
-/// a response the all-open pass-through already committed to raw
-/// delivery must not be aborted after its raw prefix reached the
+/// Exempt states: a triggered fallback or a pending replacement body
+/// discards the upstream body entirely, so nothing oversized remains to
+/// refuse; and a response the all-open pass-through already committed
+/// to raw delivery must not be aborted after its raw prefix reached the
 /// client.
+///
+/// `fallback_triggered` covers `on_status` (WOR-2686 onward the real
+/// upstream body is discarded before this function is ever reached, in
+/// `response_body_filter`'s own early return, so this is a second,
+/// redundant guard) as well as `on_error`, which never reaches this
+/// function's caller at all since it fires before any upstream response
+/// exists.
 fn closed_refusal_before_capture(ctx: &RequestContext, chunk_len: usize) -> Option<String> {
     if ctx.transform_passthrough_committed
-        || ctx.fallback_body.is_some()
+        || ctx.fallback_triggered
         || ctx.response_body_replacement.is_some()
     {
         return None;
@@ -4589,14 +4596,16 @@ impl ProxyHttp for SbProxy {
         // --- On-status fallback: rewrite response if upstream status matches ---
         //
         // Skipped on the two translated gRPC paths, which own the
-        // response body outright. `response_body_filter` returns from its
-        // `transcode_active` / `grpc_web_active` branch before it reaches
-        // the `ctx.fallback_body` swap below, so a fallback that fired
-        // here would send the fallback's status and its `content-length`
-        // over a body that is still the translated one (or, on a
-        // trailers-only response, no body at all). A body that does not
-        // match its declared length desynchronizes a keep-alive
-        // connection, which is worse than not applying the fallback.
+        // response body outright: `response_body_filter`'s
+        // `transcode_active` / `grpc_web_active` branches build the
+        // client-facing gRPC-JSON envelope or gRPC-Web frame from the
+        // buffered translated body, a construction on_status has never
+        // been taught to interact with (WOR-2686 only wired up the plain
+        // HTTP case). Serving the fallback here regardless would still be
+        // correct on its own (the fallback response is now written
+        // directly, see below), but it would silently skip the
+        // translation those two paths exist to produce, which is a
+        // separate decision this fix does not make.
         //
         // The mismatch is not new, but its reach is. Until the
         // gRPC-status-to-HTTP-status mapping above, only a genuine
@@ -4623,33 +4632,69 @@ impl ProxyHttp for SbProxy {
                         );
                         ctx.fallback_triggered = true;
 
-                        // Rewrite response headers with the fallback action's response.
-                        if let Action::Static(s) = &fallback.action {
-                            let ct = s.content_type.as_deref().unwrap_or("text/plain");
-                            upstream_response.set_status(s.status).map_err(|e| {
-                                Error::because(
-                                    ErrorType::InternalError,
-                                    "failed to set fallback status",
-                                    e,
-                                )
-                            })?;
-                            let _ = upstream_response.insert_header("content-type", ct);
-                            let _ = upstream_response
-                                .insert_header("content-length", s.body.len().to_string());
-                            upstream_response.remove_header("transfer-encoding");
-                            for (k, v) in &s.headers {
-                                let _ = upstream_response.insert_header(k.clone(), v.clone());
-                            }
-                            if fallback.add_debug_header {
-                                let _ =
-                                    upstream_response.insert_header("X-Fallback-Trigger", "status");
-                            }
-                            // Store the fallback body for response_body_filter to swap in.
-                            ctx.fallback_body =
-                                Some(bytes::Bytes::copy_from_slice(s.body.as_bytes()));
-                            ctx.response_status = Some(s.status);
-                            return Ok(());
-                        }
+                        // WOR-2686: serve the fallback response the same way
+                        // `fail_to_proxy`'s `on_error` branch already does,
+                        // via `serve_fallback_action`, instead of editing
+                        // `upstream_response` (the real, should-be-discarded
+                        // response) in place. Editing in place had two bugs:
+                        //
+                        // 1. Header leak. Only a handful of header names were
+                        //    inserted/overwritten here; every other header the
+                        //    real upstream set (its own `Server`,
+                        //    `access-control-allow-*`, etc.) survived onto
+                        //    what is supposed to be an independent fallback
+                        //    response, because `response_filter` only mutates
+                        //    the header Pingora is about to forward and does
+                        //    not clear it first.
+                        // 2. Body / Content-Length mismatch. The fallback body
+                        //    was stashed on `ctx` for `response_body_filter`
+                        //    to swap in later, but Pingora only invokes that
+                        //    hook when the upstream stream actually produces a
+                        //    body chunk. Confirmed against
+                        //    `Http1Session::read_response_task` in the
+                        //    vendored pingora fork
+                        //    (`pingora-core/src/protocols/http/v1/client.rs`):
+                        //    `end_of_body` is latched from the real response's
+                        //    `Content-Length`/body framing *before*
+                        //    `response_filter` ever runs, so a genuinely
+                        //    bodyless real response (`Content-Length: 0`, as
+                        //    in this ticket's httpbin.org/status/503 repro)
+                        //    never produces a body task at all and
+                        //    `response_body_filter` never fires for this
+                        //    exchange. The Content-Length this function had
+                        //    already declared on the real header then went
+                        //    out over the wire with zero body bytes behind
+                        //    it.
+                        //
+                        // `serve_fallback_action` writes a brand new
+                        // `ResponseHeader` (never touching the real response's
+                        // headers) and the real body bytes directly to
+                        // `session`, both before returning, which fixes both:
+                        // no leaked header has anywhere to survive to, and the
+                        // body is on the wire by construction rather than
+                        // depending on a later hook that may never run.
+                        //
+                        // Pingora still forwards the original, untouched
+                        // `upstream_response` task after this function
+                        // returns `Ok(())`; by then a response has already
+                        // been written to the session, so that second header
+                        // write hits `Http1Session::prepare_response_header`'s
+                        // documented "Respond header is already sent, cannot
+                        // send again" guard and is a no-op (one benign `warn!`
+                        // from pingora-core), and any real body bytes still in
+                        // flight behind it are dropped the same way writing
+                        // past a declared Content-Length always is
+                        // (`BodyWriter` returns `Ok(None)` past the limit).
+                        let (status, body_len) = serve_fallback_action(
+                            session,
+                            &fallback.action,
+                            fallback.add_debug_header,
+                            "status",
+                        )
+                        .await?;
+                        ctx.response_status = Some(status);
+                        ctx.response_body_bytes = body_len;
+                        return Ok(());
                     }
                 }
             }
@@ -6942,6 +6987,20 @@ impl ProxyHttp for SbProxy {
             return Ok(None);
         }
 
+        // WOR-2686: once an `on_status` fallback has fired in
+        // `response_filter`, the real upstream response's body (if the
+        // upstream sent one) is discarded outright, not swapped for. The
+        // fallback body was already written directly to the session
+        // before `response_filter` returned, so anything still arriving
+        // here from the real upstream is the response being replaced,
+        // not the response being served; scanning, transforming, or
+        // buffering it would be wasted work on bytes the client is never
+        // meant to see.
+        if ctx.fallback_triggered {
+            *body = None;
+            return Ok(None);
+        }
+
         crate::proxy_wasm_http::filter_response_body(body, end_of_stream, ctx)?;
 
         // Track outbound body bytes for the access log. Counts what
@@ -7288,12 +7347,6 @@ impl ProxyHttp for SbProxy {
                     }
                 }
             }
-        }
-
-        // If a fallback body was prepared (on_status fallback), replace the upstream body.
-        if let Some(fb_body) = ctx.fallback_body.take() {
-            *body = Some(fb_body);
-            return Ok(None);
         }
 
         // If a response modifier specified a body replacement, swap it in.
@@ -8025,8 +8078,14 @@ impl ProxyHttp for SbProxy {
                     )
                     .await;
 
-                    if let Ok(status) = result {
+                    if let Ok((status, body_len)) = result {
                         ctx.response_status = Some(status);
+                        // WOR-2686: keep bytes_out (access log + billing
+                        // meter evidence) honest for this fallback
+                        // response too; it never reaches
+                        // `response_body_filter`'s own accounting since
+                        // `fail_to_proxy` is a terminal path.
+                        ctx.response_body_bytes = body_len;
                         return FailToProxy {
                             error_code: status,
                             can_reuse_downstream: true,
