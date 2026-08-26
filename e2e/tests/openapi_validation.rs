@@ -120,6 +120,64 @@ fn missing_required_field_is_rejected() {
     }
 }
 
+// WOR-2687: the header-phase policy dispatcher runs before the body
+// is buffered, so `OpenApiValidationEnforcer::enforce` always returns
+// `Allow` there (see `builtin_enforcers::openapi_validation`) and the
+// bus gets a `policy_verdict_event` saying "allow" for this policy_id
+// before the request body has even arrived. Left uncorrected, that is
+// the only record this request's `openapi_validation` decision ever
+// gets, regardless of the 422 the client receives. Once the buffered
+// validator in `request_body_filter` finds the real violation, it
+// must publish a second, correcting event so a consumer reading the
+// audit trail in publish order sees "deny" as the last word for this
+// policy_id on this request.
+#[test]
+fn missing_required_field_publishes_a_deny_verdict() {
+    let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");
+    let harness =
+        ProxyHarness::start_with_yaml(&enforce_yaml(&upstream.base_url())).expect("start proxy");
+    let resp = harness
+        .post_json("/users/42", "api.localhost", &json!({"age": 30}), &[])
+        .expect("send");
+    assert_eq!(resp.status, 422);
+
+    // The audit bus drains asynchronously (see
+    // `sbproxy_core::policy_bus::drain_to_stderr`), so a line can land
+    // a beat after the HTTP response does. Two events are expected
+    // for this request's `openapi_validation` policy_id: the
+    // header-phase dispatcher's premature "allow" (the body doesn't
+    // exist yet at that phase) and this fix's corrective "deny".
+    // Poll until both have actually been drained to stderr rather
+    // than stopping at the first one to appear, which would race
+    // ahead of the second and read as a false failure.
+    let openapi_line = |line: &str| {
+        line.contains("policy_verdict_event")
+            && line.contains("\"policy_id\":\"openapi_validation\"")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut stderr = harness.stderr_contents();
+    while stderr.lines().filter(|l| openapi_line(l)).count() < 2
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stderr = harness.stderr_contents();
+    }
+
+    let openapi_lines: Vec<&str> = stderr.lines().filter(|l| openapi_line(l)).collect();
+    assert!(
+        openapi_lines.len() >= 2,
+        "expected the premature header-phase \"allow\" plus a corrective \
+         \"deny\" for openapi_validation, got {} matching line(s), stderr: {stderr}",
+        openapi_lines.len()
+    );
+    let last = openapi_lines.last().expect("checked len above");
+    assert!(
+        last.contains("\"verdict\":\"deny\""),
+        "the last openapi_validation policy_verdict_event for a rejected \
+         request must report \"deny\", got: {last}\nfull stderr: {stderr}"
+    );
+}
+
 #[test]
 fn additional_property_is_rejected() {
     let upstream = MockUpstream::start(json!({"ok": true})).expect("upstream");

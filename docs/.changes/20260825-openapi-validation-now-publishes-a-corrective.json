@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "openapi_validation now publishes a corrective deny policy_verdict_event when a buffered body fails schema validation, instead of leaving the header-phase allow as the only audit record"
+}

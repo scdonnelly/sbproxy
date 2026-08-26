@@ -6488,6 +6488,57 @@ impl ProxyHttp for SbProxy {
                                                         })
                                                         .to_string()
                                                     });
+                                                // WOR-2687: `check_policies` (header
+                                                // phase) already published an `allow`
+                                                // `policy_verdict_event` for
+                                                // "openapi_validation" on this
+                                                // request: `OpenApiValidationEnforcer::
+                                                // enforce` always returns `Allow`
+                                                // there because the body this policy
+                                                // validates is not buffered yet, and
+                                                // defers the real check to here. Left
+                                                // uncorrected, the audit trail for a
+                                                // request denied in this arm reports
+                                                // "allow" regardless of whether the
+                                                // rejection reaches the client. Publish
+                                                // the real verdict now, tagged with the
+                                                // same surface/engine this policy
+                                                // compiles with (`builtin_enforcers::
+                                                // registry::builtin`, BuiltIn/BuiltIn)
+                                                // so the two audit records for this
+                                                // request agree on attribution.
+                                                sbproxy_observe::metrics::record_policy(
+                                                    ctx.hostname.as_str(),
+                                                    "openapi_validation",
+                                                    "deny",
+                                                );
+                                                ctx.record_policy_decision(
+                                                    "openapi_validation",
+                                                    "deny",
+                                                );
+                                                let verdict_ctx = PolicyVerdictCtx {
+                                                    request_id: ctx.request_id.to_string(),
+                                                    workspace_id: pipeline.config.origins
+                                                        [origin_idx]
+                                                        .workspace_id
+                                                        .to_string(),
+                                                    origin: pipeline.config.origins[origin_idx]
+                                                        .origin_id
+                                                        .to_string(),
+                                                    tenant: ctx.tenant_id.to_string(),
+                                                    record_format: pipeline
+                                                        .config
+                                                        .decision_audit
+                                                        .policy_record_format(),
+                                                };
+                                                emit_policy_verdict(
+                                                    &verdict_ctx,
+                                                    "openapi_validation",
+                                                    sbproxy_observe::events::PolicySurface::BuiltIn,
+                                                    sbproxy_observe::decision::DecisionEngine::BuiltIn,
+                                                    sbproxy_observe::events::VerdictTag::Deny,
+                                                    std::time::Instant::now(),
+                                                );
                                                 failed = Some((
                                                     oa.status,
                                                     body_str,
