@@ -2419,6 +2419,24 @@ impl AiClient {
         let mut discarded_tokens: u64 = 0;
         let mut discarded_cost_usd: f64 = 0.0;
         let router = config.router();
+        // WOR-2685: `total_skips` counts every tier that produced no
+        // outcome (every `continue` below that is not preceded by
+        // `last_outcome = Some(..)`); `policy_lock_skips` counts the
+        // subset of those excluded specifically by the credential's
+        // provider policy. The "exhausted" error after the loop names
+        // the policy lock as the cause only when the two counts are
+        // equal and non-zero, i.e. policy was the *only* reason nothing
+        // dispatched; a bare "exhausted" names neither the lock nor the
+        // plan's requested provider, and a mixed cause (a policy lock
+        // alongside a cost-cap, health, or transport exclusion) must not
+        // be reported as a pure policy lock either. `locked_providers`
+        // is a deduped *display* list of the provider ids named by that
+        // subset (two tiers can name the same locked provider), kept
+        // separate from `policy_lock_skips` so the dedup cannot make the
+        // sole-cause count comparison undercount.
+        let mut locked_providers: Vec<String> = Vec::new();
+        let mut policy_lock_skips: usize = 0;
+        let mut total_skips: usize = 0;
 
         for (tier_idx, tier) in cascade.tiers.iter().enumerate() {
             // Cost cap gate. Both the cascade-level and per-tier
@@ -2440,20 +2458,52 @@ impl AiClient {
                     "cascade: skipping tier; would exceed cost cap"
                 );
                 ai_metrics::record_cascade_tier_outcome(tier_idx, "cost_cap");
+                total_skips += 1;
                 continue;
             }
 
-            // Find the provider config for this tier, then apply the same
-            // strict live resilience gate as ordinary dispatch. A cascade
-            // must never revive an unhealthy, ejected, or breaker-blocked
-            // provider merely because it appears in the configured tiers.
-            let provider = match config.providers.iter().enumerate().find(|(idx, provider)| {
-                provider.name == tier.provider_id
-                    && cascade_provider_is_eligible(provider, allowed_providers, blocked_providers)
-                    && !router
-                        .eligible_candidate_indices(&config.providers, &[*idx])
-                        .is_empty()
-            }) {
+            // Find the provider config for this tier by name once, then
+            // apply the same strict live resilience gate as ordinary
+            // dispatch. A cascade must never revive an unhealthy, ejected,
+            // or breaker-blocked provider merely because it appears in the
+            // configured tiers. Looked up by name only first (rather than
+            // folding the eligibility checks into one `find`) so a tier
+            // that fails eligibility can still be classified below without
+            // a second scan over `config.providers`.
+            let provider_by_name = config
+                .providers
+                .iter()
+                .enumerate()
+                .find(|(_, provider)| provider.name == tier.provider_id);
+            // WOR-2685: `enabled`, `policy_ok`, and `resilience_ok` are
+            // each computed exactly once and reused both to decide
+            // eligibility and, on the ineligible path below, to classify
+            // why. Recomputing any of them a second time there would let
+            // the eligibility gate and the skip classification silently
+            // drift apart on some future edit to either; it would also
+            // let a tier that fails for more than one reason at once
+            // (e.g. both policy-locked *and* unhealthy) get misreported
+            // as a pure policy lock if the classification only re-checked
+            // the policy half. "Excluded by the credential's provider
+            // policy" is reported only when policy is the *sole* failing
+            // condition: the tier's provider must be configured, enabled,
+            // and otherwise resilience-eligible (health, breaker,
+            // ejection all clear), and fail only the allow/block check.
+            let enabled = provider_by_name.is_some_and(|(_, provider)| provider.enabled);
+            let policy_ok = provider_by_name.is_some_and(|(_, provider)| {
+                provider_allowed_by_policy(
+                    provider.name.as_str(),
+                    allowed_providers,
+                    blocked_providers,
+                )
+            });
+            let resilience_ok = provider_by_name.is_some_and(|(idx, _)| {
+                !router
+                    .eligible_candidate_indices(&config.providers, &[idx])
+                    .is_empty()
+            });
+            let provider = match provider_by_name.filter(|_| enabled && policy_ok && resilience_ok)
+            {
                 Some((_, provider)) => provider,
                 None => {
                     warn!(
@@ -2461,6 +2511,20 @@ impl AiClient {
                         provider_id = %tier.provider_id,
                         "cascade: tier provider not found or ineligible; skipping"
                     );
+                    total_skips += 1;
+                    if enabled && resilience_ok && !policy_ok {
+                        // Policy is the only thing that failed for this
+                        // tier's provider. Counted here regardless of
+                        // dedup so a repeat `provider_id` across tiers
+                        // cannot undercount against `total_skips`; the
+                        // display list below is deduped separately so
+                        // the error names the provider once, not once
+                        // per tier.
+                        policy_lock_skips += 1;
+                        if !locked_providers.contains(&tier.provider_id) {
+                            locked_providers.push(tier.provider_id.clone());
+                        }
+                    }
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
                     continue;
                 }
@@ -2544,6 +2608,7 @@ impl AiClient {
                         "cascade: transport error; trying next tier"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    total_skips += 1;
                     continue;
                 }
             };
@@ -2582,6 +2647,7 @@ impl AiClient {
                         "cascade: body read failed; trying next tier"
                     );
                     ai_metrics::record_cascade_tier_outcome(tier_idx, "retry");
+                    total_skips += 1;
                     continue;
                 }
             };
@@ -2723,8 +2789,27 @@ impl AiClient {
             });
         }
 
-        last_outcome
-            .ok_or_else(|| anyhow::anyhow!("cascade exhausted without dispatching any tier"))
+        last_outcome.ok_or_else(|| {
+            // WOR-2685: only when every recorded skip is a provider-policy
+            // exclusion do we name the credential's lock specifically; a
+            // single non-policy skip (cost cap, missing/disabled
+            // provider, unhealthy provider, transport error, or a body
+            // read failure) mixed in among them keeps the generic
+            // message rather than mislabel that unrelated exclusion as a
+            // policy lock.
+            if policy_lock_skips > 0 && policy_lock_skips == total_skips {
+                anyhow::anyhow!(
+                    "cascade exhausted: every candidate tier was excluded by the credential's \
+                     provider policy (allowed={}, blocked={}); routing plan requested \
+                     provider(s) {}, which this credential cannot reach",
+                    crate::data_posture::bounded_exclusion_list(allowed_providers),
+                    crate::data_posture::bounded_exclusion_list(blocked_providers),
+                    crate::data_posture::bounded_exclusion_list(&locked_providers),
+                )
+            } else {
+                anyhow::anyhow!("cascade exhausted without dispatching any tier")
+            }
+        })
     }
 }
 
@@ -3079,15 +3164,6 @@ fn parse_shadow_metadata(body: &[u8]) -> (Option<u64>, Option<u64>, Option<Strin
             reason[..end].to_string()
         });
     (prompt, completion, finish)
-}
-
-fn cascade_provider_is_eligible(
-    provider: &ProviderConfig,
-    allowed: &[String],
-    blocked: &[String],
-) -> bool {
-    provider.enabled
-        && crate::routing::provider_allowed_by_policy(provider.name.as_str(), allowed, blocked)
 }
 
 impl Default for AiClient {
@@ -3630,15 +3706,15 @@ mod tests {
 
     #[test]
     fn cascade_provider_blocklist_overrides_allowlist() {
-        let provider: ProviderConfig = serde_json::from_value(serde_json::json!({
-            "name": "openai",
-            "api_key": "test-key"
-        }))
-        .expect("provider fixture");
+        // The cascade dispatch loop's eligibility gate is `provider.enabled
+        // && provider_allowed_by_policy(..)` (see `forward_cascade_with_policy_impl`),
+        // so this exercises the exact predicate that decides whether a
+        // tier's provider dispatches, direct rather than through a
+        // wrapper.
         let allowed = vec!["openai".to_string()];
         let blocked = vec!["openai".to_string()];
 
-        assert!(!cascade_provider_is_eligible(&provider, &allowed, &blocked));
+        assert!(!provider_allowed_by_policy("openai", &allowed, &blocked));
     }
 
     fn two_tier_cascade_config(first_url: &str, second_url: &str) -> AiHandlerConfig {
@@ -3802,6 +3878,263 @@ mod tests {
         );
         first_request.abort();
         second_request.await.expect("healthy request captured");
+    }
+
+    // --- Cascade exhaustion names a credential provider lock (WOR-2685) ---
+    //
+    // A cascade whose only tier names a provider the calling credential's
+    // provider allow/block policy excludes used to fail with the bare
+    // "cascade exhausted without dispatching any tier" message, naming
+    // neither the credential's lock nor the plan's requested provider.
+    // These pin the new, more specific message for the case where that
+    // lock is the sole reason nothing dispatched, and confirm a mixed
+    // cause (lock plus an unrelated health exclusion) still gets the
+    // generic message rather than a misleading one.
+
+    #[tokio::test]
+    async fn cascade_exhaustion_names_the_credential_provider_lock() {
+        let config = one_tier_anthropic_cascade_config("http://127.0.0.1:9");
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                // The credential is locked to "openai"; the cascade's
+                // only tier names "anthropic", which it can never reach.
+                &["openai".to_string()],
+                &[],
+                "/v1/messages",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect_err("a policy-locked tier must not silently dispatch");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("credential's provider policy"),
+            "error should name the provider policy as the cause, got: {message}"
+        );
+        assert!(
+            message.contains("anthropic"),
+            "error should name the requested provider, got: {message}"
+        );
+        assert!(
+            message.contains("openai"),
+            "error should name the credential's allowed provider, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_exhaustion_stays_generic_when_causes_are_mixed() {
+        let config = two_tier_cascade_config("http://127.0.0.1:9", "http://127.0.0.1:9");
+        // Tier 0 ("first") is excluded for health, not policy.
+        config.router().set_provider_health(0, false);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                // Tier 1 ("second") is excluded by the credential's
+                // provider policy.
+                &["first".to_string()],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test-model"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+            )
+            .await
+            .expect_err("both tiers are excluded, so the cascade cannot dispatch");
+
+        assert_eq!(
+            error.to_string(),
+            "cascade exhausted without dispatching any tier",
+            "a mixed exclusion cause must not be misreported as a pure provider lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_exhaustion_stays_generic_when_mixed_with_a_transport_error() {
+        // Tier 0 ("first") passes the credential's provider policy but
+        // dispatches to nothing listening on the port, so it fails with
+        // a transport error rather than a policy exclusion.
+        let config = two_tier_cascade_config("http://127.0.0.1:9", "http://127.0.0.1:9");
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                // Tier 1 ("second") is excluded by the credential's
+                // provider policy; only tier 0 ("first") is allowed.
+                &["first".to_string()],
+                &[],
+                "/v1/chat/completions",
+                &serde_json::json!({"model": "test-model"}),
+                &crate::attribution::AttributionTags::default(),
+                "chat_completions",
+            )
+            .await
+            .expect_err("a refused connection leaves nothing to dispatch");
+
+        assert_eq!(
+            error.to_string(),
+            "cascade exhausted without dispatching any tier",
+            "a transport-error tier mixed with a policy-locked tier must not be misreported \
+             as a pure provider lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_exhaustion_stays_generic_when_one_tier_is_both_policy_locked_and_unhealthy() {
+        // The cascade's only tier is excluded by both the credential's
+        // provider policy and the router's own health gate at once.
+        // Policy alone is not why it cannot dispatch, so the specific
+        // message must not fire.
+        let config = one_tier_anthropic_cascade_config("http://127.0.0.1:9");
+        config.router().set_provider_health(0, false);
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &["openai".to_string()],
+                &[],
+                "/v1/messages",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect_err("a policy-locked and unhealthy tier still cannot dispatch");
+
+        assert_eq!(
+            error.to_string(),
+            "cascade exhausted without dispatching any tier",
+            "relaxing the provider policy alone would not make this tier dispatchable, so it \
+             must not be reported as a pure policy lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_exhaustion_stays_generic_when_the_only_tier_provider_is_disabled() {
+        // The tier's provider is both disabled and excluded by the
+        // credential's provider policy. Disabled is a configuration
+        // fact, not a policy lock, so the specific message must not
+        // fire even though the policy check alone would also fail.
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": "http://127.0.0.1:9",
+                "allow_private_base_url": true,
+                "enabled": false
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [{
+                    "provider_id": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "quality_threshold": 0.5
+                }]
+            }
+        }))
+        .expect("disabled-provider cascade fixture");
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &["openai".to_string()],
+                &[],
+                "/v1/messages",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect_err("a disabled provider cannot dispatch");
+
+        assert_eq!(
+            error.to_string(),
+            "cascade exhausted without dispatching any tier",
+            "a disabled provider must not be reported as excluded by the credential's policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn cascade_exhaustion_names_a_locked_provider_once_even_with_repeat_tiers() {
+        // Two tiers both name the same policy-locked provider (legal:
+        // `CascadeTier` has no cross-tier uniqueness constraint). The
+        // requested-provider list in the error must name it once, not
+        // once per tier.
+        let config = AiHandlerConfig::from_config(serde_json::json!({
+            "providers": [{
+                "name": "anthropic",
+                "provider_type": "anthropic",
+                "api_key": "test-key",
+                "base_url": "http://127.0.0.1:9",
+                "allow_private_base_url": true
+            }],
+            "routing": {
+                "strategy": "cascade",
+                "tiers": [
+                    {
+                        "provider_id": "anthropic",
+                        "model": "claude-3-5-sonnet",
+                        "quality_threshold": 0.5
+                    },
+                    {
+                        "provider_id": "anthropic",
+                        "model": "claude-3-opus",
+                        "quality_threshold": 0.5
+                    }
+                ]
+            }
+        }))
+        .expect("repeat-tier cascade fixture");
+        let cascade = config.router().cascade_config().cloned().expect("cascade");
+
+        let error = AiClient::new()
+            .forward_cascade_with_policy(
+                &config,
+                &cascade,
+                &["openai".to_string()],
+                &[],
+                "/v1/messages",
+                &serde_json::json!({
+                    "model": "claude-3-5-sonnet",
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+                &crate::attribution::AttributionTags::default(),
+                "messages",
+            )
+            .await
+            .expect_err("both tiers name a provider this credential cannot reach");
+
+        let message = error.to_string();
+        assert_eq!(
+            message.matches("anthropic").count(),
+            1,
+            "a provider named by more than one tier must be named once in the error, got: \
+             {message}"
+        );
     }
 
     // --- Cascade discarded-usage aggregation (WOR-1845) ---
