@@ -5,7 +5,6 @@ import {
   api,
   type ExtensionBundleRecord,
   type ExtensionHookRecord,
-  type ExtensionLoadRecord,
 } from "../api";
 import EmptyState from "../components/EmptyState.vue";
 import ErrorState from "../components/ErrorState.vue";
@@ -15,6 +14,7 @@ import { useAsync } from "../composables/useAsync";
 import {
   hooksForBundle,
   loadLabel,
+  loadTone,
   sourceLabel,
   stateTone,
 } from "../lib/extensions";
@@ -46,14 +46,6 @@ function label(value: string): string {
 function shortRevision(revision: string | null): string {
   if (!revision) return "not reported";
   return revision.length > 28 ? `${revision.slice(0, 25)}...` : revision;
-}
-
-function loadTone(load: ExtensionLoadRecord) {
-  return load.status === "ok"
-    ? "ok"
-    : load.status === "failed" || load.status === "degraded"
-      ? "err"
-      : "neutral";
 }
 
 function hookPosition(hook: ExtensionHookRecord): string {
@@ -268,7 +260,12 @@ function bundleHooks(bundle: ExtensionBundleRecord): ExtensionHookRecord[] {
           </div>
         </dl>
 
-        <p v-if="bundle.load.detail" class="bundle__detail" role="status">
+        <p
+          v-if="bundle.load.detail"
+          class="bundle__detail"
+          :class="{ 'bundle__detail--err': loadTone(bundle.load) === 'err' }"
+          role="status"
+        >
           {{ bundle.load.detail }}
         </p>
 
@@ -327,7 +324,13 @@ function bundleHooks(bundle: ExtensionBundleRecord): ExtensionHookRecord[] {
               </ul>
               <span v-else class="hook__none">no host capabilities</span>
             </div>
-            <p v-if="hook.detail" class="hook__detail">{{ hook.detail }}</p>
+            <p
+              v-if="hook.detail"
+              class="hook__detail"
+              :class="{ 'hook__detail--err': stateTone(hook.state) === 'err' }"
+            >
+              {{ hook.detail }}
+            </p>
           </article>
         </section>
       </article>
@@ -586,10 +589,16 @@ dd {
 .hook__detail {
   margin: 0;
   padding: var(--sb-space-3) var(--sb-space-4);
-  color: var(--sb-err);
-  background: var(--sb-err-bg);
+  color: var(--sb-text-muted);
+  background: var(--sb-surface-2);
   font-size: 0.78rem;
   overflow-wrap: anywhere;
+}
+
+.bundle__detail--err,
+.hook__detail--err {
+  color: var(--sb-err);
+  background: var(--sb-err-bg);
 }
 
 .hooks {

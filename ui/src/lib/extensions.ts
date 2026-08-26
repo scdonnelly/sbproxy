@@ -42,6 +42,14 @@ export function loadLabel(load: ExtensionLoadRecord): string {
   }
 }
 
+export function loadTone(load: ExtensionLoadRecord): ExtensionStatusTone {
+  return load.status === "ok"
+    ? "ok"
+    : load.status === "failed" || load.status === "degraded"
+      ? "err"
+      : "neutral";
+}
+
 export function stateTone(state: ExtensionState): ExtensionStatusTone {
   switch (state) {
     case "active":

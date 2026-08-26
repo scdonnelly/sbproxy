@@ -1,0 +1,4 @@
+{
+  "type": "fixed",
+  "message": "The Extensions admin page no longer renders a healthy bundle/hook load status message in error-red styling; the red styling is now reserved for a genuinely failed or degraded load."
+}

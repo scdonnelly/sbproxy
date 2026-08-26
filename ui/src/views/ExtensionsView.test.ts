@@ -7,6 +7,7 @@ import type {
 import {
   hooksForBundle,
   loadLabel,
+  loadTone,
   sourceLabel,
   stateTone,
 } from "../lib/extensions";
@@ -123,5 +124,48 @@ describe("extension inventory presentation", () => {
     expect(extensionsView).toContain("<dt>Load</dt>");
     expect(extensionsView).not.toContain("Verification");
     expect(extensionsView).not.toContain("JSON.stringify(snapshot");
+  });
+
+  it("gates bundle/hook load-evidence error styling on the real load status, not on detail text presence", () => {
+    // The bug (WOR-2684): `.bundle__detail`/`.hook__detail` carried
+    // unconditional error coloring in <style>, so a healthy status message
+    // (e.g. "refresh source unchanged; ...") rendered identically to a
+    // genuine failure. The fix must branch the error modifier class on the
+    // actual load-status field, not merely on whether detail text exists.
+    expect(extensionsView).toContain("'bundle__detail--err': loadTone(bundle.load) === 'err'");
+    expect(extensionsView).toContain("'hook__detail--err': stateTone(hook.state) === 'err'");
+
+    // The base `.bundle__detail`/`.hook__detail` rule must be neutral;
+    // error coloring may only live on the `--err` modifier.
+    const baseRuleMatch = extensionsView.match(
+      /\.bundle__detail,\s*\n\.hook__detail\s*\{([^}]*)\}/,
+    );
+    expect(baseRuleMatch).not.toBeNull();
+    expect(baseRuleMatch?.[1]).not.toContain("var(--sb-err)");
+    expect(baseRuleMatch?.[1]).not.toContain("var(--sb-err-bg)");
+
+    const errRuleMatch = extensionsView.match(
+      /\.bundle__detail--err,\s*\n\.hook__detail--err\s*\{([^}]*)\}/,
+    );
+    expect(errRuleMatch).not.toBeNull();
+    expect(errRuleMatch?.[1]).toContain("var(--sb-err)");
+    expect(errRuleMatch?.[1]).toContain("var(--sb-err-bg)");
+  });
+
+  it("keeps loadTone reserved for genuine failure/degraded status, not mere detail presence", () => {
+    expect(loadTone({ phase: "candidate_load", status: "ok", detail: "note" })).toBe("ok");
+    expect(
+      loadTone({ phase: "manifest", status: "failed", detail: "hook kind is unsupported" }),
+    ).toBe("err");
+    expect(loadTone({ phase: "manifest", status: "degraded", detail: "partial load" })).toBe(
+      "err",
+    );
+    expect(
+      loadTone({
+        phase: "refresh",
+        status: "unattributed",
+        detail: "refresh source unchanged; soapbucket/sbproxy at 8272118",
+      }),
+    ).toBe("neutral");
   });
 });
