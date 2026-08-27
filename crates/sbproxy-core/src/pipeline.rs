@@ -1721,7 +1721,7 @@ pub struct CompiledPipeline {
     /// Compiled forward rules for each origin (may be empty).
     pub forward_rules: Vec<Vec<CompiledForwardRule>>,
     /// Compiled fallback origin for each origin (None if not configured).
-    pub fallbacks: Vec<Option<CompiledFallback>>,
+    pub(crate) fallbacks: Vec<Option<CompiledFallback>>,
     /// Compiled bot detection for each origin (None if not configured).
     pub bot_detections: Vec<Option<BotDetection>>,
     /// Compiled threat protection for each origin (None if not configured).
