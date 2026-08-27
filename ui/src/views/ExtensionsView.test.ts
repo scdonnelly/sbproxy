@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ExtensionBundleRecord,
+  ExtensionHookRecord,
   ExtensionInventorySnapshot,
 } from "../api";
 import {
@@ -72,7 +73,11 @@ const snapshot: ExtensionInventorySnapshot = {
       match_key: "fallback_policy",
       position: null,
       state: "available",
-      detail: "loaded but not attached",
+      // A hook record carries no detail unless a collision gave it one
+      // (`apply_collision_states`,
+      // `crates/sbproxy-core/src/extension_inventory.rs`). Every other
+      // running-mode construction site leaves it null.
+      detail: null,
       runtime: "javascript",
       execution: {
         phase: "request",
@@ -183,11 +188,27 @@ describe("extension inventory presentation", () => {
     };
     expect(bundleDetailClass(collided)).toContain("bundle__detail--err");
 
-    expect(
-      hookDetailClass({ ...snapshot.hooks[1], state: "failed" }),
-    ).toContain("hook__detail--err");
-    // `available` is the state of a loaded-but-unattached hook, which is
-    // information rather than failure.
+    // The same collision writes the hook half. `apply_collision_states`
+    // sets `state: "failed"` and, for the unresolved case, a detail of
+    // `"<resolution> on `<match_key>`"`; the winner of a resolved
+    // collision leaves the loser `shadowed` with the winning
+    // registration named. Both are the shapes asserted here.
+    const failedHook: ExtensionHookRecord = {
+      ...snapshot.hooks[1],
+      state: "failed",
+      detail: "rejected duplicate exclusive registrations on `fallback_policy`",
+    };
+    expect(hookDetailClass(failedHook)).toContain("hook__detail--err");
+
+    const shadowedHook: ExtensionHookRecord = {
+      ...snapshot.hooks[1],
+      state: "shadowed",
+      detail:
+        "linked registration takes precedence; request-policy:policy:request_policy serves `fallback_policy`",
+    };
+    // Shadowed is a warning, not a failure: the winner still serves the
+    // key, so the reason reads in the neutral treatment.
+    expect(hookDetailClass(shadowedHook)).toBe("hook__detail");
     expect(hookDetailClass(snapshot.hooks[1])).toBe("hook__detail");
   });
 

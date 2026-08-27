@@ -100,15 +100,24 @@ pub(crate) fn inventory_with_health(
 }
 
 fn annotate_inventory(inventory: &mut ExtensionInventorySnapshot, health: BundleRefreshHealth) {
+    let failures = health.consecutive_failures;
     let refresh_detail = match health.cycle {
         BundleRefreshCycle::Applied => "refresh ok".to_string(),
         BundleRefreshCycle::NotModified => "refresh source unchanged".to_string(),
+        // A busy cycle never reached the source, so it neither clears
+        // the failure count nor adds to it. Reporting it as a clean
+        // skip would hide the rejection that is still outstanding.
+        BundleRefreshCycle::ReloadBusy if failures > 0 => format!(
+            "refresh skipped because another reload was active; the last candidate that \
+             reached the source was rejected and the last verified generation is still \
+             serving ({failures} consecutive failure(s))"
+        ),
         BundleRefreshCycle::ReloadBusy => {
             "refresh skipped because another reload was active".to_string()
         }
         BundleRefreshCycle::Failed => format!(
-            "refresh candidate rejected; serving last verified generation ({} consecutive failure(s))",
-            health.consecutive_failures
+            "refresh candidate rejected; serving last verified generation ({failures} \
+             consecutive failure(s))"
         ),
     };
     // A rejected candidate keeps the last verified generation serving,
@@ -118,7 +127,13 @@ fn annotate_inventory(inventory: &mut ExtensionInventorySnapshot, health: Bundle
     // proxy pinned to a stale generation reads exactly like a healthy
     // one: same green Load badge, same neutral detail line, one poll
     // after the last good one (WOR-2684).
-    let degraded = health.cycle == BundleRefreshCycle::Failed;
+    //
+    // The gate is the counter rather than this cycle's outcome, because
+    // only Applied and NotModified reset it. A ReloadBusy cycle leaves
+    // it standing, so gating on `cycle == Failed` would hand the page a
+    // green badge for one whole interval on any busy poll that follows
+    // a rejection, with the source still untracked.
+    let degraded = failures > 0;
     for bundle in &mut inventory.bundles {
         if bundle.source != ExtensionRegistrationSource::Git {
             continue;
@@ -433,6 +448,54 @@ mod tests {
         assert!(detail.starts_with("refresh source unchanged"), "{detail}");
         assert_eq!(inventory.bundles[0].load.status, "ok");
         assert_eq!(inventory.bundles[0].state, ExtensionState::Active);
+    }
+
+    #[test]
+    fn a_busy_cycle_after_a_rejection_keeps_reporting_degraded() {
+        // ReloadBusy never reaches the source, so it neither clears the
+        // failure count nor adds to it. Gating on the cycle alone would
+        // hand the page a green badge for one whole refresh interval
+        // while the source is still untracked (WOR-2684).
+        let mut inventory = git_bundle_inventory();
+
+        annotate_inventory(
+            &mut inventory,
+            BundleRefreshHealth {
+                cycle: BundleRefreshCycle::ReloadBusy,
+                consecutive_failures: 2,
+            },
+        );
+
+        let detail = inventory.bundles[0]
+            .load
+            .detail
+            .as_deref()
+            .expect("health detail");
+        assert!(detail.contains("another reload was active"), "{detail}");
+        assert!(detail.contains("2 consecutive failure(s)"), "{detail}");
+        assert_eq!(inventory.bundles[0].load.status, "degraded");
+    }
+
+    #[test]
+    fn a_busy_cycle_with_no_outstanding_failure_stays_ok() {
+        let mut inventory = git_bundle_inventory();
+
+        annotate_inventory(
+            &mut inventory,
+            BundleRefreshHealth {
+                cycle: BundleRefreshCycle::ReloadBusy,
+                consecutive_failures: 0,
+            },
+        );
+
+        let detail = inventory.bundles[0]
+            .load
+            .detail
+            .as_deref()
+            .expect("health detail");
+        assert!(detail.contains("another reload was active"), "{detail}");
+        assert!(!detail.contains("consecutive failure"), "{detail}");
+        assert_eq!(inventory.bundles[0].load.status, "ok");
     }
 
     #[test]
