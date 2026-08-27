@@ -6565,6 +6565,7 @@ dependencies = [
  "jsonschema 0.17.1",
  "lru",
  "minijinja",
+ "num-bigint 0.4.8",
  "object_store",
  "parking_lot",
  "postcard",
@@ -6592,12 +6593,14 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "thiserror 2.0.18",
  "tiktoken-rs",
  "tokio",
  "tracing",
  "url",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -6639,9 +6642,12 @@ name = "sbproxy-classifier-client"
 version = "0.1.0"
 dependencies = [
  "hyper-util",
+ "prometheus",
  "sbproxy-classifier-proto",
+ "sbproxy-security",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
@@ -8144,6 +8150,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -8211,8 +8218,11 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",

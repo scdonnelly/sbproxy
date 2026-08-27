@@ -1043,7 +1043,7 @@ pub(super) fn classifier_label(verdict: &crate::hooks::ClassifyVerdict) -> Strin
 }
 
 pub(super) fn intent_label(intent: crate::hooks::IntentCategory) -> String {
-    format!("{intent:?}").to_ascii_lowercase()
+    intent.as_str().to_string()
 }
 
 /// The `upstream_status` field: the status the primary upstream
