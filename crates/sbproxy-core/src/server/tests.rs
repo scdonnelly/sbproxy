@@ -6657,3 +6657,41 @@ async fn ldap_auth_missing_credentials_denies_with_401() {
     );
     assert!(principal.is_none());
 }
+
+/// WOR-2687: the header phase must not publish a terminal `allow` for a
+/// policy whose real decision happens in the request-body phase.
+///
+/// `OpenApiValidationEnforcer::enforce` returns `Allow` unconditionally
+/// because all it does at that phase is arm body buffering, so before
+/// this change a request the body phase went on to refuse carried two
+/// contradicting `policy_verdict_event` records keyed identically on
+/// `(request_id, policy_id)`, and the natural SIEM query for "which
+/// requests did `openapi_validation` admit" matched every request it
+/// denied.
+///
+/// The negative half is the load-bearing half. Every other body-phase
+/// refusal in `request_body_filter` publishes no verdict from that
+/// phase, so suppressing its header-phase `allow` would delete the only
+/// record its decision has rather than de-duplicate two.
+#[test]
+fn wor_2687_only_policies_that_emit_in_the_body_phase_skip_the_header_verdict() {
+    assert!(
+        emits_own_verdict_in_body_phase("openapi_validation"),
+        "the body phase publishes this policy's verdict, so the header phase must not"
+    );
+    for policy_id in [
+        "request_validator",
+        "content_digest",
+        "body_threat_protection",
+        "prompt_injection_v2",
+        "a2a",
+        "rate_limit",
+        "waf",
+    ] {
+        assert!(
+            !emits_own_verdict_in_body_phase(policy_id),
+            "{policy_id} publishes no verdict from the body phase; suppressing its \
+             header-phase record would delete the decision, not de-duplicate it"
+        );
+    }
+}

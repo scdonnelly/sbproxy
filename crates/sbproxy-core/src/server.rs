@@ -4796,6 +4796,36 @@ fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'stat
     ctx.deny_policy_type.unwrap_or(fallback)
 }
 
+/// Whether `policy_id` publishes its own `policy_verdict_event` from
+/// the request-body phase, so the header phase must not publish a
+/// terminal `allow` for it (WOR-2687).
+///
+/// The header-phase `Allow` from an enforcer of this kind is not a
+/// decision. `OpenApiValidationEnforcer::enforce` returns `Allow`
+/// unconditionally, because all it does at that phase is set
+/// `validate_request_body` so the body it validates gets buffered; the
+/// verdict is reached later, in `request_body_filter`. Publishing both
+/// puts two contradicting records on the bus for one decision, keyed
+/// identically on `(request_id, policy_id)` and separable only by
+/// arrival order, which is the shape `docs/observability.md` and
+/// `docs/decision-records.md` both record as rejected: the natural SIEM
+/// query for "which requests did this policy admit" would match every
+/// request it denied.
+///
+/// What this cannot see, and deliberately does not claim to: the other
+/// policies that also decide in the body phase. `request_validator`,
+/// `content_digest`, `body_threat_protection`, `prompt_injection_v2`'s
+/// body scan, and the A2A push-notification check all refuse from
+/// `request_body_filter` without publishing a verdict there, so their
+/// header-phase `allow` is the only record their decision has. Adding
+/// them here without giving each one a body-phase emission first would
+/// not fix a doubled record; it would delete the record. The list grows
+/// one policy at a time, paired with the emission that replaces what it
+/// suppresses.
+fn emits_own_verdict_in_body_phase(policy_id: &str) -> bool {
+    matches!(policy_id, "openapi_validation")
+}
+
 /// Run every enforcer for an origin in chain order. Returns `None`
 /// when every enforcer allowed the request, or `Some((status,
 /// message, fallback_policy_type))` for the first deny.
@@ -5017,6 +5047,19 @@ async fn check_policies(
             &mut ctx.policy_response_headers,
             &mut confirm_state,
         );
+        // WOR-2687: an enforcer that only arms body buffering here has
+        // not decided anything yet, and the phase that does decide
+        // publishes the verdict itself. Skipped after
+        // `translate_plugin_decision` rather than before `enforce`,
+        // because the enforcer still has to run: arming the buffer is
+        // the whole reason it is in the chain, and any response headers
+        // or confirm state its decision carries have already been
+        // applied by the line above. A deny is never skipped, so an
+        // enforcer of this kind that starts refusing in the header
+        // phase keeps its record here.
+        if translated.deny.is_none() && emits_own_verdict_in_body_phase(policy_id) {
+            continue;
+        }
         emit_policy_verdict(
             verdict_ctx,
             policy_id,
