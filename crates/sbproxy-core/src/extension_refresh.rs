@@ -111,6 +111,14 @@ fn annotate_inventory(inventory: &mut ExtensionInventorySnapshot, health: Bundle
             health.consecutive_failures
         ),
     };
+    // A rejected candidate keeps the last verified generation serving,
+    // so the bundle really did load and its lifecycle state stays
+    // honest. The load status is then the only field that can say the
+    // refresh pipeline stopped tracking its source, and without it a
+    // proxy pinned to a stale generation reads exactly like a healthy
+    // one: same green Load badge, same neutral detail line, one poll
+    // after the last good one (WOR-2684).
+    let degraded = health.cycle == BundleRefreshCycle::Failed;
     for bundle in &mut inventory.bundles {
         if bundle.source != ExtensionRegistrationSource::Git {
             continue;
@@ -120,6 +128,9 @@ fn annotate_inventory(inventory: &mut ExtensionInventorySnapshot, health: Bundle
             None => refresh_detail.clone(),
         };
         bundle.load.detail = Some(bound_detail(detail, 512));
+        if degraded {
+            bundle.load.status = "degraded".to_owned();
+        }
     }
 }
 
@@ -338,9 +349,11 @@ mod tests {
         assert_eq!(serving_generation.get(), "generation-a");
     }
 
-    #[test]
-    fn failed_refresh_health_keeps_safe_last_green_provenance_in_inventory() {
-        let mut inventory = ExtensionInventorySnapshot {
+    /// One serving Git bundle shaped the way the loader publishes it:
+    /// `phase: candidate_load`, `status: ok`, and the redacted
+    /// repo-reference-commit provenance as the whole detail.
+    fn git_bundle_inventory() -> ExtensionInventorySnapshot {
+        ExtensionInventorySnapshot {
             schema_version: EXTENSION_INVENTORY_SCHEMA_VERSION,
             scope: ExtensionInventoryScope {
                 mode: ExtensionScopeMode::Running,
@@ -367,7 +380,12 @@ mod tests {
             }],
             hooks: Vec::new(),
             collisions: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn failed_refresh_health_keeps_safe_last_green_provenance_in_inventory() {
+        let mut inventory = git_bundle_inventory();
 
         annotate_inventory(
             &mut inventory,
@@ -391,7 +409,45 @@ mod tests {
             detail.contains("https://example.test/extensions.git"),
             "{detail}"
         );
-        assert_eq!(inventory.bundles[0].load.status, "ok");
+        assert_eq!(inventory.bundles[0].load.status, "degraded");
         assert!(detail.len() <= 512);
+    }
+
+    #[test]
+    fn healthy_refresh_health_leaves_the_load_status_alone() {
+        let mut inventory = git_bundle_inventory();
+
+        annotate_inventory(
+            &mut inventory,
+            BundleRefreshHealth {
+                cycle: BundleRefreshCycle::NotModified,
+                consecutive_failures: 0,
+            },
+        );
+
+        let detail = inventory.bundles[0]
+            .load
+            .detail
+            .as_deref()
+            .expect("health detail");
+        assert!(detail.starts_with("refresh source unchanged"), "{detail}");
+        assert_eq!(inventory.bundles[0].load.status, "ok");
+        assert_eq!(inventory.bundles[0].state, ExtensionState::Active);
+    }
+
+    #[test]
+    fn refresh_health_does_not_degrade_a_non_git_bundle() {
+        let mut inventory = git_bundle_inventory();
+        inventory.bundles[0].source = ExtensionRegistrationSource::Directory;
+
+        annotate_inventory(
+            &mut inventory,
+            BundleRefreshHealth {
+                cycle: BundleRefreshCycle::Failed,
+                consecutive_failures: 7,
+            },
+        );
+
+        assert_eq!(inventory.bundles[0].load.status, "ok");
     }
 }
