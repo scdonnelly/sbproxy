@@ -5429,8 +5429,12 @@ anything below that no authored page matches renders as problem+json:
   Pingora's `fail_to_proxy` path. The `detail` field carries the
   RFC 9209 error token (`connection_refused`,
   `connection_timeout`, `tls_protocol_error`, `connection_terminated`,
-  `http_request_error`) so downstream tooling can break down by
-  failure mode without scraping the body.
+  `http_request_error`, `credential_provider_locked`) so downstream
+  tooling can break down by failure mode without scraping the body.
+  `credential_provider_locked` is the one token that is not an upstream
+  failure: it means the calling credential's provider policy excluded
+  every tier of an AI cascade. It carries no policy contents, so a
+  caller cannot learn from it which providers exist behind the gateway.
 
 ### What it does not cover
 
