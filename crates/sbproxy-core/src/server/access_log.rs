@@ -580,7 +580,7 @@ pub(super) fn emit_access_log(
         .and_then(|v| v.to_str().ok())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    let upstream_status = ctx.response_status.filter(|upstream| *upstream != status);
+    let upstream_status = logged_upstream_status(ctx, status);
 
     let context = AccessLogContext {
         // WOR-2407: name the config that served this request, and the
@@ -1051,6 +1051,23 @@ pub(super) fn intent_label(intent: crate::hooks::IntentCategory) -> String {
 /// failure modes (waf_blocked, rate_limited, ...) are stamped at the
 /// failure site via `ctx.short_circuit_status` paths; this fallback
 /// only fires when no upstream classification ran.
+/// The `upstream_status` field: the primary's status, but only when it
+/// differs from the status the client saw.
+///
+/// A free function rather than an expression inline in `emit_access_log`
+/// because the bug it fixes was invisible in place. It read
+/// `ctx.response_status` and filtered it against `status`, and `status`
+/// comes from `final_response_status`, which *prefers*
+/// `ctx.response_status`: the two were the same number by construction,
+/// so the field was `None` on every request the proxy had ever served,
+/// including the retry, fallback and `response_modifier` cases the
+/// field's own documentation names. Reading `ctx.upstream_status`, which
+/// nothing but the upstream's own header writes, is what makes the
+/// comparison mean something (WOR-2686).
+pub(super) fn logged_upstream_status(ctx: &RequestContext, status: u16) -> Option<u16> {
+    ctx.upstream_status.filter(|upstream| *upstream != status)
+}
+
 pub(super) fn classify_error_class(status: u16) -> Option<String> {
     match status {
         200..=299 => None,
@@ -1468,6 +1485,63 @@ mod run_identity_tests {
             line.get("zone_locality").is_none(),
             "an absent verdict must be absent, not empty: {line}"
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_status_tests {
+    use super::logged_upstream_status;
+    use crate::context::RequestContext;
+
+    /// The primary's status reaches the access log when a fallback
+    /// replaced the status the client saw.
+    ///
+    /// The red proof is in the test body: the expression this replaced is
+    /// evaluated alongside the fixed one, so the regression is
+    /// demonstrated rather than remembered. On a fallback an on-call
+    /// engineer would otherwise see `status: 200, fallback_triggered:
+    /// true` and have no record anywhere of whether the primary answered
+    /// 502, 503 or 504, since the only other place that value appeared
+    /// was a `debug!` that `release_max_level_info` compiles out.
+    #[test]
+    fn a_fallback_puts_the_primary_status_on_the_access_log() {
+        let mut ctx = RequestContext::new();
+        ctx.upstream_status = Some(503);
+        // What the client saw, and therefore what `final_response_status`
+        // hands `emit_access_log` as `status`.
+        ctx.response_status = Some(200);
+        let status = ctx.response_status.expect("the fallback set it");
+
+        let before_the_fix = ctx.response_status.filter(|upstream| *upstream != status);
+        assert_eq!(
+            before_the_fix, None,
+            "the old field filtered response_status against a number computed from \
+             response_status, so it could never be anything but None"
+        );
+
+        assert_eq!(logged_upstream_status(&ctx, status), Some(503));
+    }
+
+    /// A response the proxy passed through unchanged reports nothing, so
+    /// the field still means "the proxy rewrote this".
+    #[test]
+    fn an_unrewritten_status_reports_no_upstream_status() {
+        let mut ctx = RequestContext::new();
+        ctx.upstream_status = Some(200);
+        ctx.response_status = Some(200);
+
+        assert_eq!(logged_upstream_status(&ctx, 200), None);
+    }
+
+    /// No upstream answered at all: a short-circuited request, or an
+    /// `on_error` fallback, where `fail_to_proxy` fires before any
+    /// upstream response exists.
+    #[test]
+    fn no_upstream_response_reports_no_upstream_status() {
+        let mut ctx = RequestContext::new();
+        ctx.response_status = Some(502);
+
+        assert_eq!(logged_upstream_status(&ctx, 502), None);
     }
 }
 

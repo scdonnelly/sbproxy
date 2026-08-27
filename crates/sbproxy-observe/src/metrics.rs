@@ -2734,6 +2734,41 @@ pub fn record_security_headers_csp_emitted(mode: &str, tenant: &str) {
         .inc();
 }
 
+/// Record one `fallback_origin` response served, by which trigger fired.
+///
+/// `trigger` is a closed two-value set: `status` when the primary
+/// upstream answered with a status the operator listed under
+/// `on_status`, and `error` when it failed outright and `on_error`
+/// caught it in `fail_to_proxy`. Both are proxy-authored constants;
+/// `origin` and `tenant` are operator-scoped and pass through the
+/// cardinality limiter.
+///
+/// Until WOR-2686 a fallback taken left no scrapeable trace at all. The
+/// only evidence was `fallback_triggered` on an access-log row, so
+/// "fallbacks are firing on checkout.local" was a log-scraping question
+/// rather than an alert, and `on_status` in particular was not reliably
+/// serving what it claimed to serve. A fallback is a degraded response
+/// by construction, so the rate of this counter is the first number an
+/// operator wants when a primary starts failing.
+pub fn record_fallback_served(trigger: &str, origin: &str, tenant: &str) {
+    use prometheus::{register_int_counter_vec, IntCounterVec};
+    use std::sync::OnceLock;
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    let counter = C.get_or_init(|| {
+        register_int_counter_vec!(
+            "sbproxy_fallback_total",
+            "fallback_origin responses served, by trigger",
+            &["trigger", "origin", "tenant"],
+        )
+        .expect("counter vec registers")
+    });
+    let origin_san = sanitize_label("origin", origin);
+    let tenant_san = sanitize_label("tenant", tenant);
+    counter
+        .with_label_values(&[trigger, origin_san.as_str(), tenant_san.as_str()])
+        .inc();
+}
+
 /// Record one WebSocket upgrade refusal or tunnel teardown initiated
 /// by the gateway (WOR-2552).
 ///

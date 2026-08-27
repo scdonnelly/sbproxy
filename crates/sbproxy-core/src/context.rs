@@ -691,8 +691,25 @@ pub struct RequestContext {
     /// `response_filter` slice of `sbproxy_phase_duration_seconds`.
     /// `None` when no response_filter ran (e.g. early auth rejection).
     pub response_filter_finished_at: Option<Instant>,
-    /// HTTP status code from the upstream response (set in response_filter).
+    /// The status the client ends up seeing (set in `response_filter`,
+    /// and by every path that short-circuits or replaces a response).
+    /// `final_response_status` prefers this over the written header.
     pub response_status: Option<u16>,
+    /// The status the primary upstream actually answered with, recorded
+    /// at the top of `response_filter` before any stage can rewrite it.
+    ///
+    /// Separate from `response_status` because that field holds the
+    /// status the client sees, and on a `fallback_origin` or a `status`
+    /// response modifier the two differ. The access log's
+    /// `upstream_status` reads this and surfaces it only when they do.
+    /// Before WOR-2686 that field read `response_status` and filtered it
+    /// against a number computed from `response_status`, so it was
+    /// unreachable on every request the proxy has ever served.
+    ///
+    /// `None` when no upstream response exists: a short-circuited
+    /// request, or an `on_error` fallback, where `fail_to_proxy` fires
+    /// before any upstream answered.
+    pub upstream_status: Option<u16>,
 
     // --- Rate limit info ---
     /// Rate limit info from the policy check, used to add response headers.
@@ -1865,6 +1882,7 @@ impl RequestContext {
             upstream_first_byte_at: None,
             response_filter_finished_at: None,
             response_status: None,
+            upstream_status: None,
             rate_limit_info: None,
             shared_rate_limit_decision: None,
             shared_agent_budget_decision: None,

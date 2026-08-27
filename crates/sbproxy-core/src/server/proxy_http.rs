@@ -2525,6 +2525,104 @@ pub(super) fn evaluate_cache_admit_for(
     plan
 }
 
+/// Serve the `fallback_origin.on_status` response when the primary
+/// upstream's status is one the operator listed.
+///
+/// # Why this runs here and not in `response_filter`
+///
+/// A fallback response has to be *written*, header and body together,
+/// which means an `await`, and WOR-2686 originally put that await in
+/// `response_filter`. That is the one place on this request path where an
+/// added await is known to be dangerous: `response_filter` inlines every
+/// response stage the proxy has and is the largest future on the path,
+/// and this workspace has already had a single added await grow a
+/// request-path future past the 2 MiB Pingora worker stack and kill every
+/// AI request while 13006 unit tests stayed green. `upstream_response_decision`
+/// is the hook next door, it runs once per upstream response before any
+/// byte reaches the client, it already awaits `maybe_retry_upstream_status`,
+/// and its own future is a handful of locals. The status-retry decision
+/// already lives here, and an `on_status` fallback is that decision's
+/// sibling: both look at the primary's status and decide not to serve it.
+///
+/// # What Pingora does with the primary's response afterwards
+///
+/// This returns without aborting, so Pingora goes on forwarding the
+/// original, untouched upstream response. By then a response has already
+/// been written to the session, so the second header write hits
+/// `Http1Session::prepare_response_header`'s documented "Respond header
+/// is already sent, cannot send again" guard and is a no-op (one benign
+/// `warn!` from pingora-core), and `H2Session` drops it on `ended` for an
+/// HTTP/2 downstream. Real body bytes still in flight are nulled by
+/// `response_body_filter`'s `fallback_triggered` early return, and would
+/// be dropped by the finished content-length body writer even without it.
+///
+/// # Why the two translated gRPC paths are excluded
+///
+/// `response_body_filter`'s `transcode_active` / `grpc_web_active`
+/// branches build the client-facing gRPC-JSON envelope or gRPC-Web frame
+/// out of the buffered translated body, a construction `on_status` has
+/// never been taught to interact with. Serving the fallback there would
+/// now be correct on its own terms, since the fallback response is
+/// written directly and completely, but it would silently skip the
+/// translation those two paths exist to produce, and that is a separate
+/// decision this fix does not make. `on_error` is untouched: it fires in
+/// `fail_to_proxy`, before any upstream response exists, so there is no
+/// translated body to conflict with. `docs/routing.md` states the limit.
+async fn maybe_serve_status_fallback(
+    session: &mut Session,
+    upstream_response: &ResponseHeader,
+    ctx: &mut RequestContext,
+) -> Result<()> {
+    // Once is the contract. Pingora calls the hook that reaches here for
+    // every upstream header task, and an upstream that sends `100
+    // Continue` or `103 Early Hints` ahead of its real status produces
+    // more than one, so a fallback listed against an informational status
+    // could otherwise write a second complete response onto a session
+    // that already carries one.
+    if ctx.fallback_triggered || ctx.transcode_active || ctx.grpc_web_active {
+        return Ok(());
+    }
+    let Some(origin_idx) = ctx.origin_idx else {
+        return Ok(());
+    };
+    let upstream_status = upstream_response.status.as_u16();
+    let pipeline = ctx.pipeline.clone();
+    let Some(fallback) = pipeline
+        .fallbacks
+        .get(origin_idx)
+        .and_then(|entry| entry.as_ref())
+    else {
+        return Ok(());
+    };
+    if fallback.on_status.is_empty() || !fallback.on_status.contains(&upstream_status) {
+        return Ok(());
+    }
+
+    debug!(
+        hostname = %ctx.hostname,
+        upstream_status = %upstream_status,
+        "upstream status matched on_status fallback, serving fallback response"
+    );
+    ctx.fallback_triggered = true;
+    let (status, body_len) = serve_fallback_action(
+        session,
+        ctx,
+        &fallback.action,
+        fallback.add_debug_header,
+        "status",
+        Some(upstream_status),
+    )
+    .await?;
+    ctx.response_status = Some(status);
+    ctx.response_body_bytes = body_len;
+    sbproxy_observe::metrics::record_fallback_served(
+        "status",
+        ctx.hostname.as_str(),
+        ctx.tenant_id.as_str(),
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl ProxyHttp for SbProxy {
     type CTX = RequestContext;
@@ -4102,7 +4200,18 @@ impl ProxyHttp for SbProxy {
             // Never let a generic status retry multiply it.
             return None;
         }
-        maybe_retry_upstream_status(session, upstream_response, ctx).await
+        if let Some(error) = maybe_retry_upstream_status(session, upstream_response, ctx).await {
+            return Some(error);
+        }
+        // WOR-2686: `fallback_origin.on_status` is served from here, not
+        // from `response_filter`. A retry outranks it, which is why this
+        // sits below the retry decision: a status the operator asked us
+        // to retry gets another upstream attempt before it gets a canned
+        // response. See `maybe_serve_status_fallback` for why the write
+        // is not in `response_filter`.
+        maybe_serve_status_fallback(session, upstream_response, ctx)
+            .await
+            .err()
     }
 
     /// Modify the response header before it is sent to the downstream client.
@@ -4484,7 +4593,16 @@ impl ProxyHttp for SbProxy {
         // Snapshot the upstream status and headers here so
         // `response_body_filter` can pair them with the accumulated
         // body and call `record_response` once the stream ends.
-        if ctx.idempotency_miss.is_some() {
+        //
+        // Skipped on a fallback (WOR-2686): the paired body capture and
+        // `record_response` live below `response_body_filter`'s
+        // `fallback_triggered` early return and can never run, so the
+        // snapshot would be dead state describing a response the client
+        // never received. An idempotent request whose upstream answered a
+        // listed status records nothing under its key and replays against
+        // the upstream, which is the honest outcome while the fallback
+        // body is not itself recorded.
+        if ctx.idempotency_miss.is_some() && !ctx.fallback_triggered {
             ctx.idempotency_response_status = Some(upstream_response.status.as_u16());
             let headers: Vec<(String, String)> = upstream_response
                 .headers
@@ -4593,111 +4711,31 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // --- On-status fallback: rewrite response if upstream status matches ---
-        //
-        // Skipped on the two translated gRPC paths, which own the
-        // response body outright: `response_body_filter`'s
-        // `transcode_active` / `grpc_web_active` branches build the
-        // client-facing gRPC-JSON envelope or gRPC-Web frame from the
-        // buffered translated body, a construction on_status has never
-        // been taught to interact with (WOR-2686 only wired up the plain
-        // HTTP case). Serving the fallback here regardless would still be
-        // correct on its own (the fallback response is now written
-        // directly, see below), but it would silently skip the
-        // translation those two paths exist to produce, which is a
-        // separate decision this fix does not make.
-        //
-        // The mismatch is not new, but its reach is. Until the
-        // gRPC-status-to-HTTP-status mapping above, only a genuine
-        // non-gRPC HTTP status from the upstream could land here on a
-        // translated origin, since a transcoded RPC carried the
-        // upstream's own 200 whatever its outcome. Mapping the status
-        // makes 503 and 429 ordinary values at this point, so the
-        // exclusion has to be explicit. `on_error` is untouched: it fires
-        // in `fail_to_proxy`, before any upstream response exists, so
-        // there is no translated body to conflict with.
-        // docs/routing.md states the limit.
-        if !ctx.transcode_active && !ctx.grpc_web_active {
-            let upstream_status = upstream_response.status.as_u16();
-            if let Some(origin_idx) = ctx.origin_idx {
-                let pipeline = ctx.pipeline.clone();
-                if let Some(fallback) = &pipeline.fallbacks[origin_idx] {
-                    if !fallback.on_status.is_empty()
-                        && fallback.on_status.contains(&upstream_status)
-                    {
-                        debug!(
-                            hostname = %ctx.hostname,
-                            upstream_status = %upstream_status,
-                            "upstream status matched on_status fallback, rewriting response"
-                        );
-                        ctx.fallback_triggered = true;
+        // WOR-2686: record the primary's status before anything below
+        // can rewrite it. `ctx.response_status` ends up holding the
+        // status the client actually sees (a fallback's, a `status`
+        // response modifier's, the metering refusal's), so it cannot also
+        // answer "what did the upstream say". The access log's
+        // `upstream_status` reads this field instead and surfaces it only
+        // when the two differ; before this it read `ctx.response_status`
+        // and filtered it against a number computed from
+        // `ctx.response_status`, so it was unreachable on every request.
+        ctx.upstream_status = Some(upstream_response.status.as_u16());
 
-                        // WOR-2686: serve the fallback response the same way
-                        // `fail_to_proxy`'s `on_error` branch already does,
-                        // via `serve_fallback_action`, instead of editing
-                        // `upstream_response` (the real, should-be-discarded
-                        // response) in place. Editing in place had two bugs:
-                        //
-                        // 1. Header leak. Only a handful of header names were
-                        //    inserted/overwritten here; every other header the
-                        //    real upstream set (its own `Server`,
-                        //    `access-control-allow-*`, etc.) survived onto
-                        //    what is supposed to be an independent fallback
-                        //    response, because `response_filter` only mutates
-                        //    the header Pingora is about to forward and does
-                        //    not clear it first.
-                        // 2. Body / Content-Length mismatch. The fallback body
-                        //    was stashed on `ctx` for `response_body_filter`
-                        //    to swap in later, but Pingora only invokes that
-                        //    hook when the upstream stream actually produces a
-                        //    body chunk. Confirmed against
-                        //    `Http1Session::read_response_task` in the
-                        //    vendored pingora fork
-                        //    (`pingora-core/src/protocols/http/v1/client.rs`):
-                        //    `end_of_body` is latched from the real response's
-                        //    `Content-Length`/body framing *before*
-                        //    `response_filter` ever runs, so a genuinely
-                        //    bodyless real response (`Content-Length: 0`, as
-                        //    in this ticket's httpbin.org/status/503 repro)
-                        //    never produces a body task at all and
-                        //    `response_body_filter` never fires for this
-                        //    exchange. The Content-Length this function had
-                        //    already declared on the real header then went
-                        //    out over the wire with zero body bytes behind
-                        //    it.
-                        //
-                        // `serve_fallback_action` writes a brand new
-                        // `ResponseHeader` (never touching the real response's
-                        // headers) and the real body bytes directly to
-                        // `session`, both before returning, which fixes both:
-                        // no leaked header has anywhere to survive to, and the
-                        // body is on the wire by construction rather than
-                        // depending on a later hook that may never run.
-                        //
-                        // Pingora still forwards the original, untouched
-                        // `upstream_response` task after this function
-                        // returns `Ok(())`; by then a response has already
-                        // been written to the session, so that second header
-                        // write hits `Http1Session::prepare_response_header`'s
-                        // documented "Respond header is already sent, cannot
-                        // send again" guard and is a no-op (one benign `warn!`
-                        // from pingora-core), and any real body bytes still in
-                        // flight behind it are dropped the same way writing
-                        // past a declared Content-Length always is
-                        // (`BodyWriter` returns `Ok(None)` past the limit).
-                        let (status, body_len) = serve_fallback_action(
-                            session,
-                            &fallback.action,
-                            fallback.add_debug_header,
-                            "status",
-                        )
-                        .await?;
-                        ctx.response_status = Some(status);
-                        ctx.response_body_bytes = body_len;
-                        return Ok(());
-                    }
-                }
-            }
+        // --- On-status fallback ---
+        //
+        // The decision and the write both happen in
+        // `upstream_response_decision`, which runs before this hook; see
+        // `maybe_serve_status_fallback` for why the await is not here.
+        // Nothing below this point may run for a fallback. The response
+        // the client gets was written in full before this hook was
+        // called, and `upstream_response` is the primary's header, which
+        // Pingora forwards into `prepare_response_header`'s already-sent
+        // no-op guard. Every header sbproxy owns is stamped onto the
+        // fallback response by `stamp_fallback_gateway_headers` instead,
+        // and `docs/routing.md` lists exactly which ones those are.
+        if ctx.fallback_triggered {
+            return Ok(());
         }
 
         // Collect all header modifications into owned Vecs, then drop the pipeline
@@ -6988,10 +7026,10 @@ impl ProxyHttp for SbProxy {
         }
 
         // WOR-2686: once an `on_status` fallback has fired in
-        // `response_filter`, the real upstream response's body (if the
-        // upstream sent one) is discarded outright, not swapped for. The
-        // fallback body was already written directly to the session
-        // before `response_filter` returned, so anything still arriving
+        // `upstream_response_decision`, the real upstream response's body
+        // (if the upstream sent one) is discarded outright, not swapped
+        // for. The fallback body was already written directly to the
+        // session before that hook returned, so anything still arriving
         // here from the real upstream is the response being replaced,
         // not the response being served; scanning, transforming, or
         // buffering it would be wasted work on bytes the client is never
@@ -7212,9 +7250,12 @@ impl ProxyHttp for SbProxy {
         // size is whatever is buffered so far (zero on the first chunk)
         // plus this chunk.
         //
-        // Two states are exempt. A pending fallback or replacement body
-        // (consumed just below) discards the upstream body entirely, so
-        // there is nothing oversized left to refuse. And once the
+        // Two states are exempt. A triggered fallback discards the
+        // upstream body entirely (WOR-2686 returns from this function
+        // above, before this point is reached, so the exemption is a
+        // second and redundant guard), and so does a replacement body
+        // consumed just below, so in neither case is there anything
+        // oversized left to refuse. And once the
         // all-open pass-through has committed this response to raw
         // delivery, aborting a later chunk would truncate a stream
         // whose raw prefix the client already holds, which is worse
@@ -8072,9 +8113,11 @@ impl ProxyHttp for SbProxy {
                     // Serve the fallback action's response directly.
                     let result = serve_fallback_action(
                         session,
+                        ctx,
                         &fallback.action,
                         fallback.add_debug_header,
                         "error",
+                        None,
                     )
                     .await;
 
@@ -8086,6 +8129,11 @@ impl ProxyHttp for SbProxy {
                         // `response_body_filter`'s own accounting since
                         // `fail_to_proxy` is a terminal path.
                         ctx.response_body_bytes = body_len;
+                        sbproxy_observe::metrics::record_fallback_served(
+                            "error",
+                            ctx.hostname.as_str(),
+                            ctx.tenant_id.as_str(),
+                        );
                         return FailToProxy {
                             error_code: status,
                             can_reuse_downstream: true,
@@ -8943,7 +8991,9 @@ fn apply_response_status_override(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pingora_core::protocols::l4::stream::Stream;
     use pingora_error::ErrorSource;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A downstream `GET` asking for a WebSocket upgrade.
     fn upgrade_request() -> pingora_http::RequestHeader {
@@ -9313,6 +9363,471 @@ origins:
         }
     }
 
+    // --- WOR-2686: the `fallback_origin` response ---
+    //
+    // The regression this pins shipped once and was found in production,
+    // and the only coverage the first fix carried was an e2e conformance
+    // case. This repository never runs e2e in CI, so an identical
+    // regression would have merged with a fully green gate and a fully
+    // green CI, which is exactly how it shipped the first time. These run
+    // under `cargo nextest run -p sbproxy-core --lib`.
+
+    const FALLBACK_ORIGIN_CONFIG: &str = r#"
+origins:
+  "fb.test":
+    action:
+      type: proxy
+      url: http://127.0.0.1:19999
+    cors:
+      allow_origins:
+        - https://app.example.com
+      allow_methods:
+        - GET
+    fallback_origin:
+      on_status: [503]
+      add_debug_header: true
+      origin:
+        id: fb
+        hostname: fb
+        workspace_id: test
+        version: "1.0.0"
+        action:
+          type: static
+          status_code: 200
+          content_type: application/json
+          body: '{"source":"fallback"}'
+"#;
+
+    /// A context resolved onto the single origin in `yaml`.
+    ///
+    /// `CompiledFallback` is not `Clone`, so callers reach it by holding
+    /// their own `Arc` of the pipeline and borrowing out of that.
+    fn fallback_fixture(yaml: &str) -> RequestContext {
+        let config = sbproxy_config::compile_config(yaml).expect("fixture config");
+        let pipeline =
+            crate::pipeline::CompiledPipeline::from_config(config).expect("fixture pipeline");
+        let mut ctx = RequestContext::new();
+        ctx.pipeline = std::sync::Arc::new(pipeline);
+        ctx.origin_idx = Some(0);
+        ctx.hostname = "fb.test".into();
+        ctx
+    }
+
+    fn get_request(path: &str) -> pingora_http::RequestHeader {
+        pingora_http::RequestHeader::build("GET", path.as_bytes(), None).expect("request")
+    }
+
+    /// The fallback's own `Content-Length` matches the body it hands
+    /// over, on the arm both `fallback_origin` triggers now share.
+    #[test]
+    fn a_fallback_declares_the_length_of_the_body_it_carries() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, true, "status", &http::Method::GET)
+            .expect("fallback response builds");
+
+        let declared = built
+            .header
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .expect("a 200 fallback declares its length");
+        assert_eq!(declared, built.body.len());
+        assert!(!built.body.is_empty(), "the operator configured a body");
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("x-fallback-trigger")
+                .and_then(|v| v.to_str().ok()),
+            Some("status")
+        );
+    }
+
+    /// A `204` fallback declares no length at all.
+    ///
+    /// RFC 9110 section 8.6 forbids `Content-Length` on a `204`, and
+    /// Pingora's `init_body_writer` forces a zero-length body writer for
+    /// `204`/`304` whatever the header said, so a declared length is a
+    /// promise of bytes that never arrive: an HTTP/1.1 keep-alive client
+    /// frames the next response on the connection by that length and eats
+    /// its head. `action_dispatch.rs` carved this out for the `static` and
+    /// `mock` arms under WOR-2599; this arm is the one both
+    /// `fallback_origin` triggers depend on. Red before the fix: the
+    /// builder declared `content-length` for every status.
+    #[test]
+    fn a_204_fallback_declares_no_content_length() {
+        let yaml = FALLBACK_ORIGIN_CONFIG.replace("status_code: 200", "status_code: 204");
+        let ctx = fallback_fixture(&yaml);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, false, "status", &http::Method::GET)
+            .expect("fallback response builds");
+
+        assert_eq!(built.status, 204);
+        assert!(
+            built.header.headers.get("content-length").is_none(),
+            "a 204 that declares a length desynchronizes a keep-alive connection"
+        );
+        assert!(
+            built.body.is_empty(),
+            "Pingora writes no body for a 204, so none may be handed to it"
+        );
+    }
+
+    /// A `HEAD` keeps the declared length and loses only the bytes.
+    ///
+    /// The opposite carve-out to the `204` one, and the reason the rule
+    /// is not simply "no length when no body": the length a `HEAD`
+    /// declares is the length the matching `GET` would return, which is
+    /// what the header is for, and `HEAD` framing tells the client not to
+    /// read a body regardless.
+    #[test]
+    fn a_head_fallback_declares_the_length_and_writes_no_body() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let built = build_fallback_response(&fallback.action, false, "status", &http::Method::HEAD)
+            .expect("fallback response builds");
+
+        assert!(
+            built.header.headers.get("content-length").is_some(),
+            "a HEAD declares the length its GET would return"
+        );
+        assert!(
+            built.body.is_empty(),
+            "Pingora drops body bytes written for a HEAD"
+        );
+    }
+
+    /// The gateway's own headers survive onto a fallback response.
+    ///
+    /// A fallback is built from nothing, which is what stops the
+    /// primary's headers leaking onto it. Built from nothing also means
+    /// built without the headers sbproxy would have set on the response
+    /// it replaced, and CORS is the one that reaches real users: every
+    /// CORS stage in `response_filter` runs below the fallback's early
+    /// return, so before this a browser `fetch()` against a `cors` origin
+    /// met a fallback carrying no `access-control-allow-origin` and
+    /// reported an opaque network error instead of rendering the
+    /// fallback's own JSON. Red before the fix: the fresh header carried
+    /// nothing but the action's own fields.
+    ///
+    /// This pins the *set*. That the set reaches the wire at all is
+    /// `a_fallback_writes_only_its_own_header_block_and_body`'s job: this
+    /// one calls the stamping directly and would stay green if nothing
+    /// called it.
+    #[test]
+    fn a_fallback_response_carries_the_gateway_owned_headers() {
+        let mut ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+        ctx.request_id = "req-2686".into();
+        ctx.flags.debug = true;
+        let mut request = get_request("/anything");
+        request
+            .insert_header("origin", "https://app.example.com")
+            .expect("origin header");
+
+        let mut built =
+            build_fallback_response(&fallback.action, true, "status", &http::Method::GET)
+                .expect("fallback response builds");
+        stamp_fallback_gateway_headers(&request, &ctx, &mut built.header, Some(503));
+
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "a browser drops a fallback with no CORS decision on it"
+        );
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("x-sbproxy-debug-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-2686"),
+            "the request id is how an operator finds this exchange in the log"
+        );
+        assert_eq!(
+            built
+                .header
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "the fallback still owns what it says about its own body"
+        );
+    }
+
+    /// Nothing the primary upstream set reaches the client, and the
+    /// declared length is followed by exactly that many bytes.
+    ///
+    /// The wire-level half: `serve_fallback_action` builds and writes the
+    /// whole response, so the assertion is on the bytes a real downstream
+    /// client reads off a real socket rather than on a header struct.
+    /// Red before the fix in both halves: the primary's `ResponseHeader`
+    /// was edited in place, so every header it set that the fallback did
+    /// not overwrite survived, and the body was stashed on the context
+    /// for a `response_body_filter` call that a bodyless primary never
+    /// produces.
+    #[tokio::test]
+    async fn a_fallback_writes_only_its_own_header_block_and_body() {
+        let ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        let pipeline = ctx.pipeline.clone();
+        let fallback = pipeline.fallbacks[0]
+            .as_ref()
+            .expect("fixture declares a fallback_origin");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(
+                    b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\
+                      Origin: https://app.example.com\r\n\r\n",
+                )
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let (status, body_len) = serve_fallback_action(
+            &mut session,
+            &ctx,
+            &fallback.action,
+            fallback.add_debug_header,
+            "status",
+            Some(503),
+        )
+        .await
+        .expect("fallback serves");
+        drop(session);
+
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+        let wire = String::from_utf8(wire).expect("HTTP response is UTF-8");
+        let (head, body) = wire
+            .split_once("\r\n\r\n")
+            .expect("a complete header block");
+
+        assert_eq!(status, 200);
+        assert!(head.starts_with("HTTP/1.1 200"), "wire: {wire}");
+        let declared = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .expect("the fallback declares a length");
+        assert_eq!(
+            declared,
+            body.len(),
+            "declared length and delivered bytes must agree: {wire}"
+        );
+        assert_eq!(
+            declared as u64, body_len,
+            "the reported bytes_out is what went out"
+        );
+        assert!(body.contains("\"source\":\"fallback\""), "wire: {wire}");
+        // The seam, not just the helper: a covered function is not a
+        // wired one, so this asserts the gateway-owned headers reached
+        // the wire through `serve_fallback_action` rather than asserting
+        // that `stamp_fallback_gateway_headers` can compute them.
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("access-control-allow-origin: https://app.example.com"),
+            "wire: {wire}"
+        );
+        // The header block is the fallback's own. Nothing on it can have
+        // come from a primary response, because none was ever read.
+        assert!(
+            !head.to_ascii_lowercase().contains("x-primary-marker"),
+            "wire: {wire}"
+        );
+        assert_eq!(
+            head.lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+                .count(),
+            1,
+            "exactly one length is declared: {wire}"
+        );
+    }
+
+    /// A body chunk from the primary is dropped once a fallback has
+    /// fired, rather than reaching the client behind the fallback's own
+    /// declared length.
+    ///
+    /// The other half of the framing guarantee: the fallback response is
+    /// complete and finished by the time `response_body_filter` sees
+    /// anything, so a primary that did send a body must not add bytes
+    /// after it. Red before the fix: the filter swapped in
+    /// `ctx.fallback_body` and forwarded it, and the accounting below the
+    /// swap ran over the upstream chunk.
+    #[tokio::test]
+    async fn the_primary_body_is_dropped_once_a_fallback_has_fired() {
+        let mut ctx = fallback_fixture(FALLBACK_ORIGIN_CONFIG);
+        ctx.fallback_triggered = true;
+        ctx.response_body_bytes = 21;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let mut body = Some(Bytes::from_static(
+            b"primary body the client must never see",
+        ));
+        let delay = SbProxy
+            .response_body_filter(&mut session, &mut body, true, &mut ctx)
+            .expect("the filter returns");
+
+        assert!(delay.is_none());
+        assert!(
+            body.is_none(),
+            "the primary's bytes would land behind the fallback's declared length"
+        );
+        assert_eq!(
+            ctx.response_body_bytes, 21,
+            "bytes_out stays what the fallback actually wrote"
+        );
+        drop(session);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client).await;
+    }
+
+    /// `response_filter` gains no `await` from the fallback work.
+    ///
+    /// WOR-2686's first shape put a `serve_fallback_action(..).await`
+    /// inside `response_filter`. That hook inlines every response stage
+    /// the proxy has and is the largest future on the request path, and
+    /// this workspace has already had one added await grow a
+    /// request-path future past the 2 MiB Pingora worker stack and kill
+    /// every AI request in production while 13006 unit tests stayed
+    /// green. Nothing in the gate, in CI, or in `cargo test` can see that
+    /// happen, so the constraint is pinned as a property of the source
+    /// instead.
+    ///
+    /// What this cannot see: an `await` added inside a function
+    /// `response_filter` calls, and any growth in the two call sites it
+    /// does allow. It sees the shape of the hook's own body, which is
+    /// where the regression was.
+    #[test]
+    fn response_filter_takes_no_new_await() {
+        let source = include_str!("proxy_http.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("async fn response_filter("))
+            .expect("response_filter is declared in this file");
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = None;
+        for (offset, line) in lines[start..].iter().enumerate() {
+            for ch in line.chars() {
+                match ch {
+                    '{' => {
+                        depth += 1;
+                        opened = true;
+                    }
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if opened && depth == 0 {
+                            end = Some(start + offset);
+                        }
+                    }
+                    _ => {}
+                }
+                if end.is_some() {
+                    break;
+                }
+            }
+            if end.is_some() {
+                break;
+            }
+        }
+        let end = end.expect("response_filter's body closes");
+        let awaits: Vec<&str> = lines[start..=end]
+            .iter()
+            .copied()
+            .filter(|line| line.contains(".await"))
+            .map(str::trim)
+            .collect();
+
+        assert_eq!(
+            awaits.len(),
+            2,
+            "response_filter has exactly two await points, both older than \
+             WOR-2686: the anomaly-detector hook dispatch and the on_response \
+             callbacks. Serving a response from this hook needs a third and \
+             must not be added here; see maybe_serve_status_fallback. Found: \
+             {awaits:?}"
+        );
+        assert!(
+            awaits.iter().any(|line| line.contains("hook.analyze")),
+            "found: {awaits:?}"
+        );
+    }
+
     fn refusal_test_ctx(config_yaml: &str) -> RequestContext {
         let config = sbproxy_config::compile_config(config_yaml).expect("fixture config");
         let pipeline =
@@ -9363,10 +9878,16 @@ origins:
 
     #[test]
     fn the_refusal_respects_the_exempt_states() {
-        // A pending replacement discards the upstream body, so there is
-        // nothing oversized left to refuse; and a response committed to
-        // raw delivery must not be aborted after its raw prefix reached
-        // the client.
+        // A triggered fallback or a pending replacement discards the
+        // upstream body, so there is nothing oversized left to refuse;
+        // and a response committed to raw delivery must not be aborted
+        // after its raw prefix reached the client.
+        //
+        // All three arms are asserted. WOR-2686 re-keyed the fallback arm
+        // from `fallback_body.is_some()` to `fallback_triggered` and this
+        // test, which names "the exempt states", covered only two of the
+        // three: the arm it changed could have been deleted or inverted
+        // and this would have stayed green.
         let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
         ctx.transform_passthrough_committed = true;
         assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
@@ -9374,6 +9895,14 @@ origins:
         let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
         ctx.response_body_replacement = Some(bytes::Bytes::from_static(b"replacement"));
         assert_eq!(closed_refusal_before_capture(&ctx, 45), None);
+
+        let mut ctx = refusal_test_ctx(CLOSED_CAP_CONFIG);
+        ctx.fallback_triggered = true;
+        assert_eq!(
+            closed_refusal_before_capture(&ctx, 45),
+            None,
+            "a fallback has already replaced this response; the upstream body is discarded"
+        );
     }
 
     #[test]
