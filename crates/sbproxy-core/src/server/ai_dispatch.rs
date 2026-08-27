@@ -3441,8 +3441,7 @@ mod cascade_credential_lock_tests {
                 config,
                 &cascade,
                 allowed_providers,
-                &[],
-                &[],
+                sbproxy_ai::CascadeBlockLists::credential_only(&[]),
                 "/v1/messages",
                 &body,
                 &sbproxy_ai::attribution::AttributionTags::default(),
@@ -11429,14 +11428,21 @@ pub(super) async fn handle_ai_proxy(
                     config,
                     cascade_cfg,
                     allowed_providers,
-                    blocked_providers,
-                    // WOR-2685: the credential's own block list, before
-                    // the posture narrowing above widened it. The
-                    // executor skips on `blocked_providers` and
-                    // diagnoses on this one, so a tier the posture
+                    // WOR-2685: the executor skips a tier on
+                    // `effective` and diagnoses it on
+                    // `credential_only`, so a tier the data-posture
                     // constraint excluded is never reported as the
-                    // credential's provider lock.
-                    blocked_without_posture,
+                    // credential's provider lock. `blocked_providers`
+                    // is the posture-widened binding from the narrowing
+                    // above; `blocked_without_posture` is what it was
+                    // before that. Named fields because the two are
+                    // both `&[String]` and repeating one of them here
+                    // would silently reinstate the misattribution with
+                    // every test still green.
+                    sbproxy_ai::CascadeBlockLists {
+                        effective: blocked_providers,
+                        credential_only: blocked_without_posture,
+                    },
                     &path,
                     &body,
                     &ctx.attribution_tags,

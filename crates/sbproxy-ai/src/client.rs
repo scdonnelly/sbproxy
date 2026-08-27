@@ -2310,6 +2310,42 @@ impl CascadeSkipReason {
     }
 }
 
+/// The two provider block lists a cascade is governed by (WOR-2685).
+///
+/// Named fields rather than two adjacent `&[String]` parameters
+/// because the difference between them is invisible at a call site and
+/// getting it wrong is silent: pass the effective list twice and every
+/// data-posture exclusion is reported as the credential's own lock
+/// again, with every test in this crate still green, because the
+/// executor cannot tell it was handed the same list twice. The one
+/// call site that has two different lists to pass is
+/// `handle_ai_proxy`'s cascade dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct CascadeBlockLists<'a> {
+    /// What dispatch is gated on: the credential's block list with the
+    /// request's data-posture exclusions folded in. A tier naming a
+    /// provider on this list never dispatches.
+    pub effective: &'a [String],
+    /// The credential's own block list, without the posture
+    /// exclusions. A tier is diagnosed as excluded by the credential's
+    /// provider policy against *this* list, so a provider the
+    /// credential allows and only the posture constraint removed is
+    /// never blamed on the credential.
+    pub credential_only: &'a [String],
+}
+
+impl<'a> CascadeBlockLists<'a> {
+    /// The whole block list is the credential's own: no data-posture
+    /// constraint narrowed this request.
+    #[must_use]
+    pub fn credential_only(blocked: &'a [String]) -> Self {
+        Self {
+            effective: blocked,
+            credential_only: blocked,
+        }
+    }
+}
+
 /// A cascade that walked every tier and dispatched none of them
 /// (WOR-2685).
 ///
@@ -2510,7 +2546,7 @@ impl AiClient {
     /// separate out. A caller that folds posture exclusions into the
     /// block list must use
     /// [`Self::forward_cascade_with_policy_and_quota_with_reasoning_eligibility`]
-    /// and pass the credential-only list beside it, or a
+    /// and hand it a [`CascadeBlockLists`] naming both, or a
     /// posture-excluded tier is reported as a credential lock
     /// (WOR-2685).
     #[allow(clippy::too_many_arguments)]
@@ -2529,8 +2565,7 @@ impl AiClient {
             config,
             cascade,
             allowed_providers,
-            blocked_providers,
-            blocked_providers,
+            CascadeBlockLists::credential_only(blocked_providers),
             path,
             body,
             tags,
@@ -2565,8 +2600,7 @@ impl AiClient {
             config,
             cascade,
             allowed_providers,
-            blocked_providers,
-            blocked_providers,
+            CascadeBlockLists::credential_only(blocked_providers),
             path,
             body,
             tags,
@@ -2581,23 +2615,22 @@ impl AiClient {
     /// Dispatch a quota-governed confidence cascade while preserving
     /// eligibility captured before lossy request transformations.
     ///
-    /// `blocked_providers` is the *effective* block list the request
-    /// dispatches under, data-posture exclusions folded in;
-    /// `credential_blocked_providers` is the credential's own list
-    /// without them. Both are needed because a tier is skipped on the
-    /// first and diagnosed on the second: reporting a posture
+    /// `blocked` carries both lists a request dispatches under: the
+    /// effective one, data-posture exclusions folded in, and the
+    /// credential's own. Both are needed because a tier is skipped on
+    /// the first and diagnosed on the second: reporting a posture
     /// exclusion as the credential's provider lock names a knob that
     /// is not the cause, and a wrong diagnosis is worse than the
-    /// generic one it replaces (WOR-2685). Pass the same slice twice
-    /// when no posture constraint applies.
+    /// generic one it replaces (WOR-2685). Use
+    /// [`CascadeBlockLists::credential_only`] when no posture
+    /// constraint applies.
     #[allow(clippy::too_many_arguments)]
     pub async fn forward_cascade_with_policy_and_quota_with_reasoning_eligibility(
         &self,
         config: &AiHandlerConfig,
         cascade: &crate::routing::CascadeConfig,
         allowed_providers: &[String],
-        blocked_providers: &[String],
-        credential_blocked_providers: &[String],
+        blocked: CascadeBlockLists<'_>,
         path: &str,
         body: &serde_json::Value,
         tags: &crate::attribution::AttributionTags,
@@ -2610,8 +2643,7 @@ impl AiClient {
             config,
             cascade,
             allowed_providers,
-            blocked_providers,
-            credential_blocked_providers,
+            blocked,
             path,
             body,
             tags,
@@ -2629,8 +2661,7 @@ impl AiClient {
         config: &AiHandlerConfig,
         cascade: &crate::routing::CascadeConfig,
         allowed_providers: &[String],
-        blocked_providers: &[String],
-        credential_blocked_providers: &[String],
+        blocked: CascadeBlockLists<'_>,
         path: &str,
         body: &serde_json::Value,
         tags: &crate::attribution::AttributionTags,
@@ -2733,14 +2764,14 @@ impl AiClient {
                 provider_allowed_by_policy(
                     provider.name.as_str(),
                     allowed_providers,
-                    blocked_providers,
+                    blocked.effective,
                 )
             });
             let credential_ok = provider_by_name.is_some_and(|(_, provider)| {
                 provider_allowed_by_policy(
                     provider.name.as_str(),
                     allowed_providers,
-                    credential_blocked_providers,
+                    blocked.credential_only,
                 )
             });
             let resilience_ok = provider_by_name.is_some_and(|(idx, _)| {
@@ -3057,7 +3088,7 @@ impl AiClient {
             anyhow::Error::new(CascadeExhausted::new(
                 skips,
                 allowed_providers,
-                credential_blocked_providers,
+                blocked.credential_only,
             ))
         })
     }
@@ -4474,8 +4505,7 @@ mod tests {
     async fn dispatch_cascade_as_the_server_does(
         config: &AiHandlerConfig,
         allowed: &[String],
-        blocked: &[String],
-        credential_blocked: &[String],
+        blocked: CascadeBlockLists<'_>,
     ) -> Result<CascadeOutcome> {
         let cascade = config.router().cascade_config().cloned().expect("cascade");
         let body = serde_json::json!({
@@ -4493,7 +4523,6 @@ mod tests {
                 &cascade,
                 allowed,
                 blocked,
-                credential_blocked,
                 "/v1/chat/completions",
                 &body,
                 &crate::attribution::AttributionTags::default(),
@@ -4523,8 +4552,10 @@ mod tests {
         let error = dispatch_cascade_as_the_server_does(
             &config,
             &[],
-            &["second".to_string(), "first".to_string()],
-            &["second".to_string()],
+            CascadeBlockLists {
+                effective: &["second".to_string(), "first".to_string()],
+                credential_only: &["second".to_string()],
+            },
         )
         .await
         .expect_err("both tiers are excluded, so the cascade cannot dispatch");
@@ -4557,8 +4588,10 @@ mod tests {
         let error = dispatch_cascade_as_the_server_does(
             &config,
             &[],
-            &["first".to_string(), "second".to_string()],
-            &[],
+            CascadeBlockLists {
+                effective: &["first".to_string(), "second".to_string()],
+                credential_only: &[],
+            },
         )
         .await
         .expect_err("a posture constraint that excludes every tier cannot dispatch");

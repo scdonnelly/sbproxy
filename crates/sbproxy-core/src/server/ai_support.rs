@@ -1850,26 +1850,13 @@ impl SseUsageScanner {
     }
 }
 
-/// Record post-dispatch usage against every configured budget scope
-/// for this request. Tokens come from the upstream `usage` block;
-/// cost is estimated against the model the request actually
-/// executed against using the embedded price catalog in
-/// `sbproxy-ai/src/budget.rs`.
-/// Build and publish a per-surface `AiBillingEvent` for a request
-/// that has just returned a response from the upstream.
-///
-/// Phase 8 of the AI deep-integration plan: every dispatched AI
-/// request emits a billing event onto the observability bus and into
-/// the in-process `BudgetTracker`. Non-chat surfaces (image, audio,
-/// moderations, reranking, files, batches, fine-tuning) ship today
-/// as `PerCall` events with `cost_usd = 0.0`; per-unit pricing for
-/// images, audio seconds, and rerank documents lands when the
-/// pricing tables ship.
-///
-/// This is the **only** writer into the in-process `BudgetTracker`
-/// (WOR-2212). Every dispatch path that spends budget reaches it, and
-/// a second writer beside it is the bug that made a configured budget
-/// enforce at half its value for as long as one existed.
+// Two doc blocks stood here with no item under them, left behind by
+// functions that moved. rustdoc attaches an orphan to whatever item
+// follows, so they documented `proxy_status_error_token` as the
+// BudgetTracker's only writer. Deleted rather than moved: the WOR-2212
+// invariant they carried is stated where it is enforced, on
+// `debit_budget_without_billing_event`.
+
 /// The RFC 9209 `error` token for an AI cascade that dispatched no
 /// tier because the calling credential's `provider` allow/block policy
 /// excluded every one of them (WOR-2685).
