@@ -753,7 +753,7 @@ pub struct CompiledForwardRule {
 }
 
 /// A compiled fallback origin: triggers and the fallback action.
-pub struct CompiledFallback {
+pub(crate) struct CompiledFallback {
     /// Trigger on upstream connection error / timeout.
     pub on_error: bool,
     /// Trigger on these upstream HTTP status codes.
