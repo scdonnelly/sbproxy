@@ -6669,14 +6669,18 @@ async fn ldap_auth_missing_credentials_denies_with_401() {
 /// requests did `openapi_validation` admit" matched every request it
 /// denied.
 ///
-/// The negative half is the load-bearing half. Every other body-phase
-/// refusal in `request_body_filter` publishes no verdict from that
-/// phase, so suppressing its header-phase `allow` would delete the only
-/// record its decision has rather than de-duplicate two.
+/// The negative halves are the load-bearing halves. Suppressing a
+/// header-phase record that no body phase republishes deletes a
+/// decision instead of de-duplicating one, and that can arrive on
+/// either axis: a sibling built-in that refuses in the body phase
+/// without emitting there, or a plugin bundle that names its hook after
+/// a built-in policy.
 #[test]
 fn wor_2687_only_policies_that_emit_in_the_body_phase_skip_the_header_verdict() {
+    use sbproxy_observe::events::PolicySurface;
+
     assert!(
-        emits_own_verdict_in_body_phase("openapi_validation"),
+        emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, "openapi_validation"),
         "the body phase publishes this policy's verdict, so the header phase must not"
     );
     for policy_id in [
@@ -6689,9 +6693,15 @@ fn wor_2687_only_policies_that_emit_in_the_body_phase_skip_the_header_verdict() 
         "waf",
     ] {
         assert!(
-            !emits_own_verdict_in_body_phase(policy_id),
+            !emits_own_verdict_in_body_phase(PolicySurface::BuiltIn, policy_id),
             "{policy_id} publishes no verdict from the body phase; suppressing its \
              header-phase record would delete the decision, not de-duplicate it"
         );
     }
+    assert!(
+        !emits_own_verdict_in_body_phase(PolicySurface::Plugin, "openapi_validation"),
+        "a plugin or bundle hook may call itself anything, including a built-in policy \
+         name; nothing republishes its verdict in the body phase, so it keeps the only \
+         record it has"
+    );
 }

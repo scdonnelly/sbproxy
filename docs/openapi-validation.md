@@ -176,10 +176,14 @@ The upstream connection is dialed, and the request head sent, before the body
 that decides the verdict has arrived. A refused request therefore costs one
 upstream dial, and a backend that answers off the request line alone may have
 already produced a response for a request the edge goes on to refuse. That
-response is discarded: the client receives the configured status and body, on an
-HTTP/1.1 upstream and on an HTTP/2 one alike. What the guarantee covers is the
-request body, which is never forwarded, and the answer the client receives; it
-is not a promise that the backend saw nothing.
+response is discarded and the client receives the configured status and body, on
+an HTTP/1.1 upstream and on an HTTP/2 one alike, as long as the verdict is
+reached before the backend's response header arrives. A client that streams its
+body slowly enough for a head-answering backend to reply first is the one case
+that outruns the check, on either protocol, and that request gets the backend's
+answer. What the guarantee covers is the request body, which is never forwarded,
+and the answer the client receives; it is not a promise that the backend saw
+nothing.
 
 ## What a refusal records
 

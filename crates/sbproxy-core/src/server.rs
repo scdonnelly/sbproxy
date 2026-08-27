@@ -4796,7 +4796,7 @@ fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'stat
     ctx.deny_policy_type.unwrap_or(fallback)
 }
 
-/// Whether `policy_id` publishes its own `policy_verdict_event` from
+/// Whether this enforcer publishes its own `policy_verdict_event` from
 /// the request-body phase, so the header phase must not publish a
 /// terminal `allow` for it (WOR-2687).
 ///
@@ -4812,18 +4812,39 @@ fn effective_policy_type(ctx: &RequestContext, fallback: &'static str) -> &'stat
 /// query for "which requests did this policy admit" would match every
 /// request it denied.
 ///
-/// What this cannot see, and deliberately does not claim to: the other
-/// policies that also decide in the body phase. `request_validator`,
+/// Both axes are load bearing, because suppressing a record that
+/// nothing republishes deletes a decision rather than de-duplicating
+/// one, and `policy_id` alone cannot tell the two apart.
+///
+/// `surface` first. `policy_id` is `compiled.enforcer.policy_type()`,
+/// and for a `Policy::Plugin` (a linked Rust plugin or a config-loaded
+/// bundle hook) that string is chosen by the plugin: nothing reserves
+/// the built-in policy type names against it. A bundle registering a
+/// hook called `openapi_validation` would otherwise have its
+/// header-phase record suppressed while having no body-phase emission
+/// at all, and its decision would leave no record anywhere.
+/// `builtin_enforcers::registry` gives every such enforcer
+/// `PolicySurface::Plugin` and gives the enum-arm path
+/// `PolicySurface::BuiltIn`, so requiring `BuiltIn` here keeps the
+/// suppression on the arm that this file's body phase actually
+/// republishes. A surface added to that `#[non_exhaustive]` enum later
+/// is not `BuiltIn`, so it keeps its header record until someone
+/// deliberately adds it.
+///
+/// `policy_id` second, and the list is one entry long on purpose. The
+/// other policies that decide in the body phase, `request_validator`,
 /// `content_digest`, `body_threat_protection`, `prompt_injection_v2`'s
-/// body scan, and the A2A push-notification check all refuse from
+/// body scan, and the A2A push-notification check, all refuse from
 /// `request_body_filter` without publishing a verdict there, so their
-/// header-phase `allow` is the only record their decision has. Adding
-/// them here without giving each one a body-phase emission first would
-/// not fix a doubled record; it would delete the record. The list grows
-/// one policy at a time, paired with the emission that replaces what it
-/// suppresses.
-fn emits_own_verdict_in_body_phase(policy_id: &str) -> bool {
-    matches!(policy_id, "openapi_validation")
+/// header-phase `allow` is the only record their decision has. The list
+/// grows one policy at a time, paired with the emission that replaces
+/// what it suppresses.
+fn emits_own_verdict_in_body_phase(
+    surface: sbproxy_observe::events::PolicySurface,
+    policy_id: &str,
+) -> bool {
+    matches!(surface, sbproxy_observe::events::PolicySurface::BuiltIn)
+        && matches!(policy_id, "openapi_validation")
 }
 
 /// Run every enforcer for an origin in chain order. Returns `None`
@@ -5057,7 +5078,7 @@ async fn check_policies(
         // applied by the line above. A deny is never skipped, so an
         // enforcer of this kind that starts refusing in the header
         // phase keeps its record here.
-        if translated.deny.is_none() && emits_own_verdict_in_body_phase(policy_id) {
+        if translated.deny.is_none() && emits_own_verdict_in_body_phase(surface, policy_id) {
             continue;
         }
         emit_policy_verdict(
