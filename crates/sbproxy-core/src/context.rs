@@ -695,8 +695,23 @@ pub struct RequestContext {
     /// and by every path that short-circuits or replaces a response).
     /// `final_response_status` prefers this over the written header.
     pub response_status: Option<u16>,
-    /// The status the primary upstream actually answered with, recorded
-    /// at the top of `response_filter` before any stage can rewrite it.
+    /// The status on the upstream response as it entered
+    /// `response_filter`'s header stages.
+    ///
+    /// Recorded *after* the two stages that legitimately translate a
+    /// status before any header stage sees it - the Proxy-Wasm
+    /// response-header filter, which applies a filter-supplied
+    /// `:status`, and the gRPC-to-HTTP status mapping on a `transcode`
+    /// origin - and *before* every stage below that point, which is
+    /// where a `fallback_origin`, a `status` response modifier and the
+    /// metering refusal all replace what the client sees. Not "whatever
+    /// the origin's socket said": a Proxy-Wasm filter that rewrites a
+    /// `500` to a `200` makes this field `200`, and on a transcoded RPC
+    /// this is the mapped HTTP status, which is also the status every
+    /// other surface reads. Stating it that way rather than "before any
+    /// stage can rewrite it" is deliberate: the wider claim was not the
+    /// one the code held, and a stage added above the record point would
+    /// have quietly widened the gap with nothing going red.
     ///
     /// Separate from `response_status` because that field holds the
     /// status the client sees, and on a `fallback_origin` or a `status`

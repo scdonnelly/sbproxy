@@ -1046,13 +1046,9 @@ pub(super) fn intent_label(intent: crate::hooks::IntentCategory) -> String {
     format!("{intent:?}").to_ascii_lowercase()
 }
 
-/// Map a status code to a coarse failure label suitable for an ML
-/// feature. `None` for 2xx; categorical strings otherwise. Specific
-/// failure modes (waf_blocked, rate_limited, ...) are stamped at the
-/// failure site via `ctx.short_circuit_status` paths; this fallback
-/// only fires when no upstream classification ran.
-/// The `upstream_status` field: the primary's status, but only when it
-/// differs from the status the client saw.
+/// The `upstream_status` field: the status the primary upstream
+/// answered with, but only when it differs from the status the client
+/// saw.
 ///
 /// A free function rather than an expression inline in `emit_access_log`
 /// because the bug it fixes was invisible in place. It read
@@ -1060,14 +1056,40 @@ pub(super) fn intent_label(intent: crate::hooks::IntentCategory) -> String {
 /// comes from `final_response_status`, which *prefers*
 /// `ctx.response_status`: the two were the same number by construction,
 /// so the field was `None` on every request the proxy had ever served,
-/// including the retry, fallback and `response_modifier` cases the
-/// field's own documentation names. Reading `ctx.upstream_status`, which
-/// nothing but the upstream's own header writes, is what makes the
-/// comparison mean something (WOR-2686).
+/// including the fallback and `response_modifier` cases the field's own
+/// documentation names. Reading `ctx.upstream_status`, which nothing but
+/// `response_filter` writes, is what makes the comparison mean something
+/// (WOR-2686).
+///
+/// What `ctx.upstream_status` actually holds, since the difference
+/// matters to anyone reading a log row: the status on the upstream
+/// response *as it entered `response_filter`'s header stages*, recorded
+/// after the Proxy-Wasm response-header filter
+/// (`proxy_http.rs`, `filter_response_headers`) and the gRPC-to-HTTP
+/// status translation, and before every stage below it. A Proxy-Wasm
+/// filter that rewrites a `500` to a `200` therefore reports the
+/// filter's value here, not the origin's. `None` when no upstream
+/// answered at all.
+///
+/// This surfaces on any request where the two differ, which is a rule
+/// rather than a list: a `fallback_origin` on its `on_status` trigger,
+/// a `status` response modifier, the WOR-2145 metering refusal, a
+/// closed transform aborting a committed response, and the Proxy-Wasm
+/// local-response paths all qualify once an upstream has answered.
+/// `fallback_origin`'s `on_error` trigger cannot, because it fires
+/// before any upstream response exists and leaves this `None`.
+/// `docs/access-log.md` states the rule for operators rather than
+/// enumerating the sites, so the two cannot drift apart as sites are
+/// added.
 pub(super) fn logged_upstream_status(ctx: &RequestContext, status: u16) -> Option<u16> {
     ctx.upstream_status.filter(|upstream| *upstream != status)
 }
 
+/// Map a status code to a coarse failure label suitable for an ML
+/// feature. `None` for 2xx; categorical strings otherwise. Specific
+/// failure modes (waf_blocked, rate_limited, ...) are stamped at the
+/// failure site via `ctx.short_circuit_status` paths; this fallback
+/// only fires when no upstream classification ran.
 pub(super) fn classify_error_class(status: u16) -> Option<String> {
     match status {
         200..=299 => None,

@@ -196,7 +196,7 @@ Recomputed from your own configuration and stamped on the fallback:
 - The CSRF cookie, when one was minted for this request.
 - `X-Sbproxy-Debug-Request-Id` and `X-Sbproxy-Debug-Config-Rev` when the client asked with `x-sb-flags: debug`, and the correlation-id echo header, so a client still holds an identifier that finds the request in your logs.
 - `traceparent` and `tracestate`.
-- The RFC 9209 `Proxy-Status` header on `on_status`, carrying the status the *primary* answered with. That header is the only place the primary's status reaches the client on a fallback. The access log carries it too, as `upstream_status`.
+- The RFC 9209 `Proxy-Status` header, carrying the status the *primary* answered with, on the `on_status` trigger only and only when the origin sets `proxy_status.enabled: true` and the primary's status is outside the 2xx range. It is the only place the primary's status reaches the *client* on a fallback, so an origin without `proxy_status` configured, or one listing a 2xx under `on_status`, ships a fallback that says nothing about what it replaced. The access log records it either way, as `upstream_status`.
 - The `X-Sbproxy-Idempotency` and `X-Sbproxy-Retry-Skip-Reason` markers.
 
 Not carried, deliberately:

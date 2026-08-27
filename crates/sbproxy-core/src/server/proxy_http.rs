@@ -4711,8 +4711,8 @@ impl ProxyHttp for SbProxy {
             }
         }
 
-        // WOR-2686: record the primary's status before anything below
-        // can rewrite it. `ctx.response_status` ends up holding the
+        // WOR-2686: record the upstream's status before any stage below
+        // can replace it. `ctx.response_status` ends up holding the
         // status the client actually sees (a fallback's, a `status`
         // response modifier's, the metering refusal's), so it cannot also
         // answer "what did the upstream say". The access log's
@@ -4720,6 +4720,19 @@ impl ProxyHttp for SbProxy {
         // when the two differ; before this it read `ctx.response_status`
         // and filtered it against a number computed from
         // `ctx.response_status`, so it was unreachable on every request.
+        //
+        // "Before any stage below", not "before any stage": two stages
+        // above this line translate a status on purpose, and this
+        // records the translated value. `filter_response_headers` above
+        // applies a Proxy-Wasm filter's `:status` back onto the header,
+        // and the gRPC branch above maps `grpc-status` onto an HTTP
+        // status through `apply_response_status_override`. The mapped
+        // gRPC status is what every other surface reads (docs/routing.md
+        // says so), and a wasm filter's rewrite is the response as far
+        // as this proxy is concerned, so translating first and recording
+        // second is the behavior wanted. It is documented rather than
+        // left implicit because a stage inserted above this line would
+        // otherwise change what the field means with nothing going red.
         ctx.upstream_status = Some(upstream_response.status.as_u16());
 
         // --- On-status fallback ---
@@ -8000,6 +8013,42 @@ impl ProxyHttp for SbProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // WOR-2686: a `fallback_origin` response is already on the wire,
+        // complete, header and body, written by the `on_status` trigger
+        // in `upstream_response_decision`. Whatever failed afterwards -
+        // the primary resetting mid-body is the ordinary case, since
+        // this proxy stopped reading its body the moment the fallback
+        // fired - failed on a response the client is no longer
+        // receiving. There is nothing here to write and nothing to
+        // record.
+        //
+        // An early return rather than `&& !ctx.fallback_triggered` on
+        // the `on_error` arm below, which was the narrow shape. That
+        // stops the second `serve_fallback_action` and its second
+        // `sbproxy_fallback_total` increment, and then falls through to
+        // the default upstream-error handling, which writes a
+        // synthesized error body and overwrites `ctx.response_status`
+        // with a 502 the client never saw. Trading a double-counted
+        // metric for a wrong status on the access-log row is not a fix.
+        // Returning here leaves `ctx.response_status`,
+        // `ctx.response_body_bytes` and the counter exactly as the
+        // served fallback left them.
+        //
+        // Placed above the Proxy-Wasm blocks below, whose `take()`s it
+        // therefore skips: a `fallback_origin` and a Proxy-Wasm filter
+        // chain are refused together at config compile
+        // (`pipeline.rs`), so there can be no pending local response to
+        // drop. `can_reuse_downstream` is true because the fallback was
+        // written with a declared length and finished, so the
+        // downstream stream is complete and clean whatever the upstream
+        // did.
+        if ctx.fallback_triggered {
+            return FailToProxy {
+                error_code: ctx.response_status.unwrap_or(502),
+                can_reuse_downstream: true,
+            };
+        }
+
         if let Some(local_response) = crate::proxy_wasm_http::take_pending_local_response(ctx) {
             let status = local_response.status;
             let _ = crate::proxy_wasm_http::send_terminal_local_response(session, &local_response)
@@ -9753,6 +9802,109 @@ origins:
         );
         drop(session);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), client).await;
+    }
+
+    /// A request whose `on_status` fallback already went out is not
+    /// served a second time when the primary's failure reaches
+    /// `fail_to_proxy`.
+    ///
+    /// The shape that reaches this: an origin configured with both
+    /// triggers, whose primary answers a listed status and then resets
+    /// the connection. The `on_status` fallback is written and counted,
+    /// the primary's body task then errors, and `error_while_proxy`
+    /// drives `fail_to_proxy` with `on_error: true` still configured.
+    /// The wire survives it either way, because Pingora's already-sent
+    /// header guard and the finished content-length writer swallow the
+    /// second response, so the damage is entirely in the records: one
+    /// degraded response counted twice by `sbproxy_fallback_total`,
+    /// once under each trigger label, on exactly the alert that counter
+    /// exists to carry.
+    ///
+    /// Asserted on the wire rather than on the counter because a
+    /// process-global Prometheus registry cannot be read back per test,
+    /// and the second `write_response_*` pair is the same event the
+    /// second increment rides on.
+    #[tokio::test]
+    async fn a_served_fallback_is_not_served_again_by_fail_to_proxy() {
+        let yaml = FALLBACK_ORIGIN_CONFIG.replace(
+            "      on_status: [503]",
+            "      on_status: [503]\n      on_error: true",
+        );
+        let mut ctx = fallback_fixture(&yaml);
+        assert!(
+            ctx.pipeline.fallbacks[0]
+                .as_ref()
+                .expect("fixture declares a fallback_origin")
+                .on_error,
+            "the fixture must arm the other trigger or this proves nothing"
+        );
+        // The state `upstream_response_decision` leaves behind after
+        // serving the `on_status` fallback. `response_body_bytes` is a
+        // sentinel rather than the real body length so a re-serve is
+        // visible on the context too.
+        ctx.fallback_triggered = true;
+        ctx.response_status = Some(200);
+        ctx.response_body_bytes = 999;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind downstream fixture");
+        let address = listener.local_addr().expect("downstream address");
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect downstream fixture");
+            stream
+                .write_all(b"GET /anything HTTP/1.1\r\nHost: fb.test\r\n\r\n")
+                .await
+                .expect("write request");
+            let mut response = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(_) => break,
+                }
+            }
+            response
+        });
+        let (stream, _) = listener.accept().await.expect("accept downstream");
+        let mut session = Session::new_h1(Box::new(Stream::from(stream)));
+        session
+            .as_downstream_mut()
+            .read_request()
+            .await
+            .expect("parse downstream request");
+
+        let error = Error::new(ErrorType::ReadError);
+        let outcome = SbProxy.fail_to_proxy(&mut session, &error, &mut ctx).await;
+        drop(session);
+
+        let wire = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("downstream response timeout")
+            .expect("downstream client task");
+
+        assert!(
+            wire.is_empty(),
+            "a second response was written over a complete one: {}",
+            String::from_utf8_lossy(&wire)
+        );
+        assert_eq!(
+            outcome.error_code, 200,
+            "the outcome reports the status the client actually received"
+        );
+        assert!(outcome.can_reuse_downstream);
+        assert_eq!(
+            ctx.response_status,
+            Some(200),
+            "the access log must keep the status that went out, not a synthesized 502"
+        );
+        assert_eq!(
+            ctx.response_body_bytes, 999,
+            "bytes_out must not be recomputed from a fallback body served once"
+        );
     }
 
     /// `response_filter` gains no `await` from the fallback work.
