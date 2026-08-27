@@ -12,6 +12,8 @@ import PageHeader from "../components/PageHeader.vue";
 import StatusBadge from "../components/StatusBadge.vue";
 import { useAsync } from "../composables/useAsync";
 import {
+  bundleDetailClass,
+  hookDetailClass,
   hooksForBundle,
   loadLabel,
   loadTone,
@@ -260,12 +262,7 @@ function bundleHooks(bundle: ExtensionBundleRecord): ExtensionHookRecord[] {
           </div>
         </dl>
 
-        <p
-          v-if="bundle.load.detail"
-          class="bundle__detail"
-          :class="{ 'bundle__detail--err': loadTone(bundle.load) === 'err' }"
-          role="status"
-        >
+        <p v-if="bundle.load.detail" :class="bundleDetailClass(bundle)" role="status">
           {{ bundle.load.detail }}
         </p>
 
@@ -324,11 +321,7 @@ function bundleHooks(bundle: ExtensionBundleRecord): ExtensionHookRecord[] {
               </ul>
               <span v-else class="hook__none">no host capabilities</span>
             </div>
-            <p
-              v-if="hook.detail"
-              class="hook__detail"
-              :class="{ 'hook__detail--err': stateTone(hook.state) === 'err' }"
-            >
+            <p v-if="hook.detail" :class="hookDetailClass(hook)">
               {{ hook.detail }}
             </p>
           </article>
@@ -589,14 +582,30 @@ dd {
 .hook__detail {
   margin: 0;
   padding: var(--sb-space-3) var(--sb-space-4);
+  border-left: 2px solid var(--sb-border-strong);
   color: var(--sb-text-muted);
-  background: var(--sb-surface-2);
   font-size: 0.78rem;
   overflow-wrap: anywhere;
 }
 
+/* The two paragraphs sit on opposite grounds: .bundle__detail inside
+   the white .bundle card, .hook__detail inside the --sb-surface-2
+   .hooks panel. Each takes the tier its container does not, or the
+   neutral treatment reads as a flat continuation of the panel rather
+   than a callout. The bundle rule also closes itself off from .hooks,
+   which starts immediately below it on the same surface tier. */
+.bundle__detail {
+  border-bottom: 1px solid var(--sb-border-strong);
+  background: var(--sb-surface-2);
+}
+
+.hook__detail {
+  background: var(--sb-surface);
+}
+
 .bundle__detail--err,
 .hook__detail--err {
+  border-left-color: var(--sb-err);
   color: var(--sb-err);
   background: var(--sb-err-bg);
 }

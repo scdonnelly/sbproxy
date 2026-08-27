@@ -5,6 +5,8 @@ import type {
   ExtensionInventorySnapshot,
 } from "../api";
 import {
+  bundleDetailClass,
+  hookDetailClass,
   hooksForBundle,
   loadLabel,
   loadTone,
@@ -126,46 +128,104 @@ describe("extension inventory presentation", () => {
     expect(extensionsView).not.toContain("JSON.stringify(snapshot");
   });
 
-  it("gates bundle/hook load-evidence error styling on the real load status, not on detail text presence", () => {
-    // The bug (WOR-2684): `.bundle__detail`/`.hook__detail` carried
-    // unconditional error coloring in <style>, so a healthy status message
-    // (e.g. "refresh source unchanged; ...") rendered identically to a
-    // genuine failure. The fix must branch the error modifier class on the
-    // actual load-status field, not merely on whether detail text exists.
-    expect(extensionsView).toContain("'bundle__detail--err': loadTone(bundle.load) === 'err'");
-    expect(extensionsView).toContain("'hook__detail--err': stateTone(hook.state) === 'err'");
+  it("leaves a healthy Git refresh message unstyled and paints a rejected candidate red", () => {
+    // The bug (WOR-2684): `.bundle__detail` carried unconditional error
+    // coloring, so every poll of a healthy Git bundle rendered red. Both
+    // fixtures below are the record `/api/extensions` really serves: the
+    // loader publishes `phase: "candidate_load", status: "ok"` with the
+    // redacted `<repo> at <ref> (<commit>)` provenance as the whole detail
+    // (`crates/sbproxy-extension/src/bundle/loader.rs`, `load_detail` and
+    // the `ExtensionBundleRecord` push beneath it), and
+    // `annotate_inventory`
+    // (`crates/sbproxy-core/src/extension_refresh.rs`) then prefixes the
+    // cycle's health text and, on a rejected candidate, moves the status
+    // to `degraded`.
+    const healthy: ExtensionBundleRecord = {
+      ...bundle,
+      load: {
+        phase: "candidate_load",
+        status: "ok",
+        detail:
+          "refresh source unchanged; https://example.test/extensions.git at release-v1 (commit-a)",
+      },
+    };
+    expect(bundleDetailClass(healthy)).toBe("bundle__detail");
+    expect(bundleDetailClass(healthy)).not.toContain("bundle__detail--err");
 
-    // The base `.bundle__detail`/`.hook__detail` rule must be neutral;
-    // error coloring may only live on the `--err` modifier.
+    const rejectedCandidate: ExtensionBundleRecord = {
+      ...bundle,
+      load: {
+        phase: "candidate_load",
+        status: "degraded",
+        detail:
+          "refresh candidate rejected; serving last verified generation (3 consecutive failure(s)); https://example.test/extensions.git at release-v1 (commit-a)",
+      },
+    };
+    expect(bundleDetailClass(rejectedCandidate)).toContain("bundle__detail--err");
+  });
+
+  it("paints a bundle whose hooks failed red even though its load record says ok", () => {
+    // An unresolved exclusive collision leaves the match key with no
+    // winner, so `apply_collision_states` marks both hooks `failed` and
+    // `derive_bundle_states` propagates `failed` to the bundle
+    // (`crates/sbproxy-core/src/extension_inventory.rs`). Nothing rewrites
+    // the loader's `status: "ok"` on the way, so a gate reading only
+    // `load.status` misses the one failure the running inventory can
+    // actually report.
+    const collided: ExtensionBundleRecord = {
+      ...bundle,
+      state: "failed",
+      load: {
+        phase: "candidate_load",
+        status: "ok",
+        detail: "https://example.test/extensions.git at release-v1 (commit-a)",
+      },
+    };
+    expect(bundleDetailClass(collided)).toContain("bundle__detail--err");
+
+    expect(
+      hookDetailClass({ ...snapshot.hooks[1], state: "failed" }),
+    ).toContain("hook__detail--err");
+    // `available` is the state of a loaded-but-unattached hook, which is
+    // information rather than failure.
+    expect(hookDetailClass(snapshot.hooks[1])).toBe("hook__detail");
+  });
+
+  it("keeps loadTone reserved for genuine failure or degraded status", () => {
+    expect(loadTone({ phase: "candidate_load", status: "ok", detail: "note" })).toBe("ok");
+    expect(
+      loadTone({ phase: "manifest", status: "failed", detail: "hook kind is unsupported" }),
+    ).toBe("err");
+    expect(loadTone({ phase: "candidate_load", status: "degraded", detail: null })).toBe("err");
+    // `unattributed` is the synthesized link-time bundle's status
+    // (`extension_inventory.rs`, `ensure_unattributed_failure_bundle`),
+    // which is a gap in attribution rather than a load failure.
+    expect(loadTone({ phase: "inventory", status: "unattributed", detail: null })).toBe(
+      "neutral",
+    );
+  });
+
+  it("keeps error coloring on the modifier class only", () => {
+    // The regression the fix removed lived in the base rule, so the base
+    // rule is what has to stay free of the error tokens. Both regexes
+    // tolerate the selector list on one line or several.
     const baseRuleMatch = extensionsView.match(
-      /\.bundle__detail,\s*\n\.hook__detail\s*\{([^}]*)\}/,
+      /\.bundle__detail\s*,\s*\.hook__detail\s*\{([^}]*)\}/,
     );
     expect(baseRuleMatch).not.toBeNull();
     expect(baseRuleMatch?.[1]).not.toContain("var(--sb-err)");
     expect(baseRuleMatch?.[1]).not.toContain("var(--sb-err-bg)");
 
     const errRuleMatch = extensionsView.match(
-      /\.bundle__detail--err,\s*\n\.hook__detail--err\s*\{([^}]*)\}/,
+      /\.bundle__detail--err\s*,\s*\.hook__detail--err\s*\{([^}]*)\}/,
     );
     expect(errRuleMatch).not.toBeNull();
     expect(errRuleMatch?.[1]).toContain("var(--sb-err)");
     expect(errRuleMatch?.[1]).toContain("var(--sb-err-bg)");
-  });
 
-  it("keeps loadTone reserved for genuine failure/degraded status, not mere detail presence", () => {
-    expect(loadTone({ phase: "candidate_load", status: "ok", detail: "note" })).toBe("ok");
-    expect(
-      loadTone({ phase: "manifest", status: "failed", detail: "hook kind is unsupported" }),
-    ).toBe("err");
-    expect(loadTone({ phase: "manifest", status: "degraded", detail: "partial load" })).toBe(
-      "err",
-    );
-    expect(
-      loadTone({
-        phase: "refresh",
-        status: "unattributed",
-        detail: "refresh source unchanged; soapbucket/sbproxy at 8272118",
-      }),
-    ).toBe("neutral");
+    // The paragraphs take their whole class list from the helpers above,
+    // so those helpers are the gate rather than a second copy of it.
+    expect(extensionsView).toContain(':class="bundleDetailClass(bundle)"');
+    expect(extensionsView).toContain(':class="hookDetailClass(hook)"');
   });
 });
